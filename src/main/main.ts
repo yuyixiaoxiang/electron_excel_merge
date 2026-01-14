@@ -1,5 +1,6 @@
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
 import * as path from 'path';
+import { spawn } from 'child_process';
 import { Workbook } from 'exceljs';
 
 let mainWindow: BrowserWindow | null = null;
@@ -37,6 +38,25 @@ const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
 };
 
 const cliThreeWayArgs: CliThreeWayArgs | null = parseCliThreeWayArgs();
+
+const gitAddFile = (filePath: string): Promise<void> => {
+  return new Promise((resolve) => {
+    const cwd = path.dirname(filePath);
+    const child = spawn('git', ['add', filePath], { cwd, stdio: 'ignore' });
+
+    child.on('error', (err) => {
+      console.error('git add failed', err);
+      resolve();
+    });
+
+    child.on('close', (code) => {
+      if (code !== 0) {
+        console.error('git add exited with code', code);
+      }
+      resolve();
+    });
+  });
+};
 
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -256,6 +276,15 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
     }
 
     await workbook.xlsx.writeFile(targetPath);
+
+    // 如果是通过 git/Fork 的 merge 模式启动，并且有明确的目标文件，尝试自动执行一次 git add
+    if (cliThreeWayArgs && cliThreeWayArgs.mode === 'merge' && targetPath) {
+      try {
+        await gitAddFile(targetPath);
+      } catch (e) {
+        console.error('git add after merge failed', e);
+      }
+    }
 
     return { success: true, filePath: targetPath };
   } catch (err: any) {
