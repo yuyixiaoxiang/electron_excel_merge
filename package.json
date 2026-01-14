@@ -11,7 +11,9 @@
     "dev:main": "cross-env NODE_ENV=development tsc -w",
     "start": "npm run build && electron .",
     "dist": "npm run build && electron-builder --win",
-    "pack:win": "npm run build && electron-packager . ElectronExcelMerge --platform=win32 --arch=x64 --out=dist_pkg --overwrite"
+    "pack:win": "npm run build && electron-builder --win portable --x64",
+    "clean-cache": "rimraf %LOCALAPPDATA%/electron/Cache/* %LOCALAPPDATA%/electron-builder/Cache/*",
+    "fix-build": "npm run clean-cache && npm install"
   },
   "keywords": [],
   "author": "",
@@ -42,6 +44,7 @@
     "appId": "com.example.electronexcelmerge",
     "productName": "ElectronExcelMerge",
     "asar": true,
+    "electronLanguages": ["en-US"],
     "directories": {
       "output": "dist_electron"
     },
@@ -54,7 +57,15 @@
       "target": [
         {
           "target": "nsis",
-          "arch": ["x64"]
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "portable",
+          "arch": [
+            "x64"
+          ]
         }
       ]
     }

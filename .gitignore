@@ -2,3 +2,4 @@
 build
 dist_pkg
 dist
+dist_electron
