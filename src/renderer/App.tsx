@@ -250,7 +250,6 @@ export const App: React.FC = () => {
 
   return (
     <div style={{ padding: 16, fontFamily: 'sans-serif' }}>
-      <h1>Excel Viewer / Merge Tool (Electron + React + TypeScript)</h1>
       <div style={{ marginBottom: 12 }}>
         <button onClick={handleOpen}>打开单个 Excel 文件</button>
         <button

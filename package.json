@@ -1,5 +1,5 @@
 {
-  "name": "electron_excel",
+  "name": "e-merge",
   "version": "1.0.0",
   "main": "build/main/main.js",
   "scripts": {
@@ -41,8 +41,8 @@
     "webpack-dev-server": "^5.2.3"
   },
   "build": {
-    "appId": "com.example.electronexcelmerge",
-    "productName": "ElectronExcelMerge",
+    "appId": "com.example.emerge",
+    "productName": "eMerge",
     "asar": true,
     "electronLanguages": ["en-US"],
     "directories": {
@@ -54,6 +54,7 @@
       "package.json"
     ],
     "win": {
+      "icon": "build/icon.ico",
       "target": [
         {
           "target": "nsis",

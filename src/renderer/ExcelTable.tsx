@@ -1,15 +1,23 @@
-import React, { ChangeEvent, useEffect, useRef, useState } from 'react';
+import React, { ChangeEvent, UIEvent, useEffect, useRef, useState } from 'react';
 import type { SheetCell } from '../main/preload';
+
+const ROW_HEIGHT = 24; // 估算单行高度，用于虚拟滚动
+const OVERSCAN_ROWS = 10; // 视窗上下各多渲染几行，滚动更平滑
 
 interface ExcelTableProps {
   rows: SheetCell[][];
   onCellChange: (address: string, newValue: string) => void;
 }
 
-export const ExcelTable: React.FC<ExcelTableProps> = ({ rows, onCellChange }) => {
+const ExcelTableComponent: React.FC<ExcelTableProps> = ({ rows, onCellChange }) => {
   const [columnWidths, setColumnWidths] = useState<number[]>([]);
   const dragFrameRequestedRef = useRef(false);
   const lastClientXRef = useRef<number | null>(null);
+
+  // 虚拟滚动：容器引用、滚动偏移和视口高度
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(400);
 
   // 初始化列宽（根据首行列数）
   useEffect(() => {
@@ -21,6 +29,24 @@ export const ExcelTable: React.FC<ExcelTableProps> = ({ rows, onCellChange }) =>
       return Array(colCount).fill(120);
     });
   }, [rows]);
+
+  // 初始化和更新视口高度，用于计算需要渲染的行数
+  useEffect(() => {
+    const updateViewportHeight = () => {
+      if (containerRef.current) {
+        const h = containerRef.current.clientHeight;
+        if (h > 0) {
+          setViewportHeight(h);
+        }
+      }
+    };
+
+    updateViewportHeight();
+    window.addEventListener('resize', updateViewportHeight);
+    return () => {
+      window.removeEventListener('resize', updateViewportHeight);
+    };
+  }, []);
 
   const handleChange = (cell: SheetCell) => (e: ChangeEvent<HTMLInputElement>) => {
     onCellChange(cell.address, e.target.value);
@@ -71,6 +97,10 @@ export const ExcelTable: React.FC<ExcelTableProps> = ({ rows, onCellChange }) =>
 
   const getColWidth = (colIndex: number) => columnWidths[colIndex] ?? 120;
 
+  const handleScroll = (e: UIEvent<HTMLDivElement>) => {
+    setScrollTop(e.currentTarget.scrollTop);
+  };
+
   if (rows.length === 0) {
     return null;
   }
@@ -81,8 +111,21 @@ export const ExcelTable: React.FC<ExcelTableProps> = ({ rows, onCellChange }) =>
     String.fromCharCode('A'.charCodeAt(0) + (i % 26)),
   );
 
+  // 计算需要渲染的行窗口（虚拟滚动）
+  const totalRows = rows.length;
+  const visibleRowCount = Math.ceil(viewportHeight / ROW_HEIGHT) + OVERSCAN_ROWS * 2;
+  const firstVisibleRow = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN_ROWS);
+  const lastVisibleRow = Math.min(totalRows, firstVisibleRow + visibleRowCount);
+  const visibleRows = rows.slice(firstVisibleRow, lastVisibleRow);
+  const topSpacerHeight = firstVisibleRow * ROW_HEIGHT;
+  const bottomSpacerHeight = (totalRows - lastVisibleRow) * ROW_HEIGHT;
+
   return (
-    <div style={{ overflow: 'auto', maxHeight: '70vh', border: '1px solid #ccc' }}>
+    <div
+      ref={containerRef}
+      onScroll={handleScroll}
+      style={{ overflow: 'auto', maxHeight: '70vh', border: '1px solid #ccc' }}
+    >
       <table style={{ borderCollapse: 'collapse' }}>
         <thead>
           <tr>
@@ -131,7 +174,13 @@ export const ExcelTable: React.FC<ExcelTableProps> = ({ rows, onCellChange }) =>
           </tr>
         </thead>
         <tbody>
-          {rows.map((row, rowIndex) => {
+          {topSpacerHeight > 0 && (
+            <tr style={{ height: topSpacerHeight }}>
+              <td colSpan={colCount + 1} />
+            </tr>
+          )}
+          {visibleRows.map((row, localRowIndex) => {
+            const rowIndex = firstVisibleRow + localRowIndex;
             const excelRowNumber = row[0]?.row ?? rowIndex + 1;
             return (
               <tr key={rowIndex}>
@@ -157,6 +206,7 @@ export const ExcelTable: React.FC<ExcelTableProps> = ({ rows, onCellChange }) =>
                     padding: 2,
                     width: getColWidth(colIndex),
                     minWidth: getColWidth(colIndex),
+                    height: ROW_HEIGHT,
                   }}
                 >
                   <input
@@ -177,8 +227,15 @@ export const ExcelTable: React.FC<ExcelTableProps> = ({ rows, onCellChange }) =>
             </tr>
           );
         })}
+          {bottomSpacerHeight > 0 && (
+            <tr style={{ height: bottomSpacerHeight }}>
+              <td colSpan={colCount + 1} />
+            </tr>
+          )}
         </tbody>
       </table>
     </div>
   );
 };
+
+export const ExcelTable = React.memo(ExcelTableComponent);

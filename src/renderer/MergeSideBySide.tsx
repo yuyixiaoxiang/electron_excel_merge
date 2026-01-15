@@ -1,5 +1,8 @@
-import React, { useMemo } from 'react';
+import React, { UIEvent, useEffect, useMemo, useRef, useState } from 'react';
 import type { MergeCell } from '../main/preload';
+
+const ROW_HEIGHT = 24; // px, approximate row height for virtualization
+const OVERSCAN_ROWS = 8; // render a few extra rows above/below viewport for smooth scroll
 
 export interface MergeSideBySideProps {
   rows: MergeCell[][];
@@ -29,12 +32,58 @@ const getColumnLabels = (cols: number[]): string[] => {
   return cols.map((_, i) => String.fromCharCode('A'.charCodeAt(0) + (i % 26)));
 };
 
-export const MergeSideBySide: React.FC<MergeSideBySideProps> = ({
+const DATA_COL_WIDTH = 160; // px, keep ours/theirs columns visually aligned
+
+const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   rows,
   selected,
   onSelectCell,
 }) => {
   if (rows.length === 0) return null;
+
+  // 外层滚动容器引用 & 虚拟滚动状态
+  const containerRef = useRef<HTMLDivElement | null>(null);
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(400);
+
+  // 水平滚动同步：左右表格各自有横向滚动条，但滚动位置保持一致
+  const oursTableRef = useRef<HTMLDivElement | null>(null);
+  const theirsTableRef = useRef<HTMLDivElement | null>(null);
+  const isSyncingHorizontalRef = useRef(false);
+
+  useEffect(() => {
+    const updateViewportHeight = () => {
+      if (containerRef.current) {
+        const h = containerRef.current.clientHeight;
+        if (h > 0) {
+          setViewportHeight(h);
+        }
+      }
+    };
+
+    updateViewportHeight();
+    window.addEventListener('resize', updateViewportHeight);
+    return () => {
+      window.removeEventListener('resize', updateViewportHeight);
+    };
+  }, []);
+
+  const handleScroll = (e: UIEvent<HTMLDivElement>) => {
+    setScrollTop(e.currentTarget.scrollTop);
+  };
+
+  const handleHorizontalScroll = (side: 'ours' | 'theirs') => (e: UIEvent<HTMLDivElement>) => {
+    const current = e.currentTarget;
+    const other = side === 'ours' ? theirsTableRef.current : oursTableRef.current;
+    if (!other) return;
+    if (isSyncingHorizontalRef.current) return;
+
+    isSyncingHorizontalRef.current = true;
+    other.scrollLeft = current.scrollLeft;
+    requestAnimationFrame(() => {
+      isSyncingHorizontalRef.current = false;
+    });
+  };
 
   // 只展示有差异的行/列（status !== 'unchanged'）
   const diffColumns = useMemo(() => {
@@ -68,12 +117,25 @@ export const MergeSideBySide: React.FC<MergeSideBySideProps> = ({
 
   const columnLabels = getColumnLabels(diffColumns);
 
+  // 按 diff 行号做虚拟滚动（两侧共享同一套可见行）
+  const totalRows = diffRowNumbers.length;
+  const visibleRowCount = Math.ceil(viewportHeight / ROW_HEIGHT) + OVERSCAN_ROWS * 2;
+  const firstVisibleIndex = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN_ROWS);
+  const lastVisibleIndex = Math.min(totalRows, firstVisibleIndex + visibleRowCount);
+  const visibleRowNumbers = diffRowNumbers.slice(firstVisibleIndex, lastVisibleIndex);
+  const topSpacerHeight = firstVisibleIndex * ROW_HEIGHT;
+  const bottomSpacerHeight = (totalRows - lastVisibleIndex) * ROW_HEIGHT;
+
   const renderTable = (side: 'ours' | 'theirs') => (
-    <div style={{ flex: 1, overflow: 'auto' }}>
+    <div
+      ref={side === 'ours' ? oursTableRef : theirsTableRef}
+      onScroll={handleHorizontalScroll(side)}
+      style={{ flex: 1, overflowX: 'auto', overflowY: 'hidden' }}
+    >
       <div style={{ marginBottom: 4, fontWeight: 'bold', fontSize: 12 }}>
         {side === 'ours' ? 'ours (当前分支)' : 'theirs (合并分支)'}
       </div>
-      <table style={{ borderCollapse: 'collapse' }}>
+      <table style={{ borderCollapse: 'collapse', width: '100%' }}>
         <thead>
           <tr>
             <th
@@ -100,6 +162,8 @@ export const MergeSideBySide: React.FC<MergeSideBySideProps> = ({
                   userSelect: 'none',
                   backgroundColor: '#f0f0f0',
                   fontSize: 12,
+                  width: DATA_COL_WIDTH,
+                  minWidth: DATA_COL_WIDTH,
                 }}
               >
                 {label}
@@ -108,10 +172,15 @@ export const MergeSideBySide: React.FC<MergeSideBySideProps> = ({
           </tr>
         </thead>
         <tbody>
-          {diffRowNumbers.map((rowNumber) => {
+          {topSpacerHeight > 0 && (
+            <tr style={{ height: topSpacerHeight }}>
+              <td colSpan={columnLabels.length + 1} />
+            </tr>
+          )}
+          {visibleRowNumbers.map((rowNumber) => {
             const row = rows[rowNumber - 1];
             return (
-              <tr key={rowNumber}>
+              <tr key={rowNumber} style={{ height: ROW_HEIGHT }}>
                 <td
                   style={{
                     border: '1px solid #ddd',
@@ -129,7 +198,19 @@ export const MergeSideBySide: React.FC<MergeSideBySideProps> = ({
                 {diffColumns.map((colNumber) => {
                   const cell = row[colNumber - 1];
                   if (!cell) {
-                    return <td key={`${rowNumber}-${colNumber}`} />;
+                    // 保持与有内容的单元格相同的宽度，避免一侧为空时列变窄
+                    return (
+                      <td
+                        key={`${rowNumber}-${colNumber}`}
+                        style={{
+                          border: '1px solid #ddd',
+                          padding: 2,
+                          fontSize: 12,
+                          width: DATA_COL_WIDTH,
+                          minWidth: DATA_COL_WIDTH,
+                        }}
+                      />
+                    );
                   }
 
                   const sourceRowIndex = cell.row - 1;
@@ -153,6 +234,8 @@ export const MergeSideBySide: React.FC<MergeSideBySideProps> = ({
                         padding: 2,
                         backgroundColor: getBackgroundColor(cell.status, side),
                         fontSize: 12,
+                        width: DATA_COL_WIDTH,
+                        minWidth: DATA_COL_WIDTH,
                       }}
                       title={`地址: ${cell.address}\nbase: ${cell.baseValue ?? ''}\nours: ${cell.oursValue ?? ''}\ntheirs: ${cell.theirsValue ?? ''}`}
                       onClick={() => onSelectCell && onSelectCell(sourceRowIndex, sourceColIndex)}
@@ -164,6 +247,11 @@ export const MergeSideBySide: React.FC<MergeSideBySideProps> = ({
               </tr>
             );
           })}
+          {bottomSpacerHeight > 0 && (
+            <tr style={{ height: bottomSpacerHeight }}>
+              <td colSpan={columnLabels.length + 1} />
+            </tr>
+          )}
         </tbody>
       </table>
     </div>
@@ -171,13 +259,16 @@ export const MergeSideBySide: React.FC<MergeSideBySideProps> = ({
 
   return (
     <div
+      ref={containerRef}
+      onScroll={handleScroll}
       style={{
         display: 'flex',
         gap: 16,
         border: '1px solid #ccc',
         padding: 8,
         maxHeight: '70vh',
-        overflow: 'hidden',
+        overflowY: 'auto',
+        overflowX: 'hidden',
       }}
     >
       {renderTable('ours')}
@@ -185,3 +276,5 @@ export const MergeSideBySide: React.FC<MergeSideBySideProps> = ({
     </div>
   );
 };
+
+export const MergeSideBySide = React.memo(MergeSideBySideComponent);
