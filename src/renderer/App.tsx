@@ -31,6 +31,12 @@ export const App: React.FC = () => {
   const [rows, setRows] = useState<SheetCell[][]>([]);
   const [changes, setChanges] = useState<Map<string, CellChange>>(new Map());
   const [saving, setSaving] = useState(false);
+  // 当前单文件模式下选中的单元格（用于顶部“公式栏”显示）
+  const [selectedSingleCell, setSelectedSingleCell] = useState<SheetCell | null>(null);
+  // 固定在顶部的首行数，默认 3 行
+  const [frozenRowCount, setFrozenRowCount] = useState<number>(3);
+  // 固定在左侧的列数（不含最左侧行号列），默认 0 列
+  const [frozenColCount, setFrozenColCount] = useState<number>(0);
 
   // 三方 diff 状态
   const [mergeSheets, setMergeSheets] = useState<MergeSheetData[]>([]);
@@ -57,6 +63,7 @@ export const App: React.FC = () => {
 
     setMode('single');
     setFilePath(result.filePath);
+    setSelectedSingleCell(null);
     const allSheets = result.sheets && result.sheets.length > 0 ? result.sheets : [result.sheet];
     setSheets(allSheets);
     setSelectedSheetIndex(0);
@@ -75,6 +82,7 @@ export const App: React.FC = () => {
     if (!result) return;
 
     setMode('merge');
+    setSelectedSingleCell(null);
     const allMergeSheets = result.sheets && result.sheets.length > 0 ? result.sheets : [result.sheet];
     setMergeSheets(allMergeSheets);
     setSelectedMergeSheetIndex(0);
@@ -153,6 +161,21 @@ export const App: React.FC = () => {
 
   const hasData = useMemo(() => rows.length > 0, [rows]);
   const hasMergeData = useMemo(() => mergeRows.length > 0, [mergeRows]);
+
+  // 顶部“公式栏”当前要展示的单元格坐标和值（single / merge 共用）
+  let currentCellAddress = '';
+  let currentCellValue = '';
+
+  if (mode === 'single' && selectedSingleCell) {
+    currentCellAddress = selectedSingleCell.address;
+    currentCellValue = selectedSingleCell.value === null ? '' : String(selectedSingleCell.value);
+  } else if (mode === 'merge' && selectedMergeCell) {
+    const cell = mergeRows[selectedMergeCell.rowIndex]?.[selectedMergeCell.colIndex];
+    if (cell) {
+      currentCellAddress = cell.address;
+      currentCellValue = cell.mergedValue === null ? '' : String(cell.mergedValue);
+    }
+  }
 
   const handleSelectMergeCell = useCallback((rowIndex: number, colIndex: number) => {
     setSelectedMergeCell({ rowIndex, colIndex });
@@ -282,7 +305,17 @@ export const App: React.FC = () => {
   }, [mergeInfo, mergeRows]);
 
   return (
-    <div style={{ padding: 16, fontFamily: 'sans-serif' }}>
+    <div
+      style={{
+        padding: 16,
+        fontFamily: 'sans-serif',
+        height: '100vh',
+        boxSizing: 'border-box',
+        display: 'flex',
+        flexDirection: 'column',
+        overflow: 'hidden',
+      }}
+    >
       <div style={{ marginBottom: 12 }}>
         <button onClick={handleOpen}>打开单个 Excel 文件</button>
         <button
@@ -313,11 +346,61 @@ export const App: React.FC = () => {
         )}
       </div>
 
+      {/* 公式栏：显示当前选中单元格的坐标与值（single / merge 共用） */}
+      <div
+        style={{
+          display: 'flex',
+          alignItems: 'flex-start',
+          gap: 8,
+          marginBottom: 8,
+        }}
+      >
+        <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+          <span style={{ fontSize: 12 }}>单元格地址</span>
+          <input
+            readOnly
+            value={currentCellAddress}
+            placeholder="例如 A1"
+            style={{ width: 90, padding: '2px 6px', boxSizing: 'border-box' }}
+          />
+        </div>
+        <div style={{ display: 'flex', flex: 1, alignItems: 'flex-start', gap: 4 }}>
+          <span style={{ fontSize: 12, whiteSpace: 'nowrap' }}>当前值</span>
+          <textarea
+            readOnly
+            value={currentCellValue}
+            placeholder="当前单元格值"
+            rows={1}
+            style={{
+              flex: 1,              minWidth: 260,
+              maxWidth: '100%',
+              padding: '2px 6px',
+              boxSizing: 'border-box',
+              height: 24,
+              resize: 'none',
+              whiteSpace: 'pre-wrap',
+              wordBreak: 'break-all',
+            }}
+          />
+        </div>
+      </div>
+
+      {/* 主内容：表格 / 三方 Merge，占用剩余空间，由内部自己滚动 */}
+      <div
+        style={{
+          flex: 1,
+          minHeight: 0,
+          overflow: 'hidden',
+          display: 'flex',
+          flexDirection: 'column',
+        }}
+      >
+
       {mode === 'single' && filePath && (
-        <div style={{ marginBottom: 8 }}>
-          <div>当前文件: {filePath}</div>
-          <div style={{ display: 'flex', alignItems: 'center', marginTop: 4 }}>
-            <span>工作表:</span>
+          <div style={{ marginBottom: 8 }}>
+            <div>当前文件: {filePath}</div>
+            <div style={{ display: 'flex', alignItems: 'center', marginTop: 4 }}>
+              <span>工作表:</span>
             <div
               style={{
                 display: 'inline-flex',
@@ -338,6 +421,7 @@ export const App: React.FC = () => {
                       setSheetName(sheet?.sheetName ?? null);
                       setRows(sheet?.rows ?? []);
                       setChanges(new Map());
+                      setSelectedSingleCell(null);
                     }}
                     style={{
                       padding: '2px 8px',
@@ -356,16 +440,59 @@ export const App: React.FC = () => {
             </div>
           </div>
           <div>已修改单元格数量: {changes.size}</div>
+          <div style={{ display: 'flex', alignItems: 'center', marginTop: 4, gap: 4 }}>
+            <span>固定首行数:</span>
+            <input
+              type="number"
+              min={0}
+              value={frozenRowCount}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                if (Number.isNaN(v)) return;
+                setFrozenRowCount(Math.max(0, Math.floor(v)));
+              }}
+              style={{ width: 60, padding: '2px 6px', boxSizing: 'border-box' }}
+            />
+            <span style={{ fontSize: 12, color: '#666' }}>（例如 3 表示固定前 3 行）</span>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', marginTop: 4, gap: 4 }}>
+            <span>固定首列数:</span>
+            <input
+              type="number"
+              min={0}
+              value={frozenColCount}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                if (Number.isNaN(v)) return;
+                setFrozenColCount(Math.max(0, Math.floor(v)));
+              }}
+              style={{ width: 60, padding: '2px 6px', boxSizing: 'border-box' }}
+            />
+            <span style={{ fontSize: 12, color: '#666' }}>（例如 1 表示固定 A 列）</span>
+          </div>
         </div>
       )}
 
       {mode === 'single' && (
-        hasData ? <ExcelTable rows={rows} onCellChange={handleCellChange} /> : <div>请先打开一个 .xlsx 文件。</div>
+        hasData ? (
+          <div style={{ flex: 1, minHeight: 0 }}>
+            <ExcelTable
+              rows={rows}
+              onCellChange={handleCellChange}
+              onCellSelect={setSelectedSingleCell}
+              selectedAddress={selectedSingleCell?.address ?? null}
+              frozenRowCount={frozenRowCount}
+              frozenColCount={frozenColCount}
+            />
+          </div>
+        ) : (
+          <div>请先打开一个 .xlsx 文件。</div>
+        )
       )}
 
       {mode === 'merge' && (
         hasMergeData && mergeInfo ? (
-          <div>
+          <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
             <div style={{ marginBottom: 8 }}>
               {/* diff 模式（仅传 LOCAL/REMOTE）时不显示 base 行 */}
               {!(cliInfo && cliInfo.mode === 'diff') && <div>base: {mergeInfo.basePath}</div>}
@@ -424,11 +551,13 @@ export const App: React.FC = () => {
                 颜色说明：绿色 = 只在 ours 改变，蓝色 = 只在 theirs 改变，黄色 = 双方都改成相同值，红色 = 冲突（双方修改成不同值）。比较时只看单元格值，忽略格式。
               </div>
             </div>
-            <MergeSideBySide
-              rows={mergeRows}
-              selected={selectedMergeCell}
-              onSelectCell={handleSelectMergeCell}
-            />
+            <div style={{ flex: 1, minHeight: 0 }}>
+              <MergeSideBySide
+                rows={mergeRows}
+                selected={selectedMergeCell}
+                onSelectCell={handleSelectMergeCell}
+              />
+            </div>
             {selectedMergeCell && (() => {
               const cell = mergeRows[selectedMergeCell.rowIndex]?.[selectedMergeCell.colIndex];
               if (!cell) return null;
@@ -459,6 +588,8 @@ export const App: React.FC = () => {
           <div>请先选择 base / ours / theirs 三个 Excel 文件。</div>
         )
       )}
+      </div>
     </div>
   );
 };
+
