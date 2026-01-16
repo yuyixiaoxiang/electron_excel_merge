@@ -1,6 +1,11 @@
 import React from 'react';
 import type { MergeCell } from '../main/preload';
 
+/**
+ * 旧版/备用的三方合并结果表格，仅展示 mergedValue。
+ *
+ * 目前主视图使用的是 MergeSideBySide，保留此组件便于后续需要简化视图时复用。
+ */
 export interface MergeTableProps {
   rows: MergeCell[][];
   selected?: { rowIndex: number; colIndex: number } | null;

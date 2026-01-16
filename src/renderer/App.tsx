@@ -13,6 +13,11 @@ import type {
 import { ExcelTable } from './ExcelTable';
 import { MergeSideBySide } from './MergeSideBySide';
 
+/**
+ * 应用根组件：
+ * - single 模式：单个 Excel 文件的查看与轻量编辑；
+ * - merge 模式：base / ours / theirs 三方合并与结果写回。
+ */
 type ViewMode = 'single' | 'merge';
 
 export const App: React.FC = () => {
@@ -43,6 +48,9 @@ export const App: React.FC = () => {
     colIndex: number;
   } | null>(null);
 
+  /**
+   * 交互式选择一个 Excel 文件并进入单文件编辑模式。
+   */
   const handleOpen = useCallback(async () => {
     const result: OpenResult | null = await window.excelAPI.openFile();
     if (!result) return;
@@ -57,6 +65,11 @@ export const App: React.FC = () => {
     setChanges(new Map());
   }, []);
 
+  /**
+   * 交互式选择 base / ours / theirs（三方 diff），并切换到 merge 视图。
+   *
+   * 如果是通过 git/Fork CLI 启动，则在 useEffect 中自动调用，无需用户再次点按钮。
+   */
   const handleOpenThreeWay = useCallback(async () => {
     const result: ThreeWayOpenResult | null = await window.excelAPI.openThreeWay();
     if (!result) return;
@@ -90,6 +103,11 @@ export const App: React.FC = () => {
     })();
   }, [handleOpenThreeWay]);
 
+  /**
+   * 单文件编辑模式下，当用户修改某个输入框时：
+   * - 更新内存中的 rows；
+   * - 在 changes Map 中记录此单元格修改，供后续一次性保存。
+   */
   const handleCellChange = useCallback(
     (address: string, newValue: string) => {
       setRows((prev) =>
@@ -117,6 +135,9 @@ export const App: React.FC = () => {
     [],
   );
 
+  /**
+   * 将单文件编辑模式下所有修改过的单元格一次性写回原 Excel。
+   */
   const handleSave = useCallback(async () => {
     if (!filePath || changes.size === 0) return;
     setSaving(true);
@@ -137,6 +158,12 @@ export const App: React.FC = () => {
     setSelectedMergeCell({ rowIndex, colIndex });
   }, []);
 
+  /**
+   * merge 模式下，在右侧详情中点击“用 base / ours / theirs”按钮时：
+   * - 更新 mergeSheets 中对应单元格的 mergedValue；
+   * - 同步更新当前正在展示的 mergeRows；
+   *   这样列表与详情都能立即反映最新选择。
+   */
   const handleApplyMergeChoice = useCallback(
     (source: 'base' | 'ours' | 'theirs') => {
       if (!selectedMergeCell) return;
@@ -176,6 +203,12 @@ export const App: React.FC = () => {
     [selectedMergeCell, selectedMergeSheetIndex],
   );
 
+  /**
+   * merge 模式下，将所有工作表的 mergedValue 写回一个目标 Excel 文件。
+   *
+   * 为了避免误操作，这里会先统计所有发生变化的单元格，
+   * 构造一个预览字符串通过 window.confirm 让用户二次确认。
+   */
   const handleSaveMergeToFile = useCallback(async () => {
     if (!mergeInfo || mergeSheets.length === 0) return;
 

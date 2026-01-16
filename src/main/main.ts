@@ -1,13 +1,27 @@
+/**
+ * 主进程入口：负责创建 Electron 窗口、解析 git/Fork 传入的三方合并参数，
+ * 并通过 IPC 向渲染进程提供 Excel 读写与三方 diff / merge 的能力。
+ */
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
 import * as path from 'path';
 import { spawn } from 'child_process';
-import { Workbook } from 'exceljs';
+import { Workbook, Worksheet, Row, Cell, CellValue } from 'exceljs';
 
+// 保持对主窗口的引用，避免被 GC 回收导致窗口被意外关闭
 let mainWindow: BrowserWindow | null = null;
 
 const isDev = process.env.NODE_ENV === 'development';
 
-// CLI three-way merge arguments for git/Fork integration
+/**
+ * CLI three-way merge arguments for git/Fork integration.
+ *
+ * 约定（以 Fork / git mergetool 为例）：
+ *   - diff 模式:   app.exe OURS THEIRS
+ *   - merge 模式:  app.exe BASE OURS THEIRS [MERGED]
+ *
+ * 当带有 mergedPath 时，保存结果会直接写回 MERGED 文件；
+ * 否则会回退到覆盖 ours（当前分支工作区文件）。
+ */
 interface CliThreeWayArgs {
   basePath: string;
   oursPath: string;
@@ -16,6 +30,12 @@ interface CliThreeWayArgs {
   mode: 'diff' | 'merge';
 }
 
+/**
+ * 从 process.argv 中解析三方合并相关参数。
+ *
+ * - 开发环境下 argv 形如: [electron, main.js, '.', ...args]
+ * - 打包后 exe 下 argv 形如: [app.exe, ...args]
+ */
 const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
   // 对于开发环境: process.argv = [electron, main.js, '.', ...args]
   // 对于打包后的 exe: process.argv = [app.exe, ...args]
@@ -37,8 +57,15 @@ const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
   return { basePath, oursPath, theirsPath, mergedPath, mode: 'merge' };
 };
 
+// 解析启动参数得到的三方合并信息（若无参数则为 null，走交互式模式）
 const cliThreeWayArgs: CliThreeWayArgs | null = parseCliThreeWayArgs();
 
+/**
+ * 尝试在目标文件所在目录执行一次 `git add <filePath>`，
+ * 方便在作为 merge tool 运行时自动标记冲突已解决。
+ *
+ * 注意：这里做的是“尽力而为”的操作，失败只会打印日志，不会中断主流程。
+ */
 const gitAddFile = (filePath: string): Promise<void> => {
   return new Promise((resolve) => {
     const cwd = path.dirname(filePath);
@@ -58,6 +85,12 @@ const gitAddFile = (filePath: string): Promise<void> => {
   });
 };
 
+/**
+ * 创建主浏览器窗口并加载前端页面。
+ *
+ * 开发模式下连接本地 webpack dev server，
+ * 生产模式下加载打包到 dist 中的 index.html。
+ */
 function createWindow() {
   mainWindow = new BrowserWindow({
     width: 1200,
@@ -144,6 +177,12 @@ interface SaveMergeResponse {
 
 let currentFilePath: string | null = null;
 
+/**
+ * 处理渲染进程请求：选择并打开一个 Excel 文件。
+ *
+ * 返回：文件路径 + 所有工作表的二维单元格数据（仅包含“值”），
+ * 用于单文件查看/编辑模式。
+ */
 ipcMain.handle('excel:open', async () => {
   if (!mainWindow) return null;
 
@@ -162,10 +201,10 @@ ipcMain.handle('excel:open', async () => {
   const workbook = new Workbook();
   await workbook.xlsx.readFile(filePath);
 
-  const buildSheetData = (worksheet: any): SheetData => {
+  const buildSheetData = (worksheet: Worksheet): SheetData => {
     const rows: SheetCell[][] = [];
 
-    const getSimpleValue = (raw: any): string | number | null => {
+    const getSimpleValue = (raw: CellValue): string | number | null => {
       if (raw === null || raw === undefined) return null;
       // 富文本：raw.richText 是一个包含 { text } 的数组
       if (typeof raw === 'object' && Array.isArray((raw as any).richText)) {
@@ -186,9 +225,9 @@ ipcMain.handle('excel:open', async () => {
       return String(raw);
     };
 
-    worksheet.eachRow((row: any, rowNumber: number) => {
+    worksheet.eachRow((row: Row, rowNumber: number) => {
       const rowCells: SheetCell[] = [];
-      row.eachCell({ includeEmpty: true }, (cell: any, colNumber: number) => {
+      row.eachCell({ includeEmpty: true }, (cell: Cell, colNumber: number) => {
         const value = getSimpleValue(cell.value as any);
 
         rowCells.push({
@@ -217,6 +256,11 @@ interface CellChange {
   newValue: string | number | null;
 }
 
+/**
+ * 将单文件编辑模式下用户修改过的单元格写回原始 Excel 文件。
+ *
+ * 只修改单元格的 value，不动样式/公式等格式信息。
+ */
 ipcMain.handle('excel:saveChanges', async (_event, changes: CellChange[]) => {
   if (!currentFilePath) {
     throw new Error('No Excel file is currently loaded');
@@ -237,6 +281,14 @@ ipcMain.handle('excel:saveChanges', async (_event, changes: CellChange[]) => {
 });
 
 // 保存三方 merge 结果到新的 Excel 文件，仅修改值，不改格式
+//
+// 在 git/Fork merge 模式下：
+//   - 如果提供了 MERGED 参数，则结果写回 MERGED；
+//   - 否则回退到覆盖 ours；
+// 在 diff 模式下：
+//   - 直接覆盖 ours（LOCAL）。
+// 交互式模式下：
+//   - 弹出保存对话框，由用户选择目标路径。
 ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): Promise<SaveMergeResponse> => {
   if (!mainWindow) {
     throw new Error('Main window is not available');
@@ -294,9 +346,17 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
 });
 
 // 三方 diff：base / ours / theirs，只比较单元格值，忽略格式
+//
+// 返回给渲染进程的数据是：
+//   - base / ours / theirs 的文件路径；
+//   - 每个工作表的三方单元格值 + 差异状态（unchanged / conflict 等）。
 ipcMain.handle('excel:openThreeWay', async () => {
   if (!mainWindow) return null;
 
+  // 对单个工作表做三方 diff：
+  // - 将 base / ours / theirs 的同一坐标单元格抽取出来；
+  // - 根据值的相等情况计算 status；
+  // - 默认 mergedValue 从 base 或 ours 推导出一个初始值，之后可在前端调整。
   const buildMergeSheet = (baseWs: any, oursWs: any, theirsWs: any): MergeSheetData => {
     const rows: MergeCell[][] = [];
 
@@ -384,6 +444,9 @@ ipcMain.handle('excel:openThreeWay', async () => {
   };
 
   // 按同名 sheet 做 diff
+  /**
+   * 按工作表名称对三个工作簿做对齐，仅对“同时存在于 base / ours / theirs 中的工作表”做 diff。
+   */
   const buildMergeSheetsForWorkbooks = async (
     basePath: string,
     oursPath: string,
@@ -452,7 +515,8 @@ ipcMain.handle('excel:openThreeWay', async () => {
   return { basePath, oursPath, theirsPath, sheet: mergeSheets[0], sheets: mergeSheets };
 });
 
-// 将 CLI three-way 信息暴露给渲染进程，便于自动加载ipcMain.handle('excel:getCliThreeWayInfo', async () => {
+// 将 CLI three-way 信息暴露给渲染进程，便于自动加载
+ipcMain.handle('excel:getCliThreeWayInfo', async () => {
   if (!cliThreeWayArgs) return null;
   return cliThreeWayArgs;
 });

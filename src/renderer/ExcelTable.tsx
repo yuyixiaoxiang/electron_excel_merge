@@ -4,6 +4,12 @@ import type { SheetCell } from '../main/preload';
 const ROW_HEIGHT = 24; // 估算单行高度，用于虚拟滚动
 const OVERSCAN_ROWS = 10; // 视窗上下各多渲染几行，滚动更平滑
 
+/**
+ * 单文件编辑视图中使用的表格组件。
+ *
+ * 只渲染可见的行（基于简单的虚拟滚动实现），
+ * 以便在行数较多时保持较好的滚动与编辑性能。
+ */
 interface ExcelTableProps {
   rows: SheetCell[][];
   onCellChange: (address: string, newValue: string) => void;

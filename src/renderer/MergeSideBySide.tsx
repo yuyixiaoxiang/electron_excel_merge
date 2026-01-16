@@ -4,6 +4,12 @@ import type { MergeCell } from '../main/preload';
 const ROW_HEIGHT = 24; // px, approximate row height for virtualization
 const OVERSCAN_ROWS = 8; // render a few extra rows above/below viewport for smooth scroll
 
+/**
+ * 三方对比视图中使用的 side-by-side 表格组件。
+ *
+ * 左右两侧分别显示 ours / theirs，行集只包含有差异的单元格所在行，
+ * 并通过虚拟滚动与水平滚动联动减少 DOM 数量、提升性能。
+ */
 export interface MergeSideBySideProps {
   rows: MergeCell[][];
   selected?: { rowIndex: number; colIndex: number } | null;
