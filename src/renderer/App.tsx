@@ -37,11 +37,13 @@ export const App: React.FC = () => {
   const [frozenRowCount, setFrozenRowCount] = useState<number>(3);
   // 固定在左侧的列数（不含最左侧行号列），默认 0 列
   const [frozenColCount, setFrozenColCount] = useState<number>(0);
+  // merge/diff 视图中固定在顶部展示的行数，默认 3 行
+  const [mergeFrozenRowCount, setMergeFrozenRowCount] = useState<number>(3);
 
   // 三方 diff 状态
   const [mergeSheets, setMergeSheets] = useState<MergeSheetData[]>([]);
   const [selectedMergeSheetIndex, setSelectedMergeSheetIndex] = useState<number>(0);
-  const [mergeRows, setMergeRows] = useState<MergeCell[][]>([]);
+  const [mergeCells, setMergeCells] = useState<MergeCell[]>([]);
   const [mergeInfo, setMergeInfo] = useState<{
     basePath: string;
     oursPath: string;
@@ -83,15 +85,21 @@ export const App: React.FC = () => {
 
     setMode('merge');
     setSelectedSingleCell(null);
-    const allMergeSheets = result.sheets && result.sheets.length > 0 ? result.sheets : [result.sheet];
+    const allMergeSheets =
+      result.sheets && result.sheets.length > 0
+        ? result.sheets
+        : result.sheet
+          ? [result.sheet]
+          : [];
+
     setMergeSheets(allMergeSheets);
     setSelectedMergeSheetIndex(0);
-    setMergeRows(allMergeSheets[0]?.rows ?? []);
+    setMergeCells(allMergeSheets[0]?.cells ?? []);
     setMergeInfo({
       basePath: result.basePath,
       oursPath: result.oursPath,
       theirsPath: result.theirsPath,
-      sheetName: allMergeSheets[0]?.sheetName ?? result.sheet.sheetName,
+      sheetName: allMergeSheets[0]?.sheetName ?? result.sheet?.sheetName ?? '',
     });
     setSelectedMergeCell(null);
   }, []);
@@ -160,7 +168,7 @@ export const App: React.FC = () => {
   }, [changes, filePath]);
 
   const hasData = useMemo(() => rows.length > 0, [rows]);
-  const hasMergeData = useMemo(() => mergeRows.length > 0, [mergeRows]);
+  const hasMergeData = useMemo(() => mergeCells.length > 0, [mergeCells]);
 
   // 顶部“公式栏”当前要展示的单元格坐标和值（single / merge 共用）
   let currentCellAddress = '';
@@ -170,7 +178,8 @@ export const App: React.FC = () => {
     currentCellAddress = selectedSingleCell.address;
     currentCellValue = selectedSingleCell.value === null ? '' : String(selectedSingleCell.value);
   } else if (mode === 'merge' && selectedMergeCell) {
-    const cell = mergeRows[selectedMergeCell.rowIndex]?.[selectedMergeCell.colIndex];
+    const key = `${selectedMergeCell.rowIndex + 1}:${selectedMergeCell.colIndex + 1}`;
+    const cell = mergeCells.find((c) => `${c.row}:${c.col}` === key);
     if (cell) {
       currentCellAddress = cell.address;
       currentCellValue = cell.mergedValue === null ? '' : String(cell.mergedValue);
@@ -195,32 +204,28 @@ export const App: React.FC = () => {
       setMergeSheets((prev) =>
         prev.map((sheet: MergeSheetData, sIdx: number) => {
           if (sIdx !== selectedMergeSheetIndex) return sheet;
-          const newRows = sheet.rows.map((row, rIdx) =>
-            row.map((cell, cIdx) => {
-              if (rIdx !== rowIndex || cIdx !== colIndex) return cell;
-              let value: string | number | null;
-              if (source === 'base') value = cell.baseValue;
-              else if (source === 'ours') value = cell.oursValue;
-              else value = cell.theirsValue;
-              return { ...cell, mergedValue: value };
-            }),
-          );
-          return { ...sheet, rows: newRows };
-        }),
-      );
-
-      // 同步当前视图的 rows
-      setMergeRows((prev) =>
-        prev.map((row, rIdx) =>
-          row.map((cell, cIdx) => {
-            if (rIdx !== rowIndex || cIdx !== colIndex) return cell;
+          const newCells = sheet.cells.map((cell) => {
+            if (cell.row - 1 !== rowIndex || cell.col - 1 !== colIndex) return cell;
             let value: string | number | null;
             if (source === 'base') value = cell.baseValue;
             else if (source === 'ours') value = cell.oursValue;
             else value = cell.theirsValue;
             return { ...cell, mergedValue: value };
-          }),
-        ),
+          });
+          return { ...sheet, cells: newCells };
+        }),
+      );
+
+      // 同步当前视图的 cells
+      setMergeCells((prev) =>
+        prev.map((cell) => {
+          if (cell.row - 1 !== rowIndex || cell.col - 1 !== colIndex) return cell;
+          let value: string | number | null;
+          if (source === 'base') value = cell.baseValue;
+          else if (source === 'ours') value = cell.oursValue;
+          else value = cell.theirsValue;
+          return { ...cell, mergedValue: value };
+        }),
       );
     },
     [selectedMergeCell, selectedMergeSheetIndex],
@@ -235,20 +240,16 @@ export const App: React.FC = () => {
   const handleSaveMergeToFile = useCallback(async () => {
     if (!mergeInfo || mergeSheets.length === 0) return;
 
-    // 生成本次合并的概要信息：统计所有 sheet 中 status !== 'unchanged' 的单元格
+    // 生成本次合并的概要信息：mergeSheets.cells 本身就是差异单元格列表
     const changedCells: { sheetName: string; address: string; ours: any; theirs: any; merged: any }[] = [];
     mergeSheets.forEach((sheet) => {
-      sheet.rows.forEach((row: MergeCell[]) => {
-        row.forEach((cell: MergeCell) => {
-          if (cell.status !== 'unchanged') {
-            changedCells.push({
-              sheetName: sheet.sheetName,
-              address: cell.address,
-              ours: cell.oursValue,
-              theirs: cell.theirsValue,
-              merged: cell.mergedValue,
-            });
-          }
+      sheet.cells.forEach((cell: MergeCell) => {
+        changedCells.push({
+          sheetName: sheet.sheetName,
+          address: cell.address,
+          ours: cell.oursValue,
+          theirs: cell.theirsValue,
+          merged: cell.mergedValue,
         });
       });
     });
@@ -276,13 +277,11 @@ export const App: React.FC = () => {
     if (!confirmed) return;
 
     const cells = mergeSheets.flatMap((sheet: MergeSheetData) =>
-      sheet.rows.flatMap((row: MergeCell[]) =>
-        row.map((cell: MergeCell) => ({
-          sheetName: sheet.sheetName,
-          address: cell.address,
-          value: cell.mergedValue,
-        })),
-      ),
+      sheet.cells.map((cell: MergeCell) => ({
+        sheetName: sheet.sheetName,
+        address: cell.address,
+        value: cell.mergedValue,
+      })),
     );
 
     const payload: SaveMergeRequest = {
@@ -302,7 +301,7 @@ export const App: React.FC = () => {
     } catch (e) {
       alert(`保存合并结果失败：${String(e)}`);
     }
-  }, [mergeInfo, mergeRows]);
+  }, [mergeInfo, mergeSheets]);
 
   return (
     <div
@@ -491,13 +490,23 @@ export const App: React.FC = () => {
       )}
 
       {mode === 'merge' && (
-        hasMergeData && mergeInfo ? (
+        mergeInfo && mergeSheets.length === 0 ? (
+          <div>
+            没有可对比的工作表（base / ours / theirs 中没有任何“同名工作表”的交集）。
+          </div>
+        ) : mergeInfo ? (
           <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
             <div style={{ marginBottom: 8 }}>
               {/* diff 模式（仅传 LOCAL/REMOTE）时不显示 base 行 */}
               {!(cliInfo && cliInfo.mode === 'diff') && <div>base: {mergeInfo.basePath}</div>}
               <div>ours: {mergeInfo.oursPath}</div>
               <div>theirs: {mergeInfo.theirsPath}</div>
+              {mergeInfo.basePath === mergeInfo.oursPath &&
+                mergeInfo.oursPath === mergeInfo.theirsPath && (
+                  <div style={{ marginTop: 4, color: '#b00020', fontSize: 12 }}>
+                    警告：base / ours / theirs 路径完全相同，无法产生差异。请检查第三方工具传参是否正确。
+                  </div>
+                )}
               {cliInfo?.mergedPath && (
                 <div>merged(写回目标): {cliInfo.mergedPath}</div>
               )}
@@ -528,7 +537,7 @@ export const App: React.FC = () => {
                                 }
                               : prev,
                           );
-                          setMergeRows(sheet?.rows ?? []);
+                          setMergeCells(sheet?.cells ?? []);
                           setSelectedMergeCell(null);
                         }}
                         style={{
@@ -550,16 +559,33 @@ export const App: React.FC = () => {
               <div style={{ marginTop: 4, fontSize: 12 }}>
                 颜色说明：绿色 = 只在 ours 改变，蓝色 = 只在 theirs 改变，黄色 = 双方都改成相同值，红色 = 冲突（双方修改成不同值）。比较时只看单元格值，忽略格式。
               </div>
+              <div style={{ display: 'flex', alignItems: 'center', marginTop: 4, gap: 4 }}>
+                <span>merge/diff 冻结行数:</span>
+                <input
+                  type="number"
+                  min={0}
+                  value={mergeFrozenRowCount}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isNaN(v)) return;
+                    setMergeFrozenRowCount(Math.max(0, Math.floor(v)));
+                  }}
+                  style={{ width: 60, padding: '2px 6px', boxSizing: 'border-box' }}
+                />
+                <span style={{ fontSize: 12, color: '#666' }}>（例如 3 表示固定前 3 行）</span>
+              </div>
             </div>
             <div style={{ flex: 1, minHeight: 0 }}>
-              <MergeSideBySide
-                rows={mergeRows}
-                selected={selectedMergeCell}
-                onSelectCell={handleSelectMergeCell}
-              />
+                <MergeSideBySide
+                  cells={mergeCells}
+                  selected={selectedMergeCell}
+                  onSelectCell={handleSelectMergeCell}
+                  frozenRowCount={mergeFrozenRowCount}
+                />
             </div>
             {selectedMergeCell && (() => {
-              const cell = mergeRows[selectedMergeCell.rowIndex]?.[selectedMergeCell.colIndex];
+              const key = `${selectedMergeCell.rowIndex + 1}:${selectedMergeCell.colIndex + 1}`;
+              const cell = mergeCells.find((c) => `${c.row}:${c.col}` === key);
               if (!cell) return null;
               return (
                 <div style={{ marginTop: 8, padding: 8, border: '1px solid #ccc', fontSize: 12 }}>

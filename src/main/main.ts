@@ -39,7 +39,7 @@ interface CliThreeWayArgs {
 const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
   // 对于开发环境: process.argv = [electron, main.js, '.', ...args]
   // 对于打包后的 exe: process.argv = [app.exe, ...args]
-  const argStartIndex = app.isPackaged ? 1 : 2;
+  const argStartIndex = app?.isPackaged ? 1 : 2;
   const rawArgs = process.argv.slice(argStartIndex);
   const userArgs = rawArgs.filter((arg) => !arg.startsWith('--'));
 
@@ -104,6 +104,7 @@ function createWindow() {
 
   if (isDev) {
     mainWindow.loadURL('http://localhost:3000');
+    mainWindow.webContents.openDevTools();
   } else {
     mainWindow.loadFile(path.join(__dirname, '..', '..', 'dist', 'index.html'));
   }
@@ -155,7 +156,7 @@ interface MergeCell {
 
 interface MergeSheetData {
   sheetName: string;
-  rows: MergeCell[][];
+  cells: MergeCell[];
 }
 
 interface SaveMergeCellInput {
@@ -358,8 +359,6 @@ ipcMain.handle('excel:openThreeWay', async () => {
   // - 根据值的相等情况计算 status；
   // - 默认 mergedValue 从 base 或 ours 推导出一个初始值，之后可在前端调整。
   const buildMergeSheet = (baseWs: any, oursWs: any, theirsWs: any): MergeSheetData => {
-    const rows: MergeCell[][] = [];
-
     const getSimpleValue = (v: any): string | number | null => {
       if (v === null || v === undefined) return null;
       // 富文本：v.richText 是一个包含 { text } 的数组
@@ -375,57 +374,82 @@ ipcMain.handle('excel:openThreeWay', async () => {
       return String(v);
     };
 
-    const maxRow = Math.max(baseWs.rowCount, oursWs.rowCount, theirsWs.rowCount);
-    const maxCol = Math.max(baseWs.columnCount, oursWs.columnCount, theirsWs.columnCount);
+    type CellInfo = { address: string; row: number; col: number; value: string | number | null };
 
-    for (let rowNumber = 1; rowNumber <= maxRow; rowNumber += 1) {
-      const mergeRow: MergeCell[] = [];
+    // 将 worksheet 中“实际存在内容”的单元格提取为 Map
+    const extractCells = (ws: any): Map<string, CellInfo> => {
+      const m = new Map<string, CellInfo>();
+      // includeEmpty: false -> 只遍历有内容的行/单元格，避免巨大空白区域
+      ws.eachRow({ includeEmpty: false }, (row: any, rowNumber: number) => {
+        row.eachCell({ includeEmpty: false }, (cell: any, colNumber: number) => {
+          const address: string = cell?.address ?? `${colNumber}:${rowNumber}`;
+          m.set(address, {
+            address,
+            row: rowNumber,
+            col: colNumber,
+            value: getSimpleValue(cell?.value),
+          });
+        });
+      });
+      return m;
+    };
 
-      for (let colNumber = 1; colNumber <= maxCol; colNumber += 1) {
-        const baseCell = baseWs.getRow(rowNumber).getCell(colNumber);
-        const oursCell = oursWs.getRow(rowNumber).getCell(colNumber);
-        const theirsCell = theirsWs.getRow(rowNumber).getCell(colNumber);
+    const baseMap = extractCells(baseWs);
+    const oursMap = extractCells(oursWs);
+    const theirsMap = extractCells(theirsWs);
 
-        const address =
-          (oursCell && oursCell.address) ||
-          (baseCell && baseCell.address) ||
-          (theirsCell && theirsCell.address) ||
-          `${colNumber}:${rowNumber}`;
+    // 取三边地址的并集（只对“出现过内容”的单元格做 diff）
+    const addressSet = new Set<string>();
+    for (const k of baseMap.keys()) addressSet.add(k);
+    for (const k of oursMap.keys()) addressSet.add(k);
+    for (const k of theirsMap.keys()) addressSet.add(k);
 
-        const baseValue = getSimpleValue(baseCell?.value);
-        const oursValue = getSimpleValue(oursCell?.value);
-        const theirsValue = getSimpleValue(theirsCell?.value);
+    const same = (a: any, b: any) => a === b;
 
-        const same = (a: any, b: any) => a === b;
+    const cells: MergeCell[] = [];
 
-        let status: MergeCell['status'];
-        let mergedValue: string | number | null = baseValue;
+    for (const address of addressSet) {
+      const baseCell = baseMap.get(address);
+      const oursCell = oursMap.get(address);
+      const theirsCell = theirsMap.get(address);
 
-        const equalBO = same(baseValue, oursValue);
-        const equalBT = same(baseValue, theirsValue);
-        const equalOT = same(oursValue, theirsValue);
+      const row = oursCell?.row ?? baseCell?.row ?? theirsCell?.row ?? 0;
+      const col = oursCell?.col ?? baseCell?.col ?? theirsCell?.col ?? 0;
 
-        if (equalBO && equalBT) {
-          status = 'unchanged';
-          mergedValue = baseValue;
-        } else if (!equalBO && equalBT) {
-          status = 'ours-changed';
-          mergedValue = oursValue;
-        } else if (equalBO && !equalBT) {
-          status = 'theirs-changed';
-          mergedValue = theirsValue;
-        } else if (!equalBO && !equalBT && equalOT) {
-          status = 'both-changed-same';
-          mergedValue = oursValue;
-        } else {
-          status = 'conflict';
-          mergedValue = oursValue; // 默认先用 ours，方便后续人工调整
-        }
+      const baseValue = baseCell?.value ?? null;
+      const oursValue = oursCell?.value ?? null;
+      const theirsValue = theirsCell?.value ?? null;
 
-        mergeRow.push({
+      const equalBO = same(baseValue, oursValue);
+      const equalBT = same(baseValue, theirsValue);
+      const equalOT = same(oursValue, theirsValue);
+
+      let status: MergeCell['status'];
+      let mergedValue: string | number | null = baseValue;
+
+      if (equalBO && equalBT) {
+        status = 'unchanged';
+        mergedValue = baseValue;
+      } else if (!equalBO && equalBT) {
+        status = 'ours-changed';
+        mergedValue = oursValue;
+      } else if (equalBO && !equalBT) {
+        status = 'theirs-changed';
+        mergedValue = theirsValue;
+      } else if (!equalBO && !equalBT && equalOT) {
+        status = 'both-changed-same';
+        mergedValue = oursValue;
+      } else {
+        status = 'conflict';
+        mergedValue = oursValue; // 默认先用 ours，方便后续人工调整
+      }
+
+      // 只返回“非 unchanged”的单元格，减少 IPC 负载与前端渲染压力
+      if (status !== 'unchanged') {
+        cells.push({
           address,
-          row: rowNumber,
-          col: colNumber,
+          row,
+          col,
           baseValue,
           oursValue,
           theirsValue,
@@ -433,13 +457,14 @@ ipcMain.handle('excel:openThreeWay', async () => {
           mergedValue,
         });
       }
-
-      rows.push(mergeRow);
     }
+
+    // 稳定排序：按 row/col 排序，便于前端构建 diff 行/列
+    cells.sort((a, b) => (a.row - b.row) || (a.col - b.col));
 
     return {
       sheetName: baseWs.name,
-      rows,
+      cells,
     };
   };
 
@@ -460,36 +485,80 @@ ipcMain.handle('excel:openThreeWay', async () => {
     await oursWb.xlsx.readFile(oursPath);
     await theirsWb.xlsx.readFile(theirsPath);
 
-    const baseByName = new Map<string, any>();
-    baseWb.worksheets.forEach((ws) => baseByName.set(ws.name, ws));
-    const oursByName = new Map<string, any>();
-    oursWb.worksheets.forEach((ws) => oursByName.set(ws.name, ws));
-    const theirsByName = new Map<string, any>();
-    theirsWb.worksheets.forEach((ws) => theirsByName.set(ws.name, ws));
+    const baseList = baseWb.worksheets;
+    const oursList = oursWb.worksheets;
+    const theirsList = theirsWb.worksheets;
 
-    const commonNames = Array.from(baseByName.keys()).filter(
-      (name) => oursByName.has(name) && theirsByName.has(name),
-    );
+    const baseByName = new Map<string, { ws: any; idx: number }>();
+    baseList.forEach((ws, idx) => {
+      if (!baseByName.has(ws.name)) baseByName.set(ws.name, { ws, idx });
+    });
+    const oursByName = new Map<string, { ws: any; idx: number }>();
+    oursList.forEach((ws, idx) => {
+      if (!oursByName.has(ws.name)) oursByName.set(ws.name, { ws, idx });
+    });
+    const theirsByName = new Map<string, { ws: any; idx: number }>();
+    theirsList.forEach((ws, idx) => {
+      if (!theirsByName.has(ws.name)) theirsByName.set(ws.name, { ws, idx });
+    });
 
-    const mergeSheets: MergeSheetData[] = commonNames.map((name) =>
-      buildMergeSheet(baseByName.get(name), oursByName.get(name), theirsByName.get(name)),
-    );
+    // 规则：优先按同名工作表对齐；对剩余未匹配的工作表，再按索引对齐（第 1 张对第 1 张……）。
+    const usedBaseIdx = new Set<number>();
+    const usedOursIdx = new Set<number>();
+    const usedTheirsIdx = new Set<number>();
+
+    const mergeSheets: MergeSheetData[] = [];
+
+    // 1) 同名匹配：以 base 的顺序为准
+    for (let i = 0; i < baseList.length; i += 1) {
+      const baseWs = baseList[i];
+      const oursHit = oursByName.get(baseWs.name);
+      const theirsHit = theirsByName.get(baseWs.name);
+      if (!oursHit || !theirsHit) continue;
+
+      usedBaseIdx.add(i);
+      usedOursIdx.add(oursHit.idx);
+      usedTheirsIdx.add(theirsHit.idx);
+
+      mergeSheets.push(buildMergeSheet(baseWs, oursHit.ws, theirsHit.ws));
+    }
+
+    // 2) 索引兜底：仅对“同一 idx 在三边都没被用过”的位置做对齐
+    const count = Math.min(baseList.length, oursList.length, theirsList.length);
+    for (let idx = 0; idx < count; idx += 1) {
+      if (usedBaseIdx.has(idx) || usedOursIdx.has(idx) || usedTheirsIdx.has(idx)) continue;
+      usedBaseIdx.add(idx);
+      usedOursIdx.add(idx);
+      usedTheirsIdx.add(idx);
+      mergeSheets.push(buildMergeSheet(baseList[idx], oursList[idx], theirsList[idx]));
+    }
 
     return { basePath, oursPath, theirsPath, mergeSheets };
   };
 
   // 如果从 git/Fork 传入了 base/ours/theirs，就直接使用这些路径
-  if (cliThreeWayArgs) {
-    const { basePath, oursPath, theirsPath } = cliThreeWayArgs;
-    const { mergeSheets } = await buildMergeSheetsForWorkbooks(basePath, oursPath, theirsPath);
-
+  const normalizeThreeWayResult = (
+    basePath: string,
+    oursPath: string,
+    theirsPath: string,
+    mergeSheets: MergeSheetData[],
+  ) => {
+    // 注意：如果三个工作簿没有任何“同名工作表交集”，mergeSheets 会是空数组。
+    // 这里返回一个空 sheet，避免渲染进程读取 result.sheet.sheetName 时崩溃。
+    const emptySheet: MergeSheetData = { sheetName: '', cells: [] };
     return {
       basePath,
       oursPath,
       theirsPath,
-      sheet: mergeSheets[0],
+      sheet: mergeSheets[0] ?? emptySheet,
       sheets: mergeSheets,
     };
+  };
+
+  if (cliThreeWayArgs) {
+    const { basePath, oursPath, theirsPath } = cliThreeWayArgs;
+    const { mergeSheets } = await buildMergeSheetsForWorkbooks(basePath, oursPath, theirsPath);
+    return normalizeThreeWayResult(basePath, oursPath, theirsPath, mergeSheets);
   }
 
   // 没有 CLI 参数时，回退到交互式选择文件的模式
@@ -512,7 +581,7 @@ ipcMain.handle('excel:openThreeWay', async () => {
 
   const { mergeSheets } = await buildMergeSheetsForWorkbooks(basePath, oursPath, theirsPath);
 
-  return { basePath, oursPath, theirsPath, sheet: mergeSheets[0], sheets: mergeSheets };
+  return normalizeThreeWayResult(basePath, oursPath, theirsPath, mergeSheets);
 });
 
 // 将 CLI three-way 信息暴露给渲染进程，便于自动加载

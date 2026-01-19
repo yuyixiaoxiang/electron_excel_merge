@@ -43,7 +43,8 @@ interface MergeCell {
 
 interface MergeSheetData {
   sheetName: string;
-  rows: MergeCell[][];
+  // 性能优化：仅传输“可能产生差异”的单元格列表（稀疏结构），避免把整张表矩阵通过 IPC 传到渲染进程
+  cells: MergeCell[];
 }
 
 interface ThreeWayOpenResult {
