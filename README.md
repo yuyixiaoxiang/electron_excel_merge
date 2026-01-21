@@ -67,6 +67,36 @@ npm run dev
 
 此时在 `src/main/main.ts` 中下断点即可命中。
 
+## 调试渲染进程（renderer process）
+渲染进程是 React + Webpack 的页面，开发模式下由 webpack-dev-server 提供：`http://localhost:3000`。
+
+### 方式 A：用 Electron 内置 DevTools 调试（推荐）
+1. 按上面的流程启动 `npm: dev` + `Electron Main (inspect run)`。
+2. 在 Electron 窗口打开 DevTools：`Ctrl + Shift + I`。
+3. 打开 DevTools → `Sources`：
+   - 在左侧 `webpack://`（或类似项）中找到 `src/renderer/*.tsx`。
+   - 直接在 `.tsx` 源码行号处打断点即可。
+4. 也可以在代码里临时加入：
+```js path=null start=null
+debugger;
+```
+然后触发对应操作（点击/滚动等），会自动断住。
+
+> 如果只能看到 `bundle.js`，看不到 `src/renderer/*.tsx`：通常是 source map 没开。
+> 本项目开发模式建议保持 webpack 的 `devtool` 为 `source-map` / `eval-source-map` / `cheap-module-source-map` 之一。
+
+### 方式 B：用 IDE 断点调试渲染进程（可选）
+大多数情况下直接用 DevTools 就够了；如果你希望在 IDE 里调试 TSX：
+- 优先建议在 DevTools 里断点（方式 A）。
+- 如需 IDE 调试，通常要启用 Electron 的远程调试端口（例如启动参数加 `--remote-debugging-port=9222`），
+  再用 IDE 的 Chrome/JS 调试器 attach 到该端口。
+
+## 同时调试 main + renderer（推荐组合）
+1. `npm: dev`（启动 webpack-dev-server + tsc watch）
+2. `Electron Main (inspect run)`（启动 Electron 主进程）
+3. `Attach 9229`（IDE 调试 main）
+4. Electron 窗口 `Ctrl+Shift+I`（DevTools 调试 renderer）
+
 ## 常见问题
 ### 1) 3000 端口被占用
 webpack-dev-server 默认使用 3000。可用以下命令查看占用进程：
