@@ -589,3 +589,101 @@ ipcMain.handle('excel:getCliThreeWayInfo', async () => {
   if (!cliThreeWayArgs) return null;
   return cliThreeWayArgs;
 });
+
+// 读取三方文件的“某一行”数据，用于底部行级对比视图
+interface ThreeWayRowRequest {
+  basePath: string;
+  oursPath: string;
+  theirsPath: string;
+  sheetName?: string;
+  sheetIndex?: number; // 0-based
+  rowNumber: number; // 1-based
+}
+
+interface ThreeWayRowResult {
+  sheetName: string;
+  rowNumber: number;
+  colCount: number;
+  base: (string | number | null)[];
+  ours: (string | number | null)[];
+  theirs: (string | number | null)[];
+}
+
+// 简单缓存：同一次应用生命周期内重复读取同一个 xlsx 时复用 workbook，减少 IO
+const workbookCache = new Map<string, Workbook>();
+
+const loadWorkbookCached = async (filePath: string): Promise<Workbook> => {
+  const hit = workbookCache.get(filePath);
+  if (hit) return hit;
+  const wb = new Workbook();
+  await wb.xlsx.readFile(filePath);
+  workbookCache.set(filePath, wb);
+  return wb;
+};
+
+const getWorksheetSafe = (wb: Workbook, sheetName?: string, sheetIndex?: number): any => {
+  if (sheetName) {
+    const byName = wb.getWorksheet(sheetName);
+    if (byName) return byName;
+  }
+  if (typeof sheetIndex === 'number' && sheetIndex >= 0 && sheetIndex < wb.worksheets.length) {
+    return wb.worksheets[sheetIndex];
+  }
+  return wb.worksheets[0];
+};
+
+const getSimpleValueForThreeWay = (v: any): string | number | null => {
+  if (v === null || v === undefined) return null;
+  if (typeof v === 'object' && Array.isArray((v as any).richText)) {
+    const parts = (v as any).richText
+      .map((p: any) => (p && typeof p.text === 'string' ? p.text : ''))
+      .join('');
+    return parts;
+  }
+  if (typeof v === 'object' && 'text' in v) return (v as any).text ?? null;
+  if (typeof v === 'object' && 'result' in v) return (v as any).result ?? null;
+  if (typeof v === 'string' || typeof v === 'number') return v;
+  return String(v);
+};
+
+ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): Promise<ThreeWayRowResult | null> => {
+  if (!req || !req.basePath || !req.oursPath || !req.theirsPath) return null;
+  const rowNumber = Math.max(1, Math.floor(req.rowNumber));
+
+  const [baseWb, oursWb, theirsWb] = await Promise.all([
+    loadWorkbookCached(req.basePath),
+    loadWorkbookCached(req.oursPath),
+    loadWorkbookCached(req.theirsPath),
+  ]);
+
+  const baseWs = getWorksheetSafe(baseWb, req.sheetName, req.sheetIndex);
+  const oursWs = getWorksheetSafe(oursWb, req.sheetName, req.sheetIndex);
+  const theirsWs = getWorksheetSafe(theirsWb, req.sheetName, req.sheetIndex);
+
+  const resolvedSheetName = baseWs?.name ?? req.sheetName ?? '';
+
+  const colCount = Math.max(
+    baseWs?.actualColumnCount ?? baseWs?.columnCount ?? 0,
+    oursWs?.actualColumnCount ?? oursWs?.columnCount ?? 0,
+    theirsWs?.actualColumnCount ?? theirsWs?.columnCount ?? 0,
+  );
+
+  const readRow = (ws: any): (string | number | null)[] => {
+    const row = ws.getRow(rowNumber);
+    const arr: (string | number | null)[] = [];
+    for (let col = 1; col <= colCount; col += 1) {
+      const cell = row.getCell(col);
+      arr.push(getSimpleValueForThreeWay(cell?.value));
+    }
+    return arr;
+  };
+
+  return {
+    sheetName: resolvedSheetName,
+    rowNumber,
+    colCount,
+    base: readRow(baseWs),
+    ours: readRow(oursWs),
+    theirs: readRow(theirsWs),
+  };
+});

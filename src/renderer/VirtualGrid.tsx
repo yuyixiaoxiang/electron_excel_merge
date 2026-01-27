@@ -26,10 +26,20 @@ export interface VirtualGridProps<Cell> {
   renderHeaderCell?: (colIndex: number) => React.ReactNode;
   // 初始列宽（像素），如果没提供则用 120
   defaultColWidth?: number;
-  // 可选：暴露内部滚动容器，便于外部同步 scrollLeft
+  // 可选：外部受控列宽（用于左右表格列宽一致）
+  columnWidths?: number[];
+  onColumnWidthsChange?: (widths: number[]) => void;
+  // 可选：外部受控横向滚动位置（用于共享一个横向滚动条）
+  scrollLeft?: number | null;
+  disableHorizontalScroll?: boolean;
+  // 可选：暴露内部滚动容器，便于外部同步 scrollLeft/scrollTop
   containerRef?: React.RefObject<HTMLDivElement>;
   // 可选：每次水平滚动时通知外部当前 scrollLeft，用于左右表格联动
   onScrollXChange?: (scrollLeft: number) => void;
+  // 可选：每次竖向滚动时通知外部当前 scrollTop，用于左右表格联动
+  onScrollYChange?: (scrollTop: number) => void;
+  // 可选：滚动使指定单元格出现在视口中（rowIndex/colIndex 均为 0-based grid 索引）
+  scrollToCell?: { rowIndex: number; colIndex: number } | null;
 }
 
 const DEFAULT_ROW_HEIGHT = 24;
@@ -51,7 +61,9 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
     defaultColWidth = 120,
   } = props;
 
-  const [columnWidths, setColumnWidths] = useState<number[]>([]);
+  const [internalColumnWidths, setInternalColumnWidths] = useState<number[]>([]);
+  const isControlledWidths = Array.isArray(props.columnWidths);
+  const columnWidths = (props.columnWidths ?? internalColumnWidths) as number[];
   const dragFrameRequestedRef = useRef(false);
   const lastClientXRef = useRef<number | null>(null);
 
@@ -59,6 +71,9 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
   const containerRef = props.containerRef ?? internalContainerRef;
   const headerScrollRef = useRef<HTMLDivElement | null>(null);
   const [scrollTop, setScrollTop] = useState(0);
+  const lastScrollTopRef = useRef(0);
+  const scrollRafRequestedRef = useRef(false);
+  const lastScrollLeftRef = useRef(0);
   const [viewportHeight, setViewportHeight] = useState(400);
   const [scrollbarWidth, setScrollbarWidth] = useState(0);
 
@@ -72,7 +87,13 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
   useEffect(() => {
     if (rows.length === 0) return;
     const count = rows[0].length;
-    setColumnWidths((prev) => {
+    if (isControlledWidths) {
+      if ((props.columnWidths?.length ?? 0) !== count && props.onColumnWidthsChange) {
+        props.onColumnWidthsChange(Array(count).fill(defaultColWidth));
+      }
+      return;
+    }
+    setInternalColumnWidths((prev) => {
       if (prev.length === count) return prev;
       return Array(count).fill(defaultColWidth);
     });
@@ -105,14 +126,45 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
 
   const handleScroll = (e: UIEvent<HTMLDivElement>) => {
     const target = e.currentTarget;
-    setScrollTop(target.scrollTop);
+
+    // scrollLeft：用于同步表头和左右表格，直接读写不触发 React render
+    lastScrollLeftRef.current = target.scrollLeft;
     if (headerScrollRef.current) {
       headerScrollRef.current.scrollLeft = target.scrollLeft;
     }
     if (props.onScrollXChange) {
       props.onScrollXChange(target.scrollLeft);
     }
+
+    // scrollTop：会影响虚拟列表窗口，使用 rAF 节流避免滚动时频繁 setState 卡顿
+    lastScrollTopRef.current = target.scrollTop;
+    if (props.onScrollYChange) {
+      props.onScrollYChange(target.scrollTop);
+    }
+
+    if (scrollRafRequestedRef.current) return;
+    scrollRafRequestedRef.current = true;
+
+    requestAnimationFrame(() => {
+      scrollRafRequestedRef.current = false;
+      setScrollTop((prev) => {
+        const next = lastScrollTopRef.current;
+        return prev === next ? prev : next;
+      });
+    });
   };
+
+  // 外部受控 scrollLeft：用于“只保留一个横向滚动条”的场景
+  useEffect(() => {
+    const el = containerRef.current;
+    const left = props.scrollLeft;
+    if (!el || left == null) return;
+    if (el.scrollLeft === left) return;
+    el.scrollLeft = left;
+    if (headerScrollRef.current) {
+      headerScrollRef.current.scrollLeft = left;
+    }
+  }, [props.scrollLeft]);
 
   const handleMouseDownOnResizer = (
     e: React.MouseEvent<HTMLDivElement>,
@@ -138,13 +190,22 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
         const clientX = lastClientXRef.current;
         if (clientX == null) return;
 
-        setColumnWidths((prev) => {
+        const apply = (prev: number[]) => {
           const next = [...prev];
           const delta = clientX - startX;
           const newWidth = Math.max(MIN_COL_WIDTH, startWidth + delta);
           next[colIndex] = newWidth;
           return next;
-        });
+        };
+
+        if (isControlledWidths) {
+          if (props.onColumnWidthsChange) {
+            props.onColumnWidthsChange(apply(columnWidths));
+          }
+          return;
+        }
+
+        setInternalColumnWidths((prev) => apply(prev));
       });
     };
 
@@ -173,6 +234,23 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
 
   // 冻结列（不含最左侧行号列）偏移
   const safeFrozenColCount = Math.max(0, Math.min(frozenColCount, colCount));
+
+  const getFrozenColsWidth = () => {
+    let w = showRowHeader ? 40 : 0;
+    for (let i = 0; i < safeFrozenColCount; i += 1) {
+      w += getColWidth(i);
+    }
+    return w;
+  };
+
+  const getColLeft = (colIndex: number) => {
+    let left = showRowHeader ? 40 : 0;
+    for (let i = 0; i < colIndex; i += 1) {
+      left += getColWidth(i);
+    }
+    return left;
+  };
+
   const frozenColOffsets: number[] = useMemo(() => {
     const offsets: number[] = [];
     let acc = showRowHeader ? 40 : 0;
@@ -182,6 +260,48 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
     }
     return offsets;
   }, [safeFrozenColCount, columnWidths, showRowHeader]);
+
+  // 当外部指定 scrollToCell 时，自动滚动让该单元格出现在视口中
+  useEffect(() => {
+    const target = props.scrollToCell;
+    const el = containerRef.current;
+    if (!target || !el) return;
+
+    const { rowIndex, colIndex } = target;
+
+    // 竖向：冻结行无需滚动
+    if (rowIndex >= safeFrozenRowCount) {
+      const scrollRowIndex = rowIndex - safeFrozenRowCount;
+      const rowTop = scrollRowIndex * rowHeight;
+      const rowBottom = rowTop + rowHeight;
+      const viewTop = el.scrollTop;
+      const viewBottom = viewTop + el.clientHeight;
+
+      if (rowTop < viewTop) {
+        el.scrollTop = rowTop;
+      } else if (rowBottom > viewBottom) {
+        el.scrollTop = Math.max(0, rowBottom - el.clientHeight);
+      }
+    }
+
+    // 横向：冻结列无需滚动
+    if (colIndex >= safeFrozenColCount) {
+      const colLeft = getColLeft(colIndex);
+      const colRight = colLeft + getColWidth(colIndex);
+      const frozenW = getFrozenColsWidth();
+      const viewLeft = el.scrollLeft + frozenW;
+      const viewRight = el.scrollLeft + el.clientWidth;
+
+      if (colLeft < viewLeft) {
+        el.scrollLeft = Math.max(0, colLeft - frozenW);
+      } else if (colRight > viewRight) {
+        el.scrollLeft = Math.max(0, colRight - el.clientWidth);
+      }
+    }
+    // 有些环境下 programmatic scroll 不一定触发 scroll 事件，这里显式通知外部同步
+    if (props.onScrollXChange) props.onScrollXChange(el.scrollLeft);
+    if (props.onScrollYChange) props.onScrollYChange(el.scrollTop);
+  }, [props.scrollToCell, safeFrozenRowCount, safeFrozenColCount, rowHeight, viewportHeight, columnWidths]);
 
   const renderRow = (row: Cell[], rowIndex: number) => {
     const isFrozenRow = rowIndex < safeFrozenRowCount;
@@ -236,7 +356,9 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
                 padding: 2,
                 width: getColWidth(colIndex),
                 minWidth: getColWidth(colIndex),
+                maxWidth: getColWidth(colIndex),
                 height: rowHeight,
+                overflow: 'hidden',
                 ...(externalStyle || {}),
               }}
             >
@@ -247,6 +369,25 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
       </tr>
     );
   };
+
+  const totalTableWidth = useMemo(() => {
+    let w = showRowHeader ? 40 : 0;
+    for (let i = 0; i < colCount; i += 1) {
+      w += getColWidth(i);
+    }
+    return w;
+  }, [showRowHeader, colCount, columnWidths, defaultColWidth]);
+
+  const ColGroup = useMemo(() => {
+    return (
+      <colgroup>
+        {showRowHeader && <col style={{ width: 40 }} />}
+        {Array.from({ length: colCount }, (_, colIndex) => (
+          <col key={colIndex} style={{ width: getColWidth(colIndex) }} />
+        ))}
+      </colgroup>
+    );
+  }, [showRowHeader, colCount, columnWidths, defaultColWidth]);
 
   return (
     <div
@@ -263,7 +404,8 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
         ref={headerScrollRef}
         style={{ overflowX: 'hidden', overflowY: 'hidden', paddingRight: scrollbarWidth }}
       >
-        <table style={{ borderCollapse: 'collapse', width: 'max-content' }}>
+        <table style={{ borderCollapse: 'collapse', tableLayout: 'fixed', width: totalTableWidth }}>
+          {ColGroup}
           <thead>
             <tr>
               {showRowHeader && (
@@ -302,6 +444,9 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
                       width: getColWidth(colIndex),
                       minWidth: getColWidth(colIndex),
                       backgroundColor: '#f0f0f0',
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
                     }}
                   >
                     {renderHeaderCell ? renderHeaderCell(colIndex) : String.fromCharCode('A'.charCodeAt(0) + (colIndex % 26))}
@@ -332,9 +477,15 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
       <div
         ref={containerRef}
         onScroll={handleScroll}
-        style={{ flex: 1, minHeight: 0, overflowY: 'auto', overflowX: 'auto' }}
+        style={{
+          flex: 1,
+          minHeight: 0,
+          overflowY: 'auto',
+          overflowX: props.disableHorizontalScroll ? 'hidden' : 'auto',
+        }}
       >
-        <table style={{ borderCollapse: 'collapse', width: 'max-content' }}>
+        <table style={{ borderCollapse: 'collapse', tableLayout: 'fixed', width: totalTableWidth }}>
+          {ColGroup}
           <tbody>
             {topSpacerHeight > 0 && (
               <tr style={{ height: topSpacerHeight }}>

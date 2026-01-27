@@ -81,6 +81,24 @@ interface CliThreeWayInfo {
   mode: 'diff' | 'merge';
 }
 
+interface ThreeWayRowRequest {
+  basePath: string;
+  oursPath: string;
+  theirsPath: string;
+  sheetName?: string;
+  sheetIndex?: number; // 0-based
+  rowNumber: number; // 1-based
+}
+
+interface ThreeWayRowResult {
+  sheetName: string;
+  rowNumber: number;
+  colCount: number;
+  base: (string | number | null)[];
+  ours: (string | number | null)[];
+  theirs: (string | number | null)[];
+}
+
 /**
  * 暴露给渲染进程的所有 Excel 相关操作。
  *
@@ -106,6 +124,10 @@ const excelAPI = {
     const result = await ipcRenderer.invoke('excel:getCliThreeWayInfo');
     return result as CliThreeWayInfo | null;
   },
+  getThreeWayRow: async (req: ThreeWayRowRequest): Promise<ThreeWayRowResult | null> => {
+    const result = await ipcRenderer.invoke('excel:getThreeWayRow', req);
+    return result as ThreeWayRowResult | null;
+  },
 };
 
 contextBridge.exposeInMainWorld('excelAPI', excelAPI);
@@ -122,4 +144,6 @@ export type {
   SaveMergeRequest,
   SaveMergeResponse,
   CliThreeWayInfo,
+  ThreeWayRowRequest,
+  ThreeWayRowResult,
 };

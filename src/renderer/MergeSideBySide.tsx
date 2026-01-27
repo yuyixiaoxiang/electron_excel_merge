@@ -1,4 +1,4 @@
-import React, { useMemo, useRef } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import type { MergeCell } from '../main/preload';
 import { VirtualGrid, VirtualGridRenderCtx } from './VirtualGrid';
 
@@ -28,11 +28,13 @@ const getBackgroundColor = (status: MergeCell['status'], side: 'ours' | 'theirs'
     case 'ours-changed':
       return side === 'ours' ? '#d4f8d4' : 'white';
     case 'theirs-changed':
-      return side === 'theirs' ? '#d4e8ff' : 'white';
+      // 需求：theirs 侧用 red
+      return side === 'theirs' ? '#ffc8c8' : 'white';
     case 'both-changed-same':
       return '#fff6bf'; // both sides yellow
     case 'conflict':
-      return '#ffc8c8'; // both sides red
+      // 需求：当 ours/theirs 不同（冲突）时：ours=green, theirs=red
+      return side === 'ours' ? '#d4f8d4' : '#ffc8c8';
     default:
       return 'white';
   }
@@ -64,12 +66,13 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
 }) => {
   if (cells.length === 0) return <div>没有检测到任何差异。</div>;
 
-  // 水平滚动同步：左右两边 VirtualGrid 的 scrollLeft 要联动
+  // 水平/竖直滚动同步：左右两边 VirtualGrid 的 scrollLeft/scrollTop 要联动
   const oursScrollRef = useRef<HTMLDivElement | null>(null);
   const theirsScrollRef = useRef<HTMLDivElement | null>(null);
   const isSyncingHorizontalRef = useRef(false);
+  const isSyncingVerticalRef = useRef(false);
 
-  const syncScroll = (from: 'ours' | 'theirs', scrollLeft: number) => {
+  const syncScrollX = (from: 'ours' | 'theirs', scrollLeft: number) => {
     const otherRef = from === 'ours' ? theirsScrollRef : oursScrollRef;
     if (!otherRef.current) return;
     if (isSyncingHorizontalRef.current) return;
@@ -77,6 +80,17 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
     otherRef.current.scrollLeft = scrollLeft;
     requestAnimationFrame(() => {
       isSyncingHorizontalRef.current = false;
+    });
+  };
+
+  const syncScrollY = (from: 'ours' | 'theirs', scrollTop: number) => {
+    const otherRef = from === 'ours' ? theirsScrollRef : oursScrollRef;
+    if (!otherRef.current) return;
+    if (isSyncingVerticalRef.current) return;
+    isSyncingVerticalRef.current = true;
+    otherRef.current.scrollTop = scrollTop;
+    requestAnimationFrame(() => {
+      isSyncingVerticalRef.current = false;
     });
   };
 
@@ -116,6 +130,16 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
       ),
     [cellMap, gridRowNumbers, diffColumns],
   );
+
+  // 两侧共享列宽，避免左右/表头/内容出现 1px 累积偏差或拖拽后不同步
+  const [columnWidths, setColumnWidths] = useState<number[]>([]);
+  useEffect(() => {
+    const count = diffColumns.length;
+    setColumnWidths((prev) => {
+      if (prev.length === count) return prev;
+      return Array(count).fill(DATA_COL_WIDTH);
+    });
+  }, [diffColumns.length]);
 
   const renderRowHeader = (_gridRowIndex: number, rowCells: (MergeCell | null)[]) => {
     const anyCell = rowCells.find((c) => c != null) ?? undefined;
@@ -186,6 +210,17 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   const oursGetCellStyle = makeGetCellStyle('ours');
   const theirsGetCellStyle = makeGetCellStyle('theirs');
 
+  // 当选择变化时，确保两侧都滚动到能看到该单元格
+  const scrollToCell = useMemo(() => {
+    if (!selected) return null;
+    const targetRowNumber = selected.rowIndex + 1;
+    const targetColNumber = selected.colIndex + 1;
+    const gridRowIndex = diffRowNumbers.indexOf(targetRowNumber);
+    const gridColIndex = diffColumns.indexOf(targetColNumber);
+    if (gridRowIndex < 0 || gridColIndex < 0) return null;
+    return { rowIndex: gridRowIndex, colIndex: gridColIndex };
+  }, [selected, diffRowNumbers, diffColumns]);
+
   return (
     <div
       style={{
@@ -212,8 +247,12 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
           getCellStyle={oursGetCellStyle}
           renderHeaderCell={renderHeaderCell}
           defaultColWidth={DATA_COL_WIDTH}
+          columnWidths={columnWidths}
+          onColumnWidthsChange={setColumnWidths}
           containerRef={oursScrollRef as React.RefObject<HTMLDivElement>}
-          onScrollXChange={(left) => syncScroll('ours', left)}
+          onScrollXChange={(left) => syncScrollX('ours', left)}
+          onScrollYChange={(top) => syncScrollY('ours', top)}
+          scrollToCell={scrollToCell}
         />
         <VirtualGrid<MergeCell | null>
           rows={gridRows}
@@ -227,8 +266,12 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
           getCellStyle={theirsGetCellStyle}
           renderHeaderCell={renderHeaderCell}
           defaultColWidth={DATA_COL_WIDTH}
+          columnWidths={columnWidths}
+          onColumnWidthsChange={setColumnWidths}
           containerRef={theirsScrollRef as React.RefObject<HTMLDivElement>}
-          onScrollXChange={(left) => syncScroll('theirs', left)}
+          onScrollXChange={(left) => syncScrollX('theirs', left)}
+          onScrollYChange={(top) => syncScrollY('theirs', top)}
+          scrollToCell={scrollToCell}
         />
       </div>
     </div>

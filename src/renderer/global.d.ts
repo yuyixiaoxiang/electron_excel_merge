@@ -5,6 +5,8 @@ import type {
   SaveMergeRequest,
   SaveMergeResponse,
   ThreeWayOpenResult,
+  ThreeWayRowRequest,
+  ThreeWayRowResult,
 } from '../main/preload';
 
 /**
@@ -19,6 +21,7 @@ declare global {
       openThreeWay: () => Promise<ThreeWayOpenResult | null>;
       saveMergeResult: (req: SaveMergeRequest) => Promise<SaveMergeResponse>;
       getCliThreeWayInfo: () => Promise<CliThreeWayInfo | null>;
+      getThreeWayRow: (req: ThreeWayRowRequest) => Promise<ThreeWayRowResult | null>;
     };
   }
 }
