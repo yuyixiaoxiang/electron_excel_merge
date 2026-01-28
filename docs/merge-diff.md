@@ -98,3 +98,27 @@
 - `cells[]`：仅包含有差异的单元格（含状态与 mergedValue）。
 - `rowsMeta[]`：视觉行信息（行号映射、相似度、状态）。
 - `hasExactDiff`：工作表是否存在坐标级真实差异。
+
+---
+
+## merged 数据的存储与写入流程
+
+### merged 值存储位置（渲染进程）
+- 每个差异单元格 `MergeCell` 都带有 `mergedValue`，作为“最终合并值”。
+- 该值会同时维护在两份状态里：
+  - `mergeSheets[].cells[].mergedValue`（全量，跨所有工作表）
+  - `mergeCells[].mergedValue`（当前工作表展示用副本）
+- 当用户选择“用 base / ours / theirs”时，会同步更新这两份状态，确保 UI 与保存数据一致。
+
+### 写入 merged 文件（主进程）
+- 保存时由渲染进程汇总所有 `mergedValue`，生成 `{ sheetName, address, value }[]`。
+- 通过 IPC 调用 `excel:saveMergeResult` 发送到主进程。
+- 主进程处理流程：
+  1. 选择目标路径：
+     - CLI `mode=merge`：优先 `mergedPath`，否则回退写 `oursPath`
+     - CLI `mode=diff`：写 `oursPath`
+     - 交互模式：弹出保存对话框
+  2. 用 `exceljs` 打开模板文件（默认 `oursPath` 作为格式模板）
+  3. 逐个写入单元格 `value`（仅改值，不改样式/公式）
+  4. `writeFile(targetPath)` 保存
+  5. 若是 `merge` 模式并有目标文件，会尝试执行一次 `git add`
