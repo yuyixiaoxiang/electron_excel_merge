@@ -1,4 +1,4 @@
-import React, { ChangeEvent } from 'react';
+import React, { ChangeEvent, useEffect, useState } from 'react';
 import type { SheetCell } from '../main/preload';
 import { VirtualGrid, VirtualGridRenderCtx } from './VirtualGrid';
 
@@ -28,8 +28,19 @@ const ExcelTableComponent: React.FC<ExcelTableProps> = ({
   frozenRowCount = 0,
   frozenColCount = 0,
 }) => {
-  const handleChange = (cell: SheetCell) => (e: ChangeEvent<HTMLInputElement>) => {
-    onCellChange(cell.address, e.target.value);
+  const [editingAddress, setEditingAddress] = useState<string | null>(null);
+  const [draftValue, setDraftValue] = useState<string>('');
+
+  // 当外部选中变化时，如果正在编辑其他单元格，则结束编辑
+  useEffect(() => {
+    if (editingAddress && selectedAddress && editingAddress !== selectedAddress) {
+      setEditingAddress(null);
+    }
+  }, [selectedAddress, editingAddress]);
+
+  const commitEdit = (cell: SheetCell) => {
+    onCellChange(cell.address, draftValue);
+    setEditingAddress(null);
   };
 
   const handleSelect = (cell: SheetCell) => {
@@ -40,24 +51,61 @@ const ExcelTableComponent: React.FC<ExcelTableProps> = ({
 
   const renderCell = (cell: SheetCell | null, ctx: VirtualGridRenderCtx) => {
     if (!cell) return null;
-    const isSelected = selectedAddress === cell.address;
+
+    const isEditing = editingAddress === cell.address;
+    const displayValue = cell.value === null ? '' : String(cell.value);
+
+    if (isEditing) {
+      return (
+        <input
+          autoFocus
+          onFocus={() => handleSelect(cell)}
+          style={{
+            width: '100%',
+            boxSizing: 'border-box',
+            border: 'none',
+            outline: 'none',
+            backgroundColor: 'transparent',
+          }}
+          value={draftValue}
+          onChange={(e: ChangeEvent<HTMLInputElement>) => setDraftValue(e.target.value)}
+          onBlur={() => commitEdit(cell)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') {
+              e.preventDefault();
+              commitEdit(cell);
+            }
+            if (e.key === 'Escape') {
+              e.preventDefault();
+              setEditingAddress(null);
+            }
+          }}
+        />
+      );
+    }
 
     return (
-      <input
-        onFocus={() => handleSelect(cell)}
+      <div
+        onMouseDown={() => handleSelect(cell)}
+        onDoubleClick={() => {
+          setEditingAddress(cell.address);
+          setDraftValue(displayValue);
+        }}
+        title={displayValue}
         style={{
           width: '100%',
+          height: '100%',
           boxSizing: 'border-box',
-          border: 'none',
-          outline: 'none',
           backgroundColor: 'transparent',
           whiteSpace: 'nowrap',
           overflow: 'hidden',
           textOverflow: 'ellipsis',
+          cursor: 'text',
+          userSelect: 'none',
         }}
-        value={cell.value === null ? '' : String(cell.value)}
-        onChange={handleChange(cell)}
-      />
+      >
+        {displayValue}
+      </div>
     );
   };
 

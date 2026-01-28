@@ -17,6 +17,11 @@ export interface MergeSideBySideProps {
   cells: MergeCell[];
   selected?: { rowIndex: number; colIndex: number } | null;
   onSelectCell?: (rowIndex: number, colIndex: number) => void;
+  onApplyRowChoice?: (rowNumber: number, source: 'ours' | 'theirs') => void;
+  onApplyCellChoice?: (rowNumber: number, colNumber: number, source: 'ours' | 'theirs') => void;
+  onApplyCellsChoice?: (keys: { rowNumber: number; colNumber: number }[], source: 'ours' | 'theirs') => void;
+  /** 已确认合并（resolved）的单元格 key 集合，key 格式为 "row:col"（1-based） */
+  resolvedCellKeys?: Set<string>;
   /** 冻结在顶部展示的行数，可配置 */
   frozenRowCount?: number;
 }
@@ -62,6 +67,10 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   cells,
   selected,
   onSelectCell,
+  onApplyRowChoice,
+  onApplyCellChoice,
+  onApplyCellsChoice,
+  resolvedCellKeys,
   frozenRowCount = DEFAULT_FROZEN_HEADER_ROWS,
 }) => {
   if (cells.length === 0) return <div>没有检测到任何差异。</div>;
@@ -146,6 +155,140 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
     return anyCell?.row ?? '';
   };
 
+  const [contextMenu, setContextMenu] = useState<
+    | {
+        type: 'row';
+        x: number;
+        y: number;
+        rowNumber: number;
+        source: 'ours' | 'theirs';
+      }
+    | {
+        type: 'cell';
+        x: number;
+        y: number;
+        rowNumber: number;
+        colNumber: number;
+        source: 'ours' | 'theirs';
+      }
+    | {
+        type: 'cells';
+        x: number;
+        y: number;
+        rowNumber: number;
+        colNumber: number;
+        source: 'ours' | 'theirs';
+      }
+    | null
+  >(null);
+
+  useEffect(() => {
+    if (!contextMenu) return;
+    const close = () => setContextMenu(null);
+    window.addEventListener('click', close);
+    window.addEventListener('blur', close);
+    return () => {
+      window.removeEventListener('click', close);
+      window.removeEventListener('blur', close);
+    };
+  }, [contextMenu]);
+
+  const handleRowHeaderContextMenu = (
+    source: 'ours' | 'theirs',
+    gridRowIndex: number,
+    e: React.MouseEvent<HTMLTableCellElement>,
+  ) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const rowNumber = diffRowNumbers[gridRowIndex];
+    if (!rowNumber) return;
+    setContextMenu({ type: 'row', x: e.clientX, y: e.clientY, rowNumber, source });
+  };
+
+  // 框选多选：以 diffRows/diffColumns 的矩形范围来计算选中单元格 key（仅包含存在的 diff cell）
+  const [selectedCellKeys, setSelectedCellKeys] = useState<Set<string>>(new Set());
+  const dragStartRef = useRef<{ rowNumber: number; colNumber: number } | null>(null);
+  const dragEndRef = useRef<{ rowNumber: number; colNumber: number } | null>(null);
+  const isDraggingRef = useRef(false);
+  const dragMovedRef = useRef(false);
+
+  useEffect(() => {
+    const onUp = () => {
+      if (!isDraggingRef.current) return;
+      isDraggingRef.current = false;
+      dragStartRef.current = null;
+      dragEndRef.current = null;
+      // 结束拖拽后允许 click 继续工作
+      setTimeout(() => {
+        dragMovedRef.current = false;
+      }, 0);
+    };
+    window.addEventListener('mouseup', onUp);
+    return () => window.removeEventListener('mouseup', onUp);
+  }, []);
+
+  const computeSelectionKeys = (a: { rowNumber: number; colNumber: number }, b: { rowNumber: number; colNumber: number }) => {
+    const r1 = Math.min(a.rowNumber, b.rowNumber);
+    const r2 = Math.max(a.rowNumber, b.rowNumber);
+    const c1 = Math.min(a.colNumber, b.colNumber);
+    const c2 = Math.max(a.colNumber, b.colNumber);
+    const keys: string[] = [];
+    for (let r = r1; r <= r2; r += 1) {
+      for (let c = c1; c <= c2; c += 1) {
+        const key = `${r}:${c}`;
+        if (cellMap.has(key)) keys.push(key);
+      }
+    }
+    return new Set(keys);
+  };
+
+  const beginDragSelect = (cell: MergeCell) => {
+    isDraggingRef.current = true;
+    dragMovedRef.current = false;
+    const p = { rowNumber: cell.row, colNumber: cell.col };
+    dragStartRef.current = p;
+    dragEndRef.current = p;
+    setSelectedCellKeys(new Set([`${cell.row}:${cell.col}`]));
+  };
+
+  const updateDragSelect = (cell: MergeCell) => {
+    if (!isDraggingRef.current) return;
+    const start = dragStartRef.current;
+    if (!start) return;
+    const end = { rowNumber: cell.row, colNumber: cell.col };
+    dragEndRef.current = end;
+    if (end.rowNumber !== start.rowNumber || end.colNumber !== start.colNumber) {
+      dragMovedRef.current = true;
+    }
+    setSelectedCellKeys(computeSelectionKeys(start, end));
+  };
+
+  const handleCellContextMenu = (
+    source: 'ours' | 'theirs',
+    cell: MergeCell,
+    e: React.MouseEvent<HTMLDivElement>,
+  ) => {
+    e.preventDefault();
+    e.stopPropagation();
+
+    const key = `${cell.row}:${cell.col}`;
+    const isInMultiSelection = selectedCellKeys.size > 1 && selectedCellKeys.has(key);
+
+    // 右键时也选中该单元格，便于顶部/底部信息同步
+    if (onSelectCell) {
+      onSelectCell(cell.row - 1, cell.col - 1);
+    }
+
+    setContextMenu({
+      type: isInMultiSelection ? 'cells' : 'cell',
+      x: e.clientX,
+      y: e.clientY,
+      rowNumber: cell.row,
+      colNumber: cell.col,
+      source,
+    });
+  };
+
   const makeRenderCell = (side: 'ours' | 'theirs') =>
     (cell: MergeCell | null, ctx: VirtualGridRenderCtx) => {
       if (!cell) return null;
@@ -153,14 +296,28 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
       const sourceRowIndex = cell.row - 1;
       const sourceColIndex = cell.col - 1;
       const handleClick = () => {
+        // 拖拽框选过程中避免 click 覆盖选择
+        if (dragMovedRef.current) return;
         if (onSelectCell) {
           onSelectCell(sourceRowIndex, sourceColIndex);
         }
+        setSelectedCellKeys(new Set([`${cell.row}:${cell.col}`]));
       };
 
       return (
         <div
+          onMouseDown={(e) => {
+            if (e.button !== 0) return;
+            // 非框选状态下：鼠标按下新单元格时立即清除之前的选择，并选中当前格
+            if (onSelectCell) {
+              onSelectCell(cell.row - 1, cell.col - 1);
+            }
+            setSelectedCellKeys(new Set([`${cell.row}:${cell.col}`]));
+            beginDragSelect(cell);
+          }}
+          onMouseEnter={() => updateDragSelect(cell)}
           onClick={handleClick}
+          onContextMenu={(e) => handleCellContextMenu(side, cell, e)}
           title={`地址: ${cell.address}\nbase: ${cell.baseValue ?? ''}\nours: ${cell.oursValue ?? ''}\ntheirs: ${cell.theirsValue ?? ''}`}
           style={{
             width: '100%',
@@ -171,6 +328,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
             textOverflow: 'ellipsis',
             whiteSpace: 'nowrap',
             cursor: 'pointer',
+            userSelect: 'none',
           }}
         >
           {value === null ? '' : String(value)}
@@ -184,7 +342,20 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
       if (ctx.isFrozenRow) {
         style.backgroundColor = '#f5f5f5';
       } else if (cell) {
-        style.backgroundColor = getBackgroundColor(cell.status, side);
+        const key = `${cell.row}:${cell.col}`;
+        if (resolvedCellKeys && resolvedCellKeys.has(key)) {
+          // 已确认合并：两侧都用浅灰表示“处理过”
+          style.backgroundColor = '#f0f0f0';
+        } else {
+          style.backgroundColor = getBackgroundColor(cell.status, side);
+        }
+      }
+
+      if (cell) {
+        const key = `${cell.row}:${cell.col}`;
+        if (selectedCellKeys.has(key)) {
+          style.border = '2px solid #ff8000';
+        }
       }
 
       if (cell && selected) {
@@ -234,7 +405,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
         gap: 4,
       }}
     >
-      <div style={{ display: 'flex', gap: 16, flex: 1, minHeight: 0 }}>
+      <div style={{ display: 'flex', gap: 16, flex: 1, minHeight: 0, position: 'relative' }}>
         <VirtualGrid<MergeCell | null>
           rows={gridRows}
           rowHeight={ROW_HEIGHT}
@@ -243,6 +414,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
           frozenColCount={0}
           showRowHeader
           renderRowHeader={renderRowHeader}
+          onRowHeaderContextMenu={(rowIndex, e) => handleRowHeaderContextMenu('ours', rowIndex, e)}
           renderCell={oursRenderCell}
           getCellStyle={oursGetCellStyle}
           renderHeaderCell={renderHeaderCell}
@@ -262,6 +434,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
           frozenColCount={0}
           showRowHeader
           renderRowHeader={renderRowHeader}
+          onRowHeaderContextMenu={(rowIndex, e) => handleRowHeaderContextMenu('theirs', rowIndex, e)}
           renderCell={theirsRenderCell}
           getCellStyle={theirsGetCellStyle}
           renderHeaderCell={renderHeaderCell}
@@ -273,6 +446,76 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
           onScrollYChange={(top) => syncScrollY('theirs', top)}
           scrollToCell={scrollToCell}
         />
+        {contextMenu && (
+          <div
+            style={{
+              position: 'fixed',
+              left: contextMenu.x,
+              top: contextMenu.y,
+              background: 'white',
+              border: '1px solid #ccc',
+              boxShadow: '0 2px 10px rgba(0,0,0,0.15)',
+              zIndex: 9999,
+              fontSize: 12,
+              minWidth: 180,
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ padding: '6px 10px', borderBottom: '1px solid #eee', color: '#666' }}>
+              {contextMenu.type === 'row'
+                ? `行 ${contextMenu.rowNumber}`
+                : `单元格 ${colNumberToLabel(contextMenu.colNumber)}${contextMenu.rowNumber}`}
+              （来源：{contextMenu.source}）
+            </div>
+
+            {contextMenu.type === 'row' && (
+              <button
+                type="button"
+                style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer' }}
+                onClick={() => {
+                  if (onApplyRowChoice) onApplyRowChoice(contextMenu.rowNumber, contextMenu.source);
+                  setContextMenu(null);
+                }}
+              >
+                使用整行单元格数据
+              </button>
+            )}
+
+            {contextMenu.type === 'cell' && (
+              <button
+                type="button"
+                style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer' }}
+                onClick={() => {
+                  if (onApplyCellChoice) {
+                    onApplyCellChoice(contextMenu.rowNumber, contextMenu.colNumber, contextMenu.source);
+                  }
+                  setContextMenu(null);
+                }}
+              >
+                使用本单元格的值
+              </button>
+            )}
+
+            {contextMenu.type === 'cells' && (
+              <button
+                type="button"
+                style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer' }}
+                onClick={() => {
+                  if (onApplyCellsChoice) {
+                    const keys = Array.from(selectedCellKeys.values()).map((k) => {
+                      const [r, c] = k.split(':').map((x) => Number(x));
+                      return { rowNumber: r, colNumber: c };
+                    });
+                    onApplyCellsChoice(keys, contextMenu.source);
+                  }
+                  setContextMenu(null);
+                }}
+              >
+                使用选中单元格的数据
+              </button>
+            )}
+          </div>
+        )}
       </div>
     </div>
   );

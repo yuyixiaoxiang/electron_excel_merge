@@ -18,6 +18,7 @@ export interface VirtualGridProps<Cell> {
   // 行号列
   showRowHeader?: boolean;
   renderRowHeader?: (rowIndex: number, row: Cell[]) => React.ReactNode;
+  onRowHeaderContextMenu?: (rowIndex: number, e: React.MouseEvent<HTMLTableCellElement>) => void;
   // 单元格内容
   renderCell: (cell: Cell | null, ctx: VirtualGridRenderCtx) => React.ReactNode;
   // 单元格样式（背景色、边框等，返回的 style 会 merge 到内部样式之后）
@@ -55,6 +56,7 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
     frozenColCount = 0,
     showRowHeader = true,
     renderRowHeader,
+    onRowHeaderContextMenu,
     renderCell,
     getCellStyle,
     renderHeaderCell,
@@ -309,6 +311,11 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
 
     const rowHeader = showRowHeader ? (
       <td
+        onContextMenu={(e) => {
+          if (onRowHeaderContextMenu) {
+            onRowHeaderContextMenu(rowIndex, e);
+          }
+        }}
         style={{
           position: 'sticky',
           left: 0,
@@ -321,6 +328,7 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
           minWidth: 40,
           backgroundColor: '#f7f7f7',
           fontSize: 12,
+          cursor: onRowHeaderContextMenu ? 'context-menu' : 'default',
         }}
       >
         {renderRowHeader ? renderRowHeader(rowIndex, row) : rowIndex + 1}

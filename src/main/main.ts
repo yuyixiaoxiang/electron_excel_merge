@@ -207,6 +207,13 @@ ipcMain.handle('excel:open', async () => {
 
     const getSimpleValue = (raw: CellValue): string | number | null => {
       if (raw === null || raw === undefined) return null;
+
+      // Date
+      if (raw instanceof Date) {
+        // 保持可读性，避免显示为 [object Object]
+        return raw.toISOString();
+      }
+
       // 富文本：raw.richText 是一个包含 { text } 的数组
       if (typeof raw === 'object' && Array.isArray((raw as any).richText)) {
         const parts = (raw as any).richText
@@ -214,32 +221,65 @@ ipcMain.handle('excel:open', async () => {
           .join('');
         return parts;
       }
-      if (typeof raw === 'object' && 'text' in raw) {
-        return (raw as any).text ?? null;
+
+      // Hyperlink / text-like objects
+      if (typeof raw === 'object' && raw && 'text' in (raw as any)) {
+        const t = (raw as any).text;
+        if (t === null || t === undefined) return null;
+        return typeof t === 'string' || typeof t === 'number' ? (t as any) : String(t);
       }
-      if (typeof raw === 'object' && 'result' in raw) {
-        return (raw as any).result ?? null;
+
+      // Formula / shared formula 等：优先显示 result
+      if (typeof raw === 'object' && raw && 'result' in (raw as any)) {
+        const r = (raw as any).result;
+        if (r === null || r === undefined) return null;
+        if (typeof r === 'string' || typeof r === 'number') return r;
+        if (r instanceof Date) return r.toISOString();
+        return String(r);
       }
+
       if (typeof raw === 'string' || typeof raw === 'number') {
         return raw;
       }
+
+      // 兜底：尽量 JSON 序列化，避免 [object Object]
+      if (typeof raw === 'object') {
+        try {
+          return JSON.stringify(raw);
+        } catch {
+          return String(raw);
+        }
+      }
+
       return String(raw);
     };
 
-    worksheet.eachRow((row: Row, rowNumber: number) => {
-      const rowCells: SheetCell[] = [];
-      row.eachCell({ includeEmpty: true }, (cell: Cell, colNumber: number) => {
-        const value = getSimpleValue(cell.value as any);
+    // 重要：确保每一行的列数一致。
+    // 否则会出现“数据行列数 > 表头/冻结行列数”造成错位。
+    const maxRow =
+      (worksheet as any).actualRowCount && (worksheet as any).actualRowCount > 0
+        ? (worksheet as any).actualRowCount
+        : worksheet.rowCount;
+    const maxCol =
+      (worksheet as any).actualColumnCount && (worksheet as any).actualColumnCount > 0
+        ? (worksheet as any).actualColumnCount
+        : worksheet.columnCount;
 
+    for (let rowNumber = 1; rowNumber <= maxRow; rowNumber += 1) {
+      const rowCells: SheetCell[] = [];
+      const row = worksheet.getRow(rowNumber);
+      for (let colNumber = 1; colNumber <= maxCol; colNumber += 1) {
+        const cell = row.getCell(colNumber);
+        const value = getSimpleValue(cell.value as any);
         rowCells.push({
           address: cell.address,
           row: rowNumber,
           col: colNumber,
           value,
         });
-      });
+      }
       rows.push(rowCells);
-    });
+    }
 
     return {
       sheetName: worksheet.name,

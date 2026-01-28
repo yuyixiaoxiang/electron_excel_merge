@@ -46,6 +46,8 @@ export const App: React.FC = () => {
   const [mergeSheets, setMergeSheets] = useState<MergeSheetData[]>([]);
   const [selectedMergeSheetIndex, setSelectedMergeSheetIndex] = useState<number>(0);
   const [mergeCells, setMergeCells] = useState<MergeCell[]>([]);
+  // 记录“用户已确认合并”的单元格（resolved），按 sheetIndex 分组，key="row:col"（1-based）
+  const [resolvedBySheet, setResolvedBySheet] = useState<Map<number, Set<string>>>(new Map());
   // 当前选中行的三方原始值（用于构建 merged 行视图；目前以 ours 为基准覆盖 mergedValue）
   const [selectedThreeWayRow, setSelectedThreeWayRow] = useState<ThreeWayRowResult | null>(null);
   const [mergedRowColumnWidths, setMergedRowColumnWidths] = useState<number[]>([]);
@@ -110,6 +112,7 @@ export const App: React.FC = () => {
     setMergeSheets(allMergeSheets);
     setSelectedMergeSheetIndex(0);
     setMergeCells(allMergeSheets[0]?.cells ?? []);
+    setResolvedBySheet(new Map());
     setMergeInfo({
       basePath: result.basePath,
       oursPath: result.oursPath,
@@ -243,11 +246,29 @@ export const App: React.FC = () => {
    * - 同步更新当前正在展示的 mergeRows；
    *   这样列表与详情都能立即反映最新选择。
    */
+  const markResolvedKeys = useCallback(
+    (sheetIndex: number, keys: string[]) => {
+      if (keys.length === 0) return;
+      setResolvedBySheet((prev) => {
+        const next = new Map(prev);
+        const current = next.get(sheetIndex) ?? new Set<string>();
+        const merged = new Set(current);
+        keys.forEach((k) => merged.add(k));
+        next.set(sheetIndex, merged);
+        return next;
+      });
+    },
+    [],
+  );
+
   const handleApplyMergeChoice = useCallback(
     (source: 'base' | 'ours' | 'theirs') => {
       if (!selectedMergeCell) return;
 
       const { rowIndex, colIndex } = selectedMergeCell;
+      // 只标记用户显式操作过的单元格
+      markResolvedKeys(selectedMergeSheetIndex, [`${rowIndex + 1}:${colIndex + 1}`]);
+
       setMergeSheets((prev) =>
         prev.map((sheet: MergeSheetData, sIdx: number) => {
           if (sIdx !== selectedMergeSheetIndex) return sheet;
@@ -275,7 +296,96 @@ export const App: React.FC = () => {
         }),
       );
     },
-    [selectedMergeCell, selectedMergeSheetIndex],
+    [selectedMergeCell, selectedMergeSheetIndex, markResolvedKeys],
+  );
+
+  const handleApplyMergeRowChoice = useCallback(
+    (rowNumber: number, source: 'ours' | 'theirs') => {
+      const valueFrom = (cell: MergeCell) => (source === 'ours' ? cell.oursValue : cell.theirsValue);
+
+      // 标记这一行所有差异单元格为 resolved
+      const keys = mergeCells
+        .filter((c) => c.row === rowNumber)
+        .map((c) => `${c.row}:${c.col}`);
+      markResolvedKeys(selectedMergeSheetIndex, keys);
+
+      setMergeSheets((prev) =>
+        prev.map((sheet: MergeSheetData, sIdx: number) => {
+          if (sIdx !== selectedMergeSheetIndex) return sheet;
+          const newCells = sheet.cells.map((cell) => {
+            if (cell.row !== rowNumber) return cell;
+            return { ...cell, mergedValue: valueFrom(cell) };
+          });
+          return { ...sheet, cells: newCells };
+        }),
+      );
+
+      // 同步当前视图的 cells
+      setMergeCells((prev) =>
+        prev.map((cell) => {
+          if (cell.row !== rowNumber) return cell;
+          return { ...cell, mergedValue: valueFrom(cell) };
+        }),
+      );
+    },
+    [selectedMergeSheetIndex, mergeCells, markResolvedKeys],
+  );
+
+  const handleApplyMergeCellChoice = useCallback(
+    (rowNumber: number, colNumber: number, source: 'ours' | 'theirs') => {
+      const valueFrom = (cell: MergeCell) => (source === 'ours' ? cell.oursValue : cell.theirsValue);
+
+      markResolvedKeys(selectedMergeSheetIndex, [`${rowNumber}:${colNumber}`]);
+
+      setMergeSheets((prev) =>
+        prev.map((sheet: MergeSheetData, sIdx: number) => {
+          if (sIdx !== selectedMergeSheetIndex) return sheet;
+          const newCells = sheet.cells.map((cell) => {
+            if (cell.row !== rowNumber || cell.col !== colNumber) return cell;
+            return { ...cell, mergedValue: valueFrom(cell) };
+          });
+          return { ...sheet, cells: newCells };
+        }),
+      );
+
+      setMergeCells((prev) =>
+        prev.map((cell) => {
+          if (cell.row !== rowNumber || cell.col !== colNumber) return cell;
+          return { ...cell, mergedValue: valueFrom(cell) };
+        }),
+      );
+    },
+    [selectedMergeSheetIndex, markResolvedKeys],
+  );
+
+  const handleApplyMergeCellsChoice = useCallback(
+    (keys: { rowNumber: number; colNumber: number }[], source: 'ours' | 'theirs') => {
+      if (!keys.length) return;
+      const valueFrom = (cell: MergeCell) => (source === 'ours' ? cell.oursValue : cell.theirsValue);
+      const keySet = new Set(keys.map((k) => `${k.rowNumber}:${k.colNumber}`));
+      markResolvedKeys(selectedMergeSheetIndex, Array.from(keySet));
+
+      setMergeSheets((prev) =>
+        prev.map((sheet: MergeSheetData, sIdx: number) => {
+          if (sIdx !== selectedMergeSheetIndex) return sheet;
+          const newCells = sheet.cells.map((cell) => {
+            const k = `${cell.row}:${cell.col}`;
+            if (!keySet.has(k)) return cell;
+            return { ...cell, mergedValue: valueFrom(cell) };
+          });
+          return { ...sheet, cells: newCells };
+        }),
+      );
+
+      setMergeCells((prev) =>
+        prev.map((cell) => {
+          const k = `${cell.row}:${cell.col}`;
+          if (!keySet.has(k)) return cell;
+          return { ...cell, mergedValue: valueFrom(cell) };
+        }),
+      );
+    },
+    [selectedMergeSheetIndex, markResolvedKeys],
   );
 
   /**
@@ -708,6 +818,10 @@ export const App: React.FC = () => {
                   cells={mergeCells}
                   selected={selectedMergeCell}
                   onSelectCell={handleSelectMergeCell}
+                  onApplyRowChoice={handleApplyMergeRowChoice}
+                  onApplyCellChoice={handleApplyMergeCellChoice}
+                  onApplyCellsChoice={handleApplyMergeCellsChoice}
+                  resolvedCellKeys={resolvedBySheet.get(selectedMergeSheetIndex)}
                   frozenRowCount={mergeFrozenRowCount}
                 />
             </div>
