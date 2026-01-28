@@ -12,6 +12,7 @@ let mainWindow: BrowserWindow | null = null;
 
 const isDev = process.env.NODE_ENV === 'development';
 const DEFAULT_FROZEN_HEADER_ROWS = 3;
+const DEFAULT_ROW_SIMILARITY_THRESHOLD = 0.9;
 
 /**
  * CLI three-way merge arguments for git/Fork integration.
@@ -378,6 +379,8 @@ const alignRowsByKey = (
   baseRows: RowRecord[],
   oursRows: RowRecord[],
   theirsRows: RowRecord[],
+  keyCol: number,
+  rowSimilarityThreshold: number,
 ): { aligned: AlignedRow[]; ambiguousOurs: Set<number>; ambiguousTheirs: Set<number> } => {
   const groupByKey = (rows: RowRecord[]) => {
     const m = new Map<string, RowRecord[]>();
@@ -387,6 +390,25 @@ const alignRowsByKey = (
       m.get(r.key)!.push(r);
     });
     return m;
+  };
+  const rowSimilarityIgnoringKey = (a: RowRecord, b: RowRecord): number => {
+    if (keyCol < 1) return rowSimilarity(a, b);
+    const cols = new Set<number>();
+    a.nonEmptyCols.forEach((c) => cols.add(c));
+    b.nonEmptyCols.forEach((c) => cols.add(c));
+    if (cols.size === 0) return 1;
+    let same = 0;
+    let total = 0;
+    for (const col of cols) {
+      if (col === keyCol) continue;
+      const av = normalizeCellValue(a.values[col - 1] ?? null);
+      const bv = normalizeCellValue(b.values[col - 1] ?? null);
+      if (av === '' && bv === '') continue;
+      total += 1;
+      if (av === bv) same += 1;
+    }
+    if (total === 0) return 1;
+    return same / total;
   };
 
   const baseByKeyList = groupByKey(baseRows);
@@ -445,25 +467,65 @@ const alignRowsByKey = (
     let theirs: RowRecord | null = null;
     let ambiguousOurs = false;
     let ambiguousTheirs = false;
+    const pickBestMatch = (
+      candidates: RowRecord[],
+      similarityFn: (a: RowRecord, b: RowRecord) => number,
+      threshold: number,
+      delta: number,
+    ) => {
+      if (candidates.length === 0) return null;
+      const scored = candidates
+        .map((r) => ({ row: r, score: similarityFn(baseRow, r) }))
+        .sort((a, b) => b.score - a.score);
+      const best = scored[0];
+      const second = scored[1];
+      if (!best || best.score < threshold) return null;
+      if (second && best.score - second.score < delta) return null;
+      return best.row;
+    };
 
     if (oursCount === 0) {
-      ours = null;
+      const candidates = oursRows.filter((r) => !matchedOursRows.has(r.index));
+      const best = pickBestMatch(candidates, rowSimilarityIgnoringKey, rowSimilarityThreshold, 0.05);
+      if (best) ours = best;
+      else ours = null;
     } else if (oursCount === 1 && baseCount === 1) {
       ours = oursList[0] ?? null;
     } else if (oursCount === baseCount && baseCount > 0) {
       ours = oursList[occIndex] ?? null;
     } else {
-      ambiguousOurs = true;
+      const candidates = oursList.filter((r) => !matchedOursRows.has(r.index));
+      if (candidates.length === 1) {
+        const only = candidates[0];
+        if (rowSimilarity(baseRow, only) >= rowSimilarityThreshold) ours = only;
+        else ambiguousOurs = true;
+      } else {
+        const best = pickBestMatch(candidates, rowSimilarity, rowSimilarityThreshold, 0.1);
+        if (best) ours = best;
+        else ambiguousOurs = true;
+      }
     }
 
     if (theirsCount === 0) {
-      theirs = null;
+      const candidates = theirsRows.filter((r) => !matchedTheirsRows.has(r.index));
+      const best = pickBestMatch(candidates, rowSimilarityIgnoringKey, rowSimilarityThreshold, 0.05);
+      if (best) theirs = best;
+      else theirs = null;
     } else if (theirsCount === 1 && baseCount === 1) {
       theirs = theirsList[0] ?? null;
     } else if (theirsCount === baseCount && baseCount > 0) {
       theirs = theirsList[occIndex] ?? null;
     } else {
-      ambiguousTheirs = true;
+      const candidates = theirsList.filter((r) => !matchedTheirsRows.has(r.index));
+      if (candidates.length === 1) {
+        const only = candidates[0];
+        if (rowSimilarity(baseRow, only) >= rowSimilarityThreshold) theirs = only;
+        else ambiguousTheirs = true;
+      } else {
+        const best = pickBestMatch(candidates, rowSimilarity, rowSimilarityThreshold, 0.1);
+        if (best) theirs = best;
+        else ambiguousTheirs = true;
+      }
     }
 
     if (ours) {
@@ -573,19 +635,59 @@ const alignRowsBySequence = (
       }
     }
 
+    const unmatchedDeletes = new Set<number>(deletes);
+    const unmatchedInserts = new Set<number>(inserts);
+
+    // 优先匹配“完全相同”的行（token 相同），避免重复行造成错配
+    const insertByToken = new Map<string, number[]>();
+    for (const idx of unmatchedInserts) {
+      const token = sideTokens[idx] ?? '';
+      if (!insertByToken.has(token)) insertByToken.set(token, []);
+      insertByToken.get(token)!.push(idx);
+    }
+    insertByToken.forEach((list) => list.sort((a, b) => a - b));
+
+    const matchExactToken = (baseIndex: number) => {
+      const token = baseTokens[baseIndex] ?? '';
+      const list = insertByToken.get(token);
+      if (!list || list.length === 0) return null;
+      // 选择距离期望位置最近的插入点
+      const matchedPairs = Array.from(matched.entries()).map(([baseIndex, sideIndex]) => ({ baseIndex, sideIndex }));
+      matchedPairs.sort((a, b) => a.baseIndex - b.baseIndex);
+      const expected = estimateSideIndex(baseIndex, matchedPairs);
+      let bestPos = 0;
+      let bestDist = Math.abs(list[0] - expected);
+      for (let i = 1; i < list.length; i += 1) {
+        const dist = Math.abs(list[i] - expected);
+        if (dist < bestDist) {
+          bestDist = dist;
+          bestPos = i;
+        }
+      }
+      const sideIndex = list.splice(bestPos, 1)[0];
+      if (list.length === 0) insertByToken.delete(token);
+      return sideIndex ?? null;
+    };
+
+    for (const baseIndex of deletes) {
+      const sideIndex = matchExactToken(baseIndex);
+      if (sideIndex == null) continue;
+      matched.set(baseIndex, sideIndex);
+      unmatchedDeletes.delete(baseIndex);
+      unmatchedInserts.delete(sideIndex);
+    }
+
     const matchedPairs = Array.from(matched.entries()).map(([baseIndex, sideIndex]) => ({ baseIndex, sideIndex }));
     matchedPairs.sort((a, b) => a.baseIndex - b.baseIndex);
 
     const ambiguousBase = new Set<number>();
     const ambiguousSide = new Set<number>();
-    const unmatchedInserts = new Set<number>(inserts);
-
-    for (const baseIndex of deletes) {
+    for (const baseIndex of unmatchedDeletes) {
       const baseRow = baseRows[baseIndex];
       if (!baseRow) continue;
       const expected = estimateSideIndex(baseIndex, matchedPairs);
       const candidates: Array<{ index: number; score: number }> = [];
-      for (const sideIndex of inserts) {
+      for (const sideIndex of unmatchedInserts) {
         if (sideIndex < expected - windowSize || sideIndex > expected + windowSize) continue;
         const sideRow = sideRows[sideIndex];
         if (!sideRow) continue;
@@ -675,6 +777,7 @@ const buildMergeSheetWithRowAlign = (
   theirsWs: any,
   primaryKeyCol: number,
   frozenRowCount: number,
+  rowSimilarityThreshold: number,
 ): MergeSheetData => {
   const getRowCount = (ws: any) =>
     (ws?.actualRowCount ?? 0) > 0 ? ws.actualRowCount : ws?.rowCount ?? 0;
@@ -698,6 +801,40 @@ const buildMergeSheetWithRowAlign = (
     }
     return false;
   };
+  const detectImplicitKeyCol = (rows: RowRecord[], totalCols: number) => {
+    const total = rows.length;
+    if (total === 0) return null;
+    const minCoverage = 0.8;
+    const minUniq = 0.9;
+    const minNonEmpty = Math.max(3, Math.floor(total * minCoverage));
+    let bestCol: number | null = null;
+    let bestScore = 0;
+    for (let col = 1; col <= totalCols; col += 1) {
+      let nonEmpty = 0;
+      const uniq = new Set<string>();
+      for (const row of rows) {
+        const v = normalizeKeyValue(row.values[col - 1] ?? null);
+        if (v == null) continue;
+        nonEmpty += 1;
+        uniq.add(v);
+      }
+      if (nonEmpty < minNonEmpty) continue;
+      const coverage = nonEmpty / total;
+      const uniqueness = uniq.size / Math.max(1, nonEmpty);
+      if (coverage < minCoverage || uniqueness < minUniq) continue;
+      const score = coverage * uniqueness;
+      if (score > bestScore) {
+        bestScore = score;
+        bestCol = col;
+      }
+    }
+    return bestCol;
+  };
+  const applyKeyFromColumn = (rows: RowRecord[], col: number): RowRecord[] =>
+    rows.map((r) => ({
+      ...r,
+      key: col >= 1 ? normalizeKeyValue(r.values[col - 1] ?? null) : null,
+    }));
   const colCount = Math.max(
     baseWs?.actualColumnCount ?? baseWs?.columnCount ?? 0,
     oursWs?.actualColumnCount ?? oursWs?.columnCount ?? 0,
@@ -709,10 +846,18 @@ const buildMergeSheetWithRowAlign = (
   const baseRows = buildRowRecords(baseWs, colCount, keyCol).filter((r) => r.rowNumber > headerCount);
   const oursRows = buildRowRecords(oursWs, colCount, keyCol).filter((r) => r.rowNumber > headerCount);
   const theirsRows = buildRowRecords(theirsWs, colCount, keyCol).filter((r) => r.rowNumber > headerCount);
-
-  const alignedResult = useKey
-    ? alignRowsByKey(baseRows, oursRows, theirsRows)
-    : alignRowsBySequence(baseRows, oursRows, theirsRows);
+  const implicitKeyCol = useKey ? null : detectImplicitKeyCol(baseRows, colCount);
+  const alignKeyCol = useKey ? keyCol : implicitKeyCol ?? -1;
+  const alignedResult =
+    alignKeyCol >= 1
+      ? alignRowsByKey(
+          applyKeyFromColumn(baseRows, alignKeyCol),
+          applyKeyFromColumn(oursRows, alignKeyCol),
+          applyKeyFromColumn(theirsRows, alignKeyCol),
+          alignKeyCol,
+          rowSimilarityThreshold,
+        )
+      : alignRowsBySequence(baseRows, oursRows, theirsRows);
 
   const aligned = alignedResult.aligned;
 
@@ -722,12 +867,16 @@ const buildMergeSheetWithRowAlign = (
     const baseRow = buildHeaderRowRecord(baseWs, r, colCount, keyCol);
     const oursRow = buildHeaderRowRecord(oursWs, r, colCount, keyCol);
     const theirsRow = buildHeaderRowRecord(theirsWs, r, colCount, keyCol);
+    const oursSim = rowSimilarity(baseRow, oursRow);
+    const theirsSim = rowSimilarity(baseRow, theirsRow);
     rowsMeta.push({
       visualRowNumber: r,
       key: baseRow.key ?? oursRow.key ?? theirsRow.key ?? null,
       baseRowNumber: r,
       oursRowNumber: r,
       theirsRowNumber: r,
+      oursSimilarity: oursSim,
+      theirsSimilarity: theirsSim,
       oursStatus: computeRowStatus(baseRow, oursRow, false),
       theirsStatus: computeRowStatus(baseRow, theirsRow, false),
     });
@@ -735,12 +884,16 @@ const buildMergeSheetWithRowAlign = (
   // 2) Body rows: aligned
   aligned.forEach((row, idx) => {
     const visualRowNumber = headerCount + idx + 1;
+    const oursSim = row.base && row.ours ? rowSimilarity(row.base, row.ours) : null;
+    const theirsSim = row.base && row.theirs ? rowSimilarity(row.base, row.theirs) : null;
     rowsMeta.push({
       visualRowNumber,
-      key: row.key ?? row.base?.key ?? row.ours?.key ?? row.theirs?.key ?? null,
+      key: useKey ? row.key ?? row.base?.key ?? row.ours?.key ?? row.theirs?.key ?? null : null,
       baseRowNumber: row.base?.rowNumber ?? null,
       oursRowNumber: row.ours?.rowNumber ?? null,
       theirsRowNumber: row.theirs?.rowNumber ?? null,
+      oursSimilarity: oursSim,
+      theirsSimilarity: theirsSim,
       oursStatus: computeRowStatus(row.base ?? null, row.ours ?? null, row.ambiguousOurs),
       theirsStatus: computeRowStatus(row.base ?? null, row.theirs ?? null, row.ambiguousTheirs),
     });
@@ -904,6 +1057,7 @@ const buildMergeSheetsForWorkbooks = async (
   theirsPath: string,
   primaryKeyCol: number,
   frozenRowCount: number,
+  rowSimilarityThreshold: number,
 ) => {
   const baseWb = new Workbook();
   const oursWb = new Workbook();
@@ -948,7 +1102,9 @@ const buildMergeSheetsForWorkbooks = async (
     usedOursIdx.add(oursHit.idx);
     usedTheirsIdx.add(theirsHit.idx);
 
-    mergeSheets.push(buildMergeSheetWithRowAlign(baseWs, oursHit.ws, theirsHit.ws, primaryKeyCol, frozenRowCount));
+    mergeSheets.push(
+      buildMergeSheetWithRowAlign(baseWs, oursHit.ws, theirsHit.ws, primaryKeyCol, frozenRowCount, rowSimilarityThreshold),
+    );
   }
 
   // 2) 索引兜底：仅对“同一 idx 在三边都没被用过”的位置做对齐
@@ -959,7 +1115,7 @@ const buildMergeSheetsForWorkbooks = async (
     usedOursIdx.add(idx);
     usedTheirsIdx.add(idx);
     mergeSheets.push(
-      buildMergeSheetWithRowAlign(baseList[idx], oursList[idx], theirsList[idx], primaryKeyCol, frozenRowCount),
+      buildMergeSheetWithRowAlign(baseList[idx], oursList[idx], theirsList[idx], primaryKeyCol, frozenRowCount, rowSimilarityThreshold),
     );
   }
 
@@ -1001,6 +1157,9 @@ interface MergeRowMeta {
   baseRowNumber: number | null;
   oursRowNumber: number | null;
   theirsRowNumber: number | null;
+  /** 行相似度（相对 base，范围 0-1） */
+  oursSimilarity?: number | null;
+  theirsSimilarity?: number | null;
   /** 该视觉行在对应 side 相对 base 的状态 */
   oursStatus: RowStatus;
   theirsStatus: RowStatus;
@@ -1265,6 +1424,7 @@ ipcMain.handle('excel:openThreeWay', async () => {
   if (!mainWindow) return null;
   const primaryKeyCol = 1;
   const frozenRowCount = DEFAULT_FROZEN_HEADER_ROWS;
+  const rowSimilarityThreshold = DEFAULT_ROW_SIMILARITY_THRESHOLD;
 
   if (cliThreeWayArgs) {
     const { basePath, oursPath, theirsPath } = cliThreeWayArgs;
@@ -1274,6 +1434,7 @@ ipcMain.handle('excel:openThreeWay', async () => {
       theirsPath,
       primaryKeyCol,
       frozenRowCount,
+      rowSimilarityThreshold,
     );
     return normalizeThreeWayResult(basePath, oursPath, theirsPath, mergeSheets);
   }
@@ -1296,7 +1457,14 @@ ipcMain.handle('excel:openThreeWay', async () => {
   const theirsPath = await pickFile('选择 theirs (合并分支) Excel');
   if (!theirsPath) return null;
 
-  const { mergeSheets } = await buildMergeSheetsForWorkbooks(basePath, oursPath, theirsPath, primaryKeyCol, frozenRowCount);
+  const { mergeSheets } = await buildMergeSheetsForWorkbooks(
+    basePath,
+    oursPath,
+    theirsPath,
+    primaryKeyCol,
+    frozenRowCount,
+    rowSimilarityThreshold,
+  );
 
   return normalizeThreeWayResult(basePath, oursPath, theirsPath, mergeSheets);
 });
@@ -1306,6 +1474,7 @@ interface ThreeWayDiffRequest {
   theirsPath: string;
   primaryKeyCol: number; // 1-based, -1 means no primary key
   frozenRowCount?: number; // header rows compared by coordinates
+  rowSimilarityThreshold?: number; // 0-1
 }
 
 ipcMain.handle('excel:computeThreeWayDiff', async (_event, req: ThreeWayDiffRequest) => {
@@ -1316,12 +1485,17 @@ ipcMain.handle('excel:computeThreeWayDiff', async (_event, req: ThreeWayDiffRequ
     typeof req.frozenRowCount === 'number' && !Number.isNaN(req.frozenRowCount)
       ? Math.max(0, Math.floor(req.frozenRowCount))
       : DEFAULT_FROZEN_HEADER_ROWS;
+  const rowSimilarityThreshold =
+    typeof req.rowSimilarityThreshold === 'number' && !Number.isNaN(req.rowSimilarityThreshold)
+      ? Math.min(1, Math.max(0, req.rowSimilarityThreshold))
+      : DEFAULT_ROW_SIMILARITY_THRESHOLD;
   const { mergeSheets } = await buildMergeSheetsForWorkbooks(
     req.basePath,
     req.oursPath,
     req.theirsPath,
     primaryKeyCol,
     frozenRowCount,
+    rowSimilarityThreshold,
   );
   return normalizeThreeWayResult(req.basePath, req.oursPath, req.theirsPath, mergeSheets);
 });

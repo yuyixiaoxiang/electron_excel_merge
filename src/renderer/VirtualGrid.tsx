@@ -15,6 +15,7 @@ export interface VirtualGridProps<Cell> {
   overscanRows?: number;
   frozenRowCount?: number;
   frozenColCount?: number; // 不包含最左侧行号列
+  rowHeaderWidth?: number; // 行号列宽度
   // 行号列
   showRowHeader?: boolean;
   renderRowHeader?: (rowIndex: number, row: Cell[]) => React.ReactNode;
@@ -54,6 +55,7 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
     overscanRows = DEFAULT_OVERSCAN_ROWS,
     frozenRowCount = 0,
     frozenColCount = 0,
+    rowHeaderWidth = 40,
     showRowHeader = true,
     renderRowHeader,
     onRowHeaderContextMenu,
@@ -238,7 +240,7 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
   const safeFrozenColCount = Math.max(0, Math.min(frozenColCount, colCount));
 
   const getFrozenColsWidth = () => {
-    let w = showRowHeader ? 40 : 0;
+    let w = showRowHeader ? rowHeaderWidth : 0;
     for (let i = 0; i < safeFrozenColCount; i += 1) {
       w += getColWidth(i);
     }
@@ -324,8 +326,8 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
           padding: 2,
           textAlign: 'right',
           userSelect: 'none',
-          width: 40,
-          minWidth: 40,
+          width: rowHeaderWidth,
+          minWidth: rowHeaderWidth,
           backgroundColor: '#f7f7f7',
           fontSize: 12,
           cursor: onRowHeaderContextMenu ? 'context-menu' : 'default',
@@ -342,7 +344,9 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
           const cell = row[colIndex] ?? null;
           const isFrozenCol = colIndex < safeFrozenColCount;
           const isFrozenCell = isFrozenRow || isFrozenCol;
-          const stickyLeft = isFrozenCol ? frozenColOffsets[colIndex] ?? (showRowHeader ? 40 : 0) : undefined;
+          const stickyLeft = isFrozenCol
+            ? frozenColOffsets[colIndex] ?? (showRowHeader ? rowHeaderWidth : 0)
+            : undefined;
 
           const ctx: VirtualGridRenderCtx = {
             rowIndex,
@@ -379,23 +383,23 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
   };
 
   const totalTableWidth = useMemo(() => {
-    let w = showRowHeader ? 40 : 0;
+    let w = showRowHeader ? rowHeaderWidth : 0;
     for (let i = 0; i < colCount; i += 1) {
       w += getColWidth(i);
     }
     return w;
-  }, [showRowHeader, colCount, columnWidths, defaultColWidth]);
+  }, [showRowHeader, colCount, columnWidths, defaultColWidth, rowHeaderWidth]);
 
   const ColGroup = useMemo(() => {
     return (
       <colgroup>
-        {showRowHeader && <col style={{ width: 40 }} />}
+        {showRowHeader && <col style={{ width: rowHeaderWidth }} />}
         {Array.from({ length: colCount }, (_, colIndex) => (
           <col key={colIndex} style={{ width: getColWidth(colIndex) }} />
         ))}
       </colgroup>
     );
-  }, [showRowHeader, colCount, columnWidths, defaultColWidth]);
+  }, [showRowHeader, colCount, columnWidths, defaultColWidth, rowHeaderWidth]);
 
   return (
     <div
@@ -426,8 +430,8 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
                     padding: 2,
                     textAlign: 'right',
                     userSelect: 'none',
-                    width: 40,
-                    minWidth: 40,
+                    width: rowHeaderWidth,
+                    minWidth: rowHeaderWidth,
                     backgroundColor: '#f0f0f0',
                     fontSize: 12,
                   }}

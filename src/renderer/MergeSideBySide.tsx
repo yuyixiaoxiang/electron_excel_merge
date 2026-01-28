@@ -27,7 +27,14 @@ export interface MergeSideBySideProps {
   frozenRowCount?: number;
   /** 主键列（1-based）；传入时会在 diff 视图中额外展示该列 */
   primaryKeyCol?: number;
+  /** ours/theirs 文件路径，用于顶部标识 */
+  oursPath?: string | null;
+  theirsPath?: string | null;
+  /** base 文件路径 */
+  basePath?: string | null;
 }
+const MERGED_COLOR = '#fafafa';
+const FROZEN_COLOR = '#e6e6e6';
 
 const getBackgroundColor = (status: MergeCell['status'], side: 'ours' | 'theirs'): string => {
   switch (status) {
@@ -39,7 +46,7 @@ const getBackgroundColor = (status: MergeCell['status'], side: 'ours' | 'theirs'
       // 需求：theirs 侧用 red
       return side === 'theirs' ? '#ffc8c8' : 'white';
     case 'both-changed-same':
-      return '#fff6bf'; // both sides yellow
+      return MERGED_COLOR; // both sides same -> merge color
     case 'conflict':
       // 需求：当 ours/theirs 不同（冲突）时：ours=green, theirs=red
       return side === 'ours' ? '#d4f8d4' : '#ffc8c8';
@@ -77,6 +84,9 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   resolvedCellKeys,
   frozenRowCount = DEFAULT_FROZEN_HEADER_ROWS,
   primaryKeyCol,
+  oursPath,
+  theirsPath,
+  basePath,
 }) => {
   if (cells.length === 0) return <div>没有检测到任何差异。</div>;
 
@@ -226,12 +236,26 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
           : meta?.theirsRowNumber ?? meta?.baseRowNumber ?? visualRowNumber;
       const indicator = getRowStatusIndicator(status);
       const display = rowNumber ?? '';
+      const baseNum = meta?.baseRowNumber ?? '-';
+      const oursNum = meta?.oursRowNumber ?? '-';
+      const theirsNum = meta?.theirsRowNumber ?? '-';
+      const originalLabel = `b${baseNum}/o${oursNum}/t${theirsNum}`;
+      const sim = side === 'ours' ? meta?.oursSimilarity : meta?.theirsSimilarity;
+      const simLabel = typeof sim === 'number' ? `s${sim.toFixed(2)}` : '';
+      const title = `原始行号: base=${baseNum}, ours=${oursNum}, theirs=${theirsNum}`;
       return (
-        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4 }}>
+        <div
+          title={title}
+          style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4, overflow: 'hidden' }}
+        >
           {indicator.symbol && (
             <span style={{ color: indicator.color, fontWeight: 700 }}>{indicator.symbol}</span>
           )}
-          <span>{display}</span>
+          <span style={{ whiteSpace: 'nowrap' }}>{display}</span>
+          <span style={{ fontSize: 10, color: '#666', whiteSpace: 'nowrap' }}>{originalLabel}</span>
+          {simLabel && (
+            <span style={{ fontSize: 10, color: '#888', whiteSpace: 'nowrap' }}>{simLabel}</span>
+          )}
         </div>
       );
     };
@@ -292,6 +316,25 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   const dragEndRef = useRef<{ rowNumber: number; colNumber: number } | null>(null);
   const isDraggingRef = useRef(false);
   const dragMovedRef = useRef(false);
+  const selectionBounds = useMemo(() => {
+    if (!selectedCellKeys || selectedCellKeys.size === 0) return null;
+    let minRow = Infinity;
+    let maxRow = -Infinity;
+    let minCol = Infinity;
+    let maxCol = -Infinity;
+    selectedCellKeys.forEach((k) => {
+      const [rStr, cStr] = k.split(':');
+      const r = Number(rStr);
+      const c = Number(cStr);
+      if (Number.isNaN(r) || Number.isNaN(c)) return;
+      if (r < minRow) minRow = r;
+      if (r > maxRow) maxRow = r;
+      if (c < minCol) minCol = c;
+      if (c > maxCol) maxCol = c;
+    });
+    if (!Number.isFinite(minRow) || !Number.isFinite(minCol)) return null;
+    return { minRow, maxRow, minCol, maxCol };
+  }, [selectedCellKeys]);
 
   useEffect(() => {
     const onUp = () => {
@@ -420,22 +463,28 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   const makeGetCellStyle = (side: 'ours' | 'theirs') =>
     (cell: MergeCell | null, ctx: VirtualGridRenderCtx): React.CSSProperties => {
       const style: React.CSSProperties = {};
-      if (ctx.isFrozenRow) {
-        style.backgroundColor = '#f5f5f5';
-      } else if (cell) {
+      if (cell) {
         const key = `${cell.row}:${cell.col}`;
         if (resolvedCellKeys && resolvedCellKeys.has(key)) {
           // 已确认合并：两侧都用浅灰表示“处理过”
-          style.backgroundColor = '#f0f0f0';
-        } else {
+          style.backgroundColor = MERGED_COLOR;
+        } else if (cell.status !== 'unchanged') {
           style.backgroundColor = getBackgroundColor(cell.status, side);
+        } else if (ctx.isFrozenRow || ctx.isFrozenCol) {
+          style.backgroundColor = FROZEN_COLOR;
         }
+      } else if (ctx.isFrozenRow || ctx.isFrozenCol) {
+        style.backgroundColor = FROZEN_COLOR;
       }
 
       if (cell) {
         const key = `${cell.row}:${cell.col}`;
-        if (selectedCellKeys.has(key)) {
-          style.border = '2px solid #ff8000';
+        if (selectedCellKeys.has(key) && selectionBounds) {
+          const { minRow, maxRow, minCol, maxCol } = selectionBounds;
+          if (cell.row === minRow) style.borderTop = '2px solid #ff8000';
+          if (cell.row === maxRow) style.borderBottom = '2px solid #ff8000';
+          if (cell.col === minCol) style.borderLeft = '2px solid #ff8000';
+          if (cell.col === maxCol) style.borderRight = '2px solid #ff8000';
         }
       }
 
@@ -486,47 +535,91 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
         gap: 4,
       }}
     >
-      <div style={{ display: 'flex', gap: 16, flex: 1, minHeight: 0, position: 'relative' }}>
-        <VirtualGrid<MergeCell | null>
-          rows={gridRows}
-          rowHeight={ROW_HEIGHT}
-          overscanRows={OVERSCAN_ROWS}
-          frozenRowCount={frozenRowCount}
-          frozenColCount={0}
-          showRowHeader
-          renderRowHeader={makeRowHeaderRenderer('ours')}
-          onRowHeaderContextMenu={(rowIndex, e) => handleRowHeaderContextMenu('ours', rowIndex, e)}
-          renderCell={oursRenderCell}
-          getCellStyle={oursGetCellStyle}
-          renderHeaderCell={renderHeaderCell}
-          defaultColWidth={DATA_COL_WIDTH}
-          columnWidths={columnWidths}
-          onColumnWidthsChange={setColumnWidths}
-          containerRef={oursScrollRef as React.RefObject<HTMLDivElement>}
-          onScrollXChange={(left) => syncScrollX('ours', left)}
-          onScrollYChange={(top) => syncScrollY('ours', top)}
-          scrollToCell={scrollToCell}
-        />
-        <VirtualGrid<MergeCell | null>
-          rows={gridRows}
-          rowHeight={ROW_HEIGHT}
-          overscanRows={OVERSCAN_ROWS}
-          frozenRowCount={frozenRowCount}
-          frozenColCount={0}
-          showRowHeader
-          renderRowHeader={makeRowHeaderRenderer('theirs')}
-          onRowHeaderContextMenu={(rowIndex, e) => handleRowHeaderContextMenu('theirs', rowIndex, e)}
-          renderCell={theirsRenderCell}
-          getCellStyle={theirsGetCellStyle}
-          renderHeaderCell={renderHeaderCell}
-          defaultColWidth={DATA_COL_WIDTH}
-          columnWidths={columnWidths}
-          onColumnWidthsChange={setColumnWidths}
-          containerRef={theirsScrollRef as React.RefObject<HTMLDivElement>}
-          onScrollXChange={(left) => syncScrollX('theirs', left)}
-          onScrollYChange={(top) => syncScrollY('theirs', top)}
-          scrollToCell={scrollToCell}
-        />
+      <div
+        style={{
+          display: 'flex',
+          gap: 16,
+          fontSize: 12,
+          color: '#444',
+          alignItems: 'center',
+          minHeight: 18,
+        }}
+      >
+        <div style={{ flex: 1, minWidth: 0, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' }}>
+          ours{oursPath ? `: ${oursPath}` : ''}
+        </div>
+        <div
+          style={{
+            maxWidth: '40%',
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            textAlign: 'center',
+            flexShrink: 0,
+          }}
+        >
+          base{basePath ? `: ${basePath}` : ''}
+        </div>
+        <div
+          style={{
+            flex: 1,
+            minWidth: 0,
+            whiteSpace: 'nowrap',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            textAlign: 'right',
+          }}
+        >
+          theirs{theirsPath ? `: ${theirsPath}` : ''}
+        </div>
+      </div>
+      <div style={{ display: 'flex', gap: 16, flex: 1, minHeight: 0 }}>
+        <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0 }}>
+          <VirtualGrid<MergeCell | null>
+            rows={gridRows}
+            rowHeight={ROW_HEIGHT}
+            overscanRows={OVERSCAN_ROWS}
+            frozenRowCount={frozenRowCount}
+            frozenColCount={0}
+            rowHeaderWidth={120}
+            showRowHeader
+            renderRowHeader={makeRowHeaderRenderer('ours')}
+            onRowHeaderContextMenu={(rowIndex, e) => handleRowHeaderContextMenu('ours', rowIndex, e)}
+            renderCell={oursRenderCell}
+            getCellStyle={oursGetCellStyle}
+            renderHeaderCell={renderHeaderCell}
+            defaultColWidth={DATA_COL_WIDTH}
+            columnWidths={columnWidths}
+            onColumnWidthsChange={setColumnWidths}
+            containerRef={oursScrollRef as React.RefObject<HTMLDivElement>}
+            onScrollXChange={(left) => syncScrollX('ours', left)}
+            onScrollYChange={(top) => syncScrollY('ours', top)}
+            scrollToCell={scrollToCell}
+          />
+        </div>
+        <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0 }}>
+          <VirtualGrid<MergeCell | null>
+            rows={gridRows}
+            rowHeight={ROW_HEIGHT}
+            overscanRows={OVERSCAN_ROWS}
+            frozenRowCount={frozenRowCount}
+            frozenColCount={0}
+            rowHeaderWidth={120}
+            showRowHeader
+            renderRowHeader={makeRowHeaderRenderer('theirs')}
+            onRowHeaderContextMenu={(rowIndex, e) => handleRowHeaderContextMenu('theirs', rowIndex, e)}
+            renderCell={theirsRenderCell}
+            getCellStyle={theirsGetCellStyle}
+            renderHeaderCell={renderHeaderCell}
+            defaultColWidth={DATA_COL_WIDTH}
+            columnWidths={columnWidths}
+            onColumnWidthsChange={setColumnWidths}
+            containerRef={theirsScrollRef as React.RefObject<HTMLDivElement>}
+            onScrollXChange={(left) => syncScrollX('theirs', left)}
+            onScrollYChange={(top) => syncScrollY('theirs', top)}
+            scrollToCell={scrollToCell}
+          />
+        </div>
         {contextMenu && (
           <div
             style={{

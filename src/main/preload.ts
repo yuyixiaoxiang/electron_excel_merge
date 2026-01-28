@@ -38,6 +38,8 @@ interface MergeRowMeta {
   baseRowNumber: number | null;
   oursRowNumber: number | null;
   theirsRowNumber: number | null;
+  oursSimilarity?: number | null;
+  theirsSimilarity?: number | null;
   oursStatus: RowStatus;
   theirsStatus: RowStatus;
 }
@@ -75,6 +77,7 @@ interface ThreeWayDiffRequest {
   theirsPath: string;
   primaryKeyCol: number; // 1-based, -1 means no primary key
   frozenRowCount?: number; // number of header rows to compare by coordinates
+  rowSimilarityThreshold?: number; // 0-1
 }
 
 interface SaveMergeCellInput {

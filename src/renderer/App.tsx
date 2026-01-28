@@ -58,6 +58,7 @@ export const App: React.FC = () => {
   const [frozenColCount, setFrozenColCount] = useState<number>(0);
   // merge/diff 视图中固定在顶部展示的行数，默认 3 行
   const [mergeFrozenRowCount, setMergeFrozenRowCount] = useState<number>(3);
+  const [rowSimilarityThreshold, setRowSimilarityThreshold] = useState<number>(0.9);
 
   // 三方 diff 状态
   const [mergeSheets, setMergeSheets] = useState<MergeSheetData[]>([]);
@@ -139,6 +140,7 @@ export const App: React.FC = () => {
     setAutoHasPrimaryKey(true);
     setLastPrimaryKeyCol(1);
     setPrimaryKeyHint('');
+    setRowSimilarityThreshold(0.9);
     setResolvedBySheet(new Map());
     setMergeInfo({
       basePath: result.basePath,
@@ -175,6 +177,7 @@ export const App: React.FC = () => {
         theirsPath: mergeInfo.theirsPath,
         primaryKeyCol,
         frozenRowCount: mergeFrozenRowCount,
+        rowSimilarityThreshold,
       };
       const result = await window.excelAPI.computeThreeWayDiff(req);
       if (!result || cancelled) return;
@@ -196,7 +199,15 @@ export const App: React.FC = () => {
     return () => {
       cancelled = true;
     };
-  }, [primaryKeyCol, mergeFrozenRowCount, mergeInfo?.basePath, mergeInfo?.oursPath, mergeInfo?.theirsPath, mode]);
+  }, [
+    primaryKeyCol,
+    mergeFrozenRowCount,
+    rowSimilarityThreshold,
+    mergeInfo?.basePath,
+    mergeInfo?.oursPath,
+    mergeInfo?.theirsPath,
+    mode,
+  ]);
 
   // 自动判断是否存在主键（基于 rowsMeta 的 key 覆盖率，带滞回避免抖动）
   useEffect(() => {
@@ -322,6 +333,17 @@ export const App: React.FC = () => {
     const visualRowNumber = selectedMergeCell.rowIndex + 1;
     return mergeRowsMeta.find((m) => m.visualRowNumber === visualRowNumber) ?? null;
   }, [mode, selectedMergeCell, mergeRowsMeta]);
+
+  const mergedPath = useMemo(() => {
+    if (!mergeInfo) return null;
+    if (cliInfo?.mode === 'merge') {
+      return cliInfo.mergedPath ?? mergeInfo.oursPath;
+    }
+    if (cliInfo?.mode === 'diff') {
+      return mergeInfo.oursPath;
+    }
+    return null;
+  }, [mergeInfo, cliInfo]);
 
   // 当选中单元格变化时，按需读取该“整行”的 base/ours/theirs 值，用于底部行级对比视图
   useEffect(() => {
@@ -820,19 +842,6 @@ export const App: React.FC = () => {
         ) : mergeInfo ? (
           <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
             <div style={{ marginBottom: 8 }}>
-              {/* diff 模式（仅传 LOCAL/REMOTE）时不显示 base 行 */}
-              {!(cliInfo && cliInfo.mode === 'diff') && <div>base: {mergeInfo.basePath}</div>}
-              <div>ours: {mergeInfo.oursPath}</div>
-              <div>theirs: {mergeInfo.theirsPath}</div>
-              {mergeInfo.basePath === mergeInfo.oursPath &&
-                mergeInfo.oursPath === mergeInfo.theirsPath && (
-                  <div style={{ marginTop: 4, color: '#b00020', fontSize: 12 }}>
-                    警告：base / ours / theirs 路径完全相同，无法产生差异。请检查第三方工具传参是否正确。
-                  </div>
-                )}
-              {cliInfo?.mergedPath && (
-                <div>merged(写回目标): {cliInfo.mergedPath}</div>
-              )}
               <div style={{ display: 'flex', alignItems: 'center', marginTop: 4 }}>
                 <span>工作表:</span>
                 <div
@@ -908,8 +917,8 @@ export const App: React.FC = () => {
                   <span>theirs 侧：theirs 有改动 / 冲突时 theirs</span>
                 </span>
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
-                  <span style={{ width: 10, height: 10, backgroundColor: '#fff6bf', border: '1px solid #bbb', display: 'inline-block' }} />
-                  <span>黄色：双方都改且改成相同值</span>
+                  <span style={{ width: 10, height: 10, backgroundColor: '#fafafa', border: '1px solid #bbb', display: 'inline-block' }} />
+                  <span>浅灰：双方都改且改成相同值 / 已合并</span>
                 </span>
                 <span style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
                   <span style={{ width: 10, height: 10, backgroundColor: '#ffffff', border: '1px solid #bbb', display: 'inline-block' }} />
@@ -930,6 +939,23 @@ export const App: React.FC = () => {
                   style={{ width: 60, padding: '2px 6px', boxSizing: 'border-box' }}
                 />
                 <span style={{ fontSize: 12, color: '#666' }}>（例如 3 表示固定前 3 行）</span>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', marginTop: 4, gap: 4 }}>
+                <span>行相似度阈值:</span>
+                <input
+                  type="number"
+                  min={0}
+                  max={1}
+                  step={0.01}
+                  value={rowSimilarityThreshold}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isNaN(v)) return;
+                    setRowSimilarityThreshold(Math.min(1, Math.max(0, v)));
+                  }}
+                  style={{ width: 60, padding: '2px 6px', boxSizing: 'border-box' }}
+                />
+                <span style={{ fontSize: 12, color: '#666' }}>（0~1，越大越严格）</span>
               </div>
               <div style={{ display: 'flex', alignItems: 'center', marginTop: 4, gap: 4 }}>
                 {autoHasPrimaryKey && (
@@ -1017,6 +1043,9 @@ export const App: React.FC = () => {
                   resolvedCellKeys={resolvedBySheet.get(selectedMergeSheetIndex)}
                   frozenRowCount={mergeFrozenRowCount}
                   primaryKeyCol={primaryKeyCol}
+                  oursPath={mergeInfo?.oursPath ?? null}
+                  basePath={mergeInfo?.basePath ?? null}
+                  theirsPath={mergeInfo?.theirsPath ?? null}
                 />
             </div>
             {selectedMergeCell && selectedThreeWayRow && (
@@ -1033,16 +1062,16 @@ export const App: React.FC = () => {
                     backgroundColor: '#fafafa',
                   }}
                 >
-                  <span>
-                    当前对齐行：{selectedMergeCell.rowIndex + 1}
-                    （base:{selectedMergeRowMeta?.baseRowNumber ?? '-'} /
-                    ours:{selectedMergeRowMeta?.oursRowNumber ?? '-'} /
-                    theirs:{selectedMergeRowMeta?.theirsRowNumber ?? '-'}）
-                    （选中：{selectedMergeCellData?.address ?? ''}）
-                  </span>
-                  <button onClick={() => handleApplyMergeChoice('base')}>用 base</button>
-                  <button onClick={() => handleApplyMergeChoice('ours')}>用 ours</button>
-                  <button onClick={() => handleApplyMergeChoice('theirs')}>用 theirs</button>
+                  {mergedPath ? (
+                    <span
+                      title={mergedPath}
+                      style={{ maxWidth: 520, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                    >
+                      merged: {mergedPath}
+                    </span>
+                  ) : (
+                    <span>没有设置 merged 路径</span>
+                  )}
                 </div>
 
                 {(() => {
