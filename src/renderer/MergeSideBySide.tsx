@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type { MergeCell } from '../main/preload';
+import type { MergeCell, MergeRowMeta, RowStatus } from '../main/preload';
 import { VirtualGrid, VirtualGridRenderCtx } from './VirtualGrid';
 
 const ROW_HEIGHT = 24; // px, approximate row height for virtualization
@@ -15,6 +15,7 @@ const DEFAULT_FROZEN_HEADER_ROWS = 3; // merge/diff 视图中固定展示的前�
 export interface MergeSideBySideProps {
   // 性能优化：只传差异单元格列表（稀疏结构）
   cells: MergeCell[];
+  rowsMeta?: MergeRowMeta[];
   selected?: { rowIndex: number; colIndex: number } | null;
   onSelectCell?: (rowIndex: number, colIndex: number) => void;
   onApplyRowChoice?: (rowNumber: number, source: 'ours' | 'theirs') => void;
@@ -24,6 +25,8 @@ export interface MergeSideBySideProps {
   resolvedCellKeys?: Set<string>;
   /** 冻结在顶部展示的行数，可配置 */
   frozenRowCount?: number;
+  /** 主键列（1-based）；传入时会在 diff 视图中额外展示该列 */
+  primaryKeyCol?: number;
 }
 
 const getBackgroundColor = (status: MergeCell['status'], side: 'ours' | 'theirs'): string => {
@@ -65,6 +68,7 @@ const DATA_COL_WIDTH = 160; // px, keep ours/theirs columns visually aligned
 
 const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   cells,
+  rowsMeta,
   selected,
   onSelectCell,
   onApplyRowChoice,
@@ -72,6 +76,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   onApplyCellsChoice,
   resolvedCellKeys,
   frozenRowCount = DEFAULT_FROZEN_HEADER_ROWS,
+  primaryKeyCol,
 }) => {
   if (cells.length === 0) return <div>没有检测到任何差异。</div>;
 
@@ -117,15 +122,58 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
     cells.forEach((cell) => cols.add(cell.col));
     return Array.from(cols).sort((a, b) => a - b);
   }, [cells]);
+  const rowsMetaMap = useMemo(() => {
+    const m = new Map<number, MergeRowMeta>();
+    (rowsMeta ?? []).forEach((r) => m.set(r.visualRowNumber, r));
+    return m;
+  }, [rowsMeta]);
 
-  // 差异行号（1-based Excel 行号）
+  // 差异行号（对齐后的视觉行号）
   const diffRowNumbers = useMemo(() => {
     const rs = new Set<number>();
     cells.forEach((cell) => rs.add(cell.row));
+    const headerCount = Math.max(0, Math.floor(frozenRowCount));
+    for (let i = 1; i <= headerCount; i += 1) {
+      rs.add(i);
+    }
     return Array.from(rs).sort((a, b) => a - b);
-  }, [cells]);
+  }, [cells, frozenRowCount]);
+  const normalizedPrimaryKeyCol =
+    typeof primaryKeyCol === 'number' && primaryKeyCol >= 1 ? Math.floor(primaryKeyCol) : null;
 
-  if (diffColumns.length === 0 || diffRowNumbers.length === 0) {
+  const displayColumns = useMemo(() => {
+    if (!normalizedPrimaryKeyCol) return diffColumns;
+    const cols = new Set<number>(diffColumns);
+    cols.add(normalizedPrimaryKeyCol);
+    return Array.from(cols).sort((a, b) => a - b);
+  }, [diffColumns, normalizedPrimaryKeyCol]);
+
+  const displayCellMap = useMemo(() => {
+    const m = new Map(cellMap);
+    if (!normalizedPrimaryKeyCol) return m;
+    for (const rowNumber of diffRowNumbers) {
+      const key = `${rowNumber}:${normalizedPrimaryKeyCol}`;
+      if (m.has(key)) continue;
+      const meta = rowsMetaMap.get(rowNumber);
+      const keyValue = meta?.key ?? null;
+      const addressRow =
+        meta?.oursRowNumber ?? meta?.baseRowNumber ?? meta?.theirsRowNumber ?? rowNumber;
+      const address = `${colNumberToLabel(normalizedPrimaryKeyCol)}${addressRow}`;
+      m.set(key, {
+        address,
+        row: rowNumber,
+        col: normalizedPrimaryKeyCol,
+        baseValue: keyValue,
+        oursValue: keyValue,
+        theirsValue: keyValue,
+        status: 'unchanged',
+        mergedValue: keyValue,
+      });
+    }
+    return m;
+  }, [cellMap, normalizedPrimaryKeyCol, diffRowNumbers, rowsMetaMap]);
+
+  if (displayColumns.length === 0 || diffRowNumbers.length === 0) {
     return <div>没有检测到任何差异。</div>;
   }
 
@@ -135,25 +183,58 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   const gridRows: (MergeCell | null)[][] = useMemo(
     () =>
       gridRowNumbers.map((rowNumber) =>
-        diffColumns.map((colNumber) => cellMap.get(`${rowNumber}:${colNumber}`) ?? null),
+        displayColumns.map((colNumber) => displayCellMap.get(`${rowNumber}:${colNumber}`) ?? null),
       ),
-    [cellMap, gridRowNumbers, diffColumns],
+    [displayCellMap, gridRowNumbers, displayColumns],
   );
 
   // 两侧共享列宽，避免左右/表头/内容出现 1px 累积偏差或拖拽后不同步
   const [columnWidths, setColumnWidths] = useState<number[]>([]);
   useEffect(() => {
-    const count = diffColumns.length;
+    const count = displayColumns.length;
     setColumnWidths((prev) => {
       if (prev.length === count) return prev;
       return Array(count).fill(DATA_COL_WIDTH);
     });
-  }, [diffColumns.length]);
+  }, [displayColumns.length]);
 
-  const renderRowHeader = (_gridRowIndex: number, rowCells: (MergeCell | null)[]) => {
-    const anyCell = rowCells.find((c) => c != null) ?? undefined;
-    return anyCell?.row ?? '';
+  const getRowStatusIndicator = (status: RowStatus | undefined) => {
+    switch (status) {
+      case 'added':
+        return { symbol: '+', color: '#2e7d32' };
+      case 'deleted':
+        return { symbol: '-', color: '#b00020' };
+      case 'modified':
+        return { symbol: '~', color: '#ef6c00' };
+      case 'ambiguous':
+        return { symbol: '?', color: '#6d6d6d' };
+      case 'unchanged':
+      default:
+        return { symbol: '', color: '#666' };
+    }
   };
+
+  const makeRowHeaderRenderer =
+    (side: 'ours' | 'theirs') =>
+    (gridRowIndex: number, rowCells: (MergeCell | null)[]) => {
+      const visualRowNumber = diffRowNumbers[gridRowIndex];
+      const meta = visualRowNumber ? rowsMetaMap.get(visualRowNumber) : undefined;
+      const status = side === 'ours' ? meta?.oursStatus : meta?.theirsStatus;
+      const rowNumber =
+        side === 'ours'
+          ? meta?.oursRowNumber ?? meta?.baseRowNumber ?? visualRowNumber
+          : meta?.theirsRowNumber ?? meta?.baseRowNumber ?? visualRowNumber;
+      const indicator = getRowStatusIndicator(status);
+      const display = rowNumber ?? '';
+      return (
+        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'flex-end', gap: 4 }}>
+          {indicator.symbol && (
+            <span style={{ color: indicator.color, fontWeight: 700 }}>{indicator.symbol}</span>
+          )}
+          <span>{display}</span>
+        </div>
+      );
+    };
 
   const [contextMenu, setContextMenu] = useState<
     | {
@@ -372,7 +453,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
     };
 
   const renderHeaderCell = (colIndex: number) => {
-    const colNumber = diffColumns[colIndex];
+    const colNumber = displayColumns[colIndex];
     return colNumberToLabel(colNumber);
   };
 
@@ -387,10 +468,10 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
     const targetRowNumber = selected.rowIndex + 1;
     const targetColNumber = selected.colIndex + 1;
     const gridRowIndex = diffRowNumbers.indexOf(targetRowNumber);
-    const gridColIndex = diffColumns.indexOf(targetColNumber);
+    const gridColIndex = displayColumns.indexOf(targetColNumber);
     if (gridRowIndex < 0 || gridColIndex < 0) return null;
     return { rowIndex: gridRowIndex, colIndex: gridColIndex };
-  }, [selected, diffRowNumbers, diffColumns]);
+  }, [selected, diffRowNumbers, displayColumns]);
 
   return (
     <div
@@ -413,7 +494,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
           frozenRowCount={frozenRowCount}
           frozenColCount={0}
           showRowHeader
-          renderRowHeader={renderRowHeader}
+          renderRowHeader={makeRowHeaderRenderer('ours')}
           onRowHeaderContextMenu={(rowIndex, e) => handleRowHeaderContextMenu('ours', rowIndex, e)}
           renderCell={oursRenderCell}
           getCellStyle={oursGetCellStyle}
@@ -433,7 +514,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
           frozenRowCount={frozenRowCount}
           frozenColCount={0}
           showRowHeader
-          renderRowHeader={renderRowHeader}
+          renderRowHeader={makeRowHeaderRenderer('theirs')}
           onRowHeaderContextMenu={(rowIndex, e) => handleRowHeaderContextMenu('theirs', rowIndex, e)}
           renderCell={theirsRenderCell}
           getCellStyle={theirsGetCellStyle}

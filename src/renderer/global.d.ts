@@ -4,6 +4,7 @@ import type {
   OpenResult,
   SaveMergeRequest,
   SaveMergeResponse,
+  ThreeWayDiffRequest,
   ThreeWayOpenResult,
   ThreeWayRowRequest,
   ThreeWayRowResult,
@@ -19,6 +20,7 @@ declare global {
       openFile: () => Promise<OpenResult | null>;
       saveChanges: (changes: CellChange[]) => Promise<void>;
       openThreeWay: () => Promise<ThreeWayOpenResult | null>;
+      computeThreeWayDiff: (req: ThreeWayDiffRequest) => Promise<ThreeWayOpenResult | null>;
       saveMergeResult: (req: SaveMergeRequest) => Promise<SaveMergeResponse>;
       getCliThreeWayInfo: () => Promise<CliThreeWayInfo | null>;
       getThreeWayRow: (req: ThreeWayRowRequest) => Promise<ThreeWayRowResult | null>;

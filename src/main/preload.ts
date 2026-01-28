@@ -30,6 +30,18 @@ interface CellChange {
 }
 
 // Merge diff types
+type RowStatus = 'unchanged' | 'added' | 'deleted' | 'modified' | 'ambiguous';
+
+interface MergeRowMeta {
+  visualRowNumber: number;
+  key?: string | null;
+  baseRowNumber: number | null;
+  oursRowNumber: number | null;
+  theirsRowNumber: number | null;
+  oursStatus: RowStatus;
+  theirsStatus: RowStatus;
+}
+
 interface MergeCell {
   address: string;
   row: number;
@@ -45,6 +57,8 @@ interface MergeSheetData {
   sheetName: string;
   // 性能优化：仅传输“可能产生差异”的单元格列表（稀疏结构），避免把整张表矩阵通过 IPC 传到渲染进程
   cells: MergeCell[];
+  rowsMeta?: MergeRowMeta[];
+  hasExactDiff?: boolean;
 }
 
 interface ThreeWayOpenResult {
@@ -53,6 +67,14 @@ interface ThreeWayOpenResult {
   theirsPath: string;
   sheet: MergeSheetData; // 第一个 sheet
   sheets: MergeSheetData[];
+}
+
+interface ThreeWayDiffRequest {
+  basePath: string;
+  oursPath: string;
+  theirsPath: string;
+  primaryKeyCol: number; // 1-based, -1 means no primary key
+  frozenRowCount?: number; // number of header rows to compare by coordinates
 }
 
 interface SaveMergeCellInput {
@@ -87,12 +109,18 @@ interface ThreeWayRowRequest {
   theirsPath: string;
   sheetName?: string;
   sheetIndex?: number; // 0-based
-  rowNumber: number; // 1-based
+  rowNumber?: number; // 1-based fallback for all sides
+  baseRowNumber?: number | null;
+  oursRowNumber?: number | null;
+  theirsRowNumber?: number | null;
 }
 
 interface ThreeWayRowResult {
   sheetName: string;
-  rowNumber: number;
+  rowNumber?: number;
+  baseRowNumber: number | null;
+  oursRowNumber: number | null;
+  theirsRowNumber: number | null;
   colCount: number;
   base: (string | number | null)[];
   ours: (string | number | null)[];
@@ -114,6 +142,10 @@ const excelAPI = {
   },
   openThreeWay: async (): Promise<ThreeWayOpenResult | null> => {
     const result = await ipcRenderer.invoke('excel:openThreeWay');
+    return result as ThreeWayOpenResult | null;
+  },
+  computeThreeWayDiff: async (req: ThreeWayDiffRequest): Promise<ThreeWayOpenResult | null> => {
+    const result = await ipcRenderer.invoke('excel:computeThreeWayDiff', req);
     return result as ThreeWayOpenResult | null;
   },
   saveMergeResult: async (req: SaveMergeRequest): Promise<SaveMergeResponse> => {
@@ -139,7 +171,10 @@ export type {
   CellChange,
   MergeCell,
   MergeSheetData,
+  MergeRowMeta,
+  RowStatus,
   ThreeWayOpenResult,
+  ThreeWayDiffRequest,
   SaveMergeCellInput,
   SaveMergeRequest,
   SaveMergeResponse,
