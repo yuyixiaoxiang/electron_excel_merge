@@ -1192,10 +1192,21 @@ interface SaveMergeCellInput {
   address: string;
   value: string | number | null;
 }
+interface SaveMergeRowOp {
+  sheetName: string;
+  action: 'insert' | 'delete';
+  targetRowNumber: number; // 1-based in template (ours)
+  values?: (string | number | null)[];
+  visualRowNumber?: number;
+}
 
 interface SaveMergeRequest {
   templatePath: string;
   cells: SaveMergeCellInput[];
+  rowOps?: SaveMergeRowOp[];
+  basePath?: string;
+  oursPath?: string;
+  theirsPath?: string;
 }
 
 interface SaveMergeResponse {
@@ -1325,6 +1336,11 @@ interface CellChange {
   address: string;
   newValue: string | number | null;
 }
+interface GetSheetDataRequest {
+  path: string;
+  sheetName?: string;
+  sheetIndex?: number; // 0-based
+}
 
 /**
  * 将单文件编辑模式下用户修改过的单元格写回原始 Excel 文件。
@@ -1350,6 +1366,42 @@ ipcMain.handle('excel:saveChanges', async (_event, changes: CellChange[]) => {
   return { success: true };
 });
 
+// 读取指定文件的指定工作表（用于 merge 模式下显示全表）
+ipcMain.handle('excel:getSheetData', async (_event, req: GetSheetDataRequest): Promise<SheetData | null> => {
+  if (!req || !req.path) return null;
+  const wb = await loadWorkbookCached(req.path);
+  const ws = getWorksheetSafe(wb, req.sheetName, req.sheetIndex);
+  if (!ws) return null;
+
+  const maxRow =
+    (ws as any).actualRowCount && (ws as any).actualRowCount > 0
+      ? (ws as any).actualRowCount
+      : ws.rowCount;
+  const maxCol =
+    (ws as any).actualColumnCount && (ws as any).actualColumnCount > 0
+      ? (ws as any).actualColumnCount
+      : ws.columnCount;
+
+  const rows: SheetCell[][] = [];
+  for (let rowNumber = 1; rowNumber <= maxRow; rowNumber += 1) {
+    const rowCells: SheetCell[] = [];
+    const row = ws.getRow(rowNumber);
+    for (let colNumber = 1; colNumber <= maxCol; colNumber += 1) {
+      const cell = row.getCell(colNumber);
+      const value = getSimpleValueForThreeWay(cell?.value);
+      rowCells.push({
+        address: cell.address,
+        row: rowNumber,
+        col: colNumber,
+        value,
+      });
+    }
+    rows.push(rowCells);
+  }
+
+  return { sheetName: ws.name, rows };
+});
+
 // 保存三方 merge 结果到新的 Excel 文件，仅修改值，不改格式
 //
 // 在 git/Fork merge 模式下：
@@ -1365,7 +1417,11 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
   }
 
   try {
-    const { templatePath, cells } = req as { templatePath: string; cells: { sheetName: string; address: string; value: string | number | null }[] };
+    const { templatePath, cells, rowOps } = req as {
+      templatePath: string;
+      cells: { sheetName: string; address: string; value: string | number | null }[];
+      rowOps?: SaveMergeRowOp[];
+    };
     let targetPath: string | undefined;
 
     if (cliThreeWayArgs && cliThreeWayArgs.mode === 'merge') {
@@ -1396,7 +1452,45 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
       const cell = ws.getCell(cellInfo.address);
       cell.value = cellInfo.value as any;
     }
+    if (rowOps && rowOps.length > 0) {
+      const opsBySheet = new Map<string, SaveMergeRowOp[]>();
+      rowOps.forEach((op) => {
+        const key = op.sheetName || '';
+        if (!opsBySheet.has(key)) opsBySheet.set(key, []);
+        opsBySheet.get(key)!.push(op);
+      });
+      opsBySheet.forEach((ops, sheetName) => {
+        const ws = workbook.getWorksheet(sheetName) ?? workbook.worksheets[0];
+        const sorted = ops.slice().sort((a, b) => {
+          const va = a.visualRowNumber ?? 0;
+          const vb = b.visualRowNumber ?? 0;
+          if (va !== vb) return va - vb;
+          return a.targetRowNumber - b.targetRowNumber;
+        });
+        let offset = 0;
+        for (const op of sorted) {
+          const baseRow = Math.max(1, Math.floor(op.targetRowNumber));
+          const rowNumber = baseRow + offset;
+          if (op.action === 'insert') {
+            const maxCol = Math.max(
+              ws?.actualColumnCount ?? ws?.columnCount ?? 0,
+              op.values?.length ?? 0,
+            );
+            const values: (string | number | null)[] = [];
+            for (let i = 0; i < maxCol; i += 1) {
+              values.push(op.values && i < op.values.length ? op.values[i] ?? null : null);
+            }
+            ws.spliceRows(rowNumber, 0, values);
+            offset += 1;
+          } else if (op.action === 'delete') {
+            ws.spliceRows(rowNumber, 1);
+            offset -= 1;
+          }
+        }
+      });
+    }
 
+    normalizeSharedFormulas(workbook);
     await workbook.xlsx.writeFile(targetPath);
 
     // 如果是通过 git/Fork 的 merge 模式启动，并且有明确的目标文件，尝试自动执行一次 git add
@@ -1530,6 +1624,24 @@ interface ThreeWayRowResult {
   ours: (string | number | null)[];
   theirs: (string | number | null)[];
 }
+interface ThreeWayRowsRequest {
+  basePath: string;
+  oursPath: string;
+  theirsPath: string;
+  sheetName?: string;
+  sheetIndex?: number; // 0-based
+  rows: Array<{
+    rowNumber?: number;
+    baseRowNumber?: number | null;
+    oursRowNumber?: number | null;
+    theirsRowNumber?: number | null;
+  }>;
+}
+interface ThreeWayRowsResult {
+  sheetName: string;
+  colCount: number;
+  rows: ThreeWayRowResult[];
+}
 
 // 简单缓存：同一次应用生命周期内重复读取同一个 xlsx 时复用 workbook，减少 IO
 const workbookCache = new Map<string, Workbook>();
@@ -1552,6 +1664,30 @@ const getWorksheetSafe = (wb: Workbook, sheetName?: string, sheetIndex?: number)
     return wb.worksheets[sheetIndex];
   }
   return wb.worksheets[0];
+};
+const normalizeSharedFormulas = (workbook: Workbook) => {
+  workbook.worksheets.forEach((ws) => {
+    ws.eachRow({ includeEmpty: true }, (row) => {
+      row.eachCell({ includeEmpty: true }, (cell) => {
+        const v: any = cell.value as any;
+        if (!v || typeof v !== 'object') return;
+        const isShared = v.sharedFormula || v.shareType === 'shared';
+        if (!isShared) return;
+        const model: any = (cell as any).model || {};
+        const formula = model.formula || v.formula;
+        const result = model.result !== undefined ? model.result : v.result;
+        if (formula) {
+          cell.value = { formula, result } as any;
+          return;
+        }
+        if (result !== undefined) {
+          cell.value = result as any;
+          return;
+        }
+        cell.value = null as any;
+      });
+    });
+  });
 };
 
 const getSimpleValueForThreeWay = (v: any): string | number | null => {
@@ -1630,4 +1766,64 @@ ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): 
     ours: readRow(oursWs, oursRowNumber ?? null),
     theirs: readRow(theirsWs, theirsRowNumber ?? null),
   };
+});
+ipcMain.handle('excel:getThreeWayRows', async (_event, req: ThreeWayRowsRequest): Promise<ThreeWayRowsResult | null> => {
+  if (!req || !req.basePath || !req.oursPath || !req.theirsPath || !Array.isArray(req.rows)) return null;
+
+  const [baseWb, oursWb, theirsWb] = await Promise.all([
+    loadWorkbookCached(req.basePath),
+    loadWorkbookCached(req.oursPath),
+    loadWorkbookCached(req.theirsPath),
+  ]);
+
+  const baseWs = getWorksheetSafe(baseWb, req.sheetName, req.sheetIndex);
+  const oursWs = getWorksheetSafe(oursWb, req.sheetName, req.sheetIndex);
+  const theirsWs = getWorksheetSafe(theirsWb, req.sheetName, req.sheetIndex);
+
+  const resolvedSheetName = baseWs?.name ?? req.sheetName ?? '';
+
+  const colCount = Math.max(
+    baseWs?.actualColumnCount ?? baseWs?.columnCount ?? 0,
+    oursWs?.actualColumnCount ?? oursWs?.columnCount ?? 0,
+    theirsWs?.actualColumnCount ?? theirsWs?.columnCount ?? 0,
+  );
+
+  const readRow = (ws: any, rowNum: number | null): (string | number | null)[] => {
+    const arr: (string | number | null)[] = [];
+    if (!rowNum) {
+      for (let col = 1; col <= colCount; col += 1) arr.push(null);
+      return arr;
+    }
+    const row = ws.getRow(rowNum);
+    for (let col = 1; col <= colCount; col += 1) {
+      const cell = row.getCell(col);
+      arr.push(getSimpleValueForThreeWay(cell?.value));
+    }
+    return arr;
+  };
+
+  const rows: ThreeWayRowResult[] = req.rows.map((r) => {
+    const fallbackRow =
+      typeof r.rowNumber === 'number' && !Number.isNaN(r.rowNumber) ? Math.max(1, Math.floor(r.rowNumber)) : null;
+    const baseRowNumber =
+      typeof r.baseRowNumber === 'number' && !Number.isNaN(r.baseRowNumber) ? Math.max(1, Math.floor(r.baseRowNumber)) : fallbackRow;
+    const oursRowNumber =
+      typeof r.oursRowNumber === 'number' && !Number.isNaN(r.oursRowNumber) ? Math.max(1, Math.floor(r.oursRowNumber)) : fallbackRow;
+    const theirsRowNumber =
+      typeof r.theirsRowNumber === 'number' && !Number.isNaN(r.theirsRowNumber) ? Math.max(1, Math.floor(r.theirsRowNumber)) : fallbackRow;
+
+    return {
+      sheetName: resolvedSheetName,
+      rowNumber: fallbackRow ?? undefined,
+      baseRowNumber: baseRowNumber ?? null,
+      oursRowNumber: oursRowNumber ?? null,
+      theirsRowNumber: theirsRowNumber ?? null,
+      colCount,
+      base: readRow(baseWs, baseRowNumber ?? null),
+      ours: readRow(oursWs, oursRowNumber ?? null),
+      theirs: readRow(theirsWs, theirsRowNumber ?? null),
+    };
+  });
+
+  return { sheetName: resolvedSheetName, colCount, rows };
 });

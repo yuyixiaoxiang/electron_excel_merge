@@ -81,11 +81,8 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
   const [viewportHeight, setViewportHeight] = useState(400);
   const [scrollbarWidth, setScrollbarWidth] = useState(0);
 
-  if (rows.length === 0) {
-    return null;
-  }
-
-  const colCount = rows[0].length;
+  const hasRows = rows.length > 0;
+  const colCount = hasRows ? rows[0].length : 0;
 
   // 初始化列宽
   useEffect(() => {
@@ -400,6 +397,10 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
       </colgroup>
     );
   }, [showRowHeader, colCount, columnWidths, defaultColWidth, rowHeaderWidth]);
+
+  if (!hasRows) {
+    return null;
+  }
 
   return (
     <div

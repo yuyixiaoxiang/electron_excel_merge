@@ -32,6 +32,12 @@ export interface MergeSideBySideProps {
   theirsPath?: string | null;
   /** base 文件路径 */
   basePath?: string | null;
+  /** 是否显示全表 */
+  showFullTables?: boolean;
+  /** ours 全表数据（二维数组，仅值） */
+  fullOursRows?: (string | number | null)[][];
+  /** theirs 全表数据（二维数组，仅值） */
+  fullTheirsRows?: (string | number | null)[][];
 }
 const MERGED_COLOR = '#fafafa';
 const FROZEN_COLOR = '#e6e6e6';
@@ -87,8 +93,12 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   oursPath,
   theirsPath,
   basePath,
+  showFullTables,
+  fullOursRows,
+  fullTheirsRows,
 }) => {
-  if (cells.length === 0) return <div>没有检测到任何差异。</div>;
+  const useFullTables =
+    !!showFullTables && Array.isArray(fullOursRows) && Array.isArray(fullTheirsRows);
 
   // 水平/竖直滚动同步：左右两边 VirtualGrid 的 scrollLeft/scrollTop 要联动
   const oursScrollRef = useRef<HTMLDivElement | null>(null);
@@ -117,6 +127,25 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
       isSyncingVerticalRef.current = false;
     });
   };
+
+  const fullColCount = useMemo(() => {
+    if (!useFullTables) return 0;
+    const oursMax = (fullOursRows ?? []).reduce((m, r) => Math.max(m, r?.length ?? 0), 0);
+    const theirsMax = (fullTheirsRows ?? []).reduce((m, r) => Math.max(m, r?.length ?? 0), 0);
+    return Math.max(oursMax, theirsMax, 1);
+  }, [useFullTables, fullOursRows, fullTheirsRows]);
+  const padRow = (row: (string | number | null)[], count: number) => {
+    if (row.length >= count) return row.slice(0, count);
+    return [...row, ...Array(count - row.length).fill(null)];
+  };
+  const fullOursGrid: (string | number | null)[][] = useMemo(() => {
+    if (!useFullTables) return [];
+    return (fullOursRows ?? []).map((r) => padRow(r ?? [], fullColCount));
+  }, [useFullTables, fullOursRows, fullColCount]);
+  const fullTheirsGrid: (string | number | null)[][] = useMemo(() => {
+    if (!useFullTables) return [];
+    return (fullTheirsRows ?? []).map((r) => padRow(r ?? [], fullColCount));
+  }, [useFullTables, fullTheirsRows, fullColCount]);
 
   const cellMap = useMemo(() => {
     const m = new Map<string, MergeCell>();
@@ -183,9 +212,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
     return m;
   }, [cellMap, normalizedPrimaryKeyCol, diffRowNumbers, rowsMetaMap]);
 
-  if (displayColumns.length === 0 || diffRowNumbers.length === 0) {
-    return <div>没有检测到任何差异。</div>;
-  }
+  const hasDiffData = cells.length > 0 && displayColumns.length > 0 && diffRowNumbers.length > 0;
 
   // 将原始 rows + diffColumns/diffRowNumbers 转成 VirtualGrid 需要的矩阵
   const gridRowNumbers = useMemo(() => diffRowNumbers, [diffRowNumbers]);
@@ -201,12 +228,12 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   // 两侧共享列宽，避免左右/表头/内容出现 1px 累积偏差或拖拽后不同步
   const [columnWidths, setColumnWidths] = useState<number[]>([]);
   useEffect(() => {
-    const count = displayColumns.length;
+    const count = useFullTables ? fullColCount : displayColumns.length;
     setColumnWidths((prev) => {
       if (prev.length === count) return prev;
       return Array(count).fill(DATA_COL_WIDTH);
     });
-  }, [displayColumns.length]);
+  }, [displayColumns.length, useFullTables, fullColCount]);
 
   const getRowStatusIndicator = (status: RowStatus | undefined) => {
     switch (status) {
@@ -259,6 +286,51 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
         </div>
       );
     };
+
+  const renderFullRowHeader = (rowIndex: number) => rowIndex + 1;
+  const makeFullRenderCell =
+    (_side: 'ours' | 'theirs') =>
+    (cell: string | number | null, ctx: VirtualGridRenderCtx) => {
+      const value = cell == null ? '' : String(cell);
+      const handleClick = () => {
+        if (onSelectCell) onSelectCell(ctx.rowIndex, ctx.colIndex);
+      };
+      return (
+        <div
+          onMouseDown={handleClick}
+          onClick={handleClick}
+          title={value}
+          style={{
+            width: '100%',
+            height: '100%',
+            boxSizing: 'border-box',
+            backgroundColor: 'transparent',
+            overflow: 'hidden',
+            textOverflow: 'ellipsis',
+            whiteSpace: 'nowrap',
+            cursor: 'pointer',
+            userSelect: 'none',
+          }}
+        >
+          {value}
+        </div>
+      );
+    };
+  const getFullCellStyle = (_cell: any, ctx: VirtualGridRenderCtx) => {
+    const style: React.CSSProperties = {};
+    if (ctx.isFrozenRow || ctx.isFrozenCol) {
+      style.backgroundColor = FROZEN_COLOR;
+    }
+    if (selected) {
+      if (selected.rowIndex === ctx.rowIndex && selected.colIndex === ctx.colIndex) {
+        style.outline = '2px solid #ff8000';
+        style.outlineOffset = '-2px';
+        style.position = 'relative';
+        style.zIndex = 6;
+      }
+    }
+    return style;
+  };
 
   const [contextMenu, setContextMenu] = useState<
     | {
@@ -481,10 +553,16 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
         const key = `${cell.row}:${cell.col}`;
         if (selectedCellKeys.has(key) && selectionBounds) {
           const { minRow, maxRow, minCol, maxCol } = selectionBounds;
-          if (cell.row === minRow) style.borderTop = '2px solid #ff8000';
-          if (cell.row === maxRow) style.borderBottom = '2px solid #ff8000';
-          if (cell.col === minCol) style.borderLeft = '2px solid #ff8000';
-          if (cell.col === maxCol) style.borderRight = '2px solid #ff8000';
+          const shadows: string[] = [];
+          if (cell.row === minRow) shadows.push('inset 0 2px 0 0 #ff8000');
+          if (cell.row === maxRow) shadows.push('inset 0 -2px 0 0 #ff8000');
+          if (cell.col === minCol) shadows.push('inset 2px 0 0 0 #ff8000');
+          if (cell.col === maxCol) shadows.push('inset -2px 0 0 0 #ff8000');
+          if (shadows.length > 0) {
+            style.boxShadow = shadows.join(', ');
+            style.position = 'relative';
+            style.zIndex = 6;
+          }
         }
       }
 
@@ -494,47 +572,70 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
         const isSelected =
           selected.rowIndex === sourceRowIndex && selected.colIndex === sourceColIndex;
         if (isSelected) {
-          style.border = '2px solid #ff8000';
+          style.outline = '2px solid #ff8000';
+          style.outlineOffset = '-2px';
+          style.position = 'relative';
+          style.zIndex = 6;
         }
       }
 
       return style;
     };
 
-  const renderHeaderCell = (colIndex: number) => {
+  const renderDiffHeaderCell = (colIndex: number) => {
     const colNumber = displayColumns[colIndex];
     return colNumberToLabel(colNumber);
   };
+  const renderFullHeaderCell = (colIndex: number) => colNumberToLabel(colIndex + 1);
 
-  const oursRenderCell = makeRenderCell('ours');
-  const theirsRenderCell = makeRenderCell('theirs');
-  const oursGetCellStyle = makeGetCellStyle('ours');
-  const theirsGetCellStyle = makeGetCellStyle('theirs');
+  const oursRenderCell: (cell: any, ctx: VirtualGridRenderCtx) => React.ReactNode = useFullTables
+    ? makeFullRenderCell('ours')
+    : makeRenderCell('ours');
+  const theirsRenderCell: (cell: any, ctx: VirtualGridRenderCtx) => React.ReactNode = useFullTables
+    ? makeFullRenderCell('theirs')
+    : makeRenderCell('theirs');
+  const oursGetCellStyle: (cell: any, ctx: VirtualGridRenderCtx) => React.CSSProperties | undefined = useFullTables
+    ? getFullCellStyle
+    : makeGetCellStyle('ours');
+  const theirsGetCellStyle: (cell: any, ctx: VirtualGridRenderCtx) => React.CSSProperties | undefined = useFullTables
+    ? getFullCellStyle
+    : makeGetCellStyle('theirs');
+  const renderHeaderCell = useFullTables ? renderFullHeaderCell : renderDiffHeaderCell;
+  const renderOursRowHeader = useFullTables ? renderFullRowHeader : makeRowHeaderRenderer('ours');
+  const renderTheirsRowHeader = useFullTables ? renderFullRowHeader : makeRowHeaderRenderer('theirs');
+  const oursRowsForGrid = useFullTables ? fullOursGrid : gridRows;
+  const theirsRowsForGrid = useFullTables ? fullTheirsGrid : gridRows;
 
   // 当选择变化时，确保两侧都滚动到能看到该单元格
   const scrollToCell = useMemo(() => {
     if (!selected) return null;
+    if (useFullTables) {
+      return { rowIndex: selected.rowIndex, colIndex: selected.colIndex };
+    }
     const targetRowNumber = selected.rowIndex + 1;
     const targetColNumber = selected.colIndex + 1;
     const gridRowIndex = diffRowNumbers.indexOf(targetRowNumber);
     const gridColIndex = displayColumns.indexOf(targetColNumber);
     if (gridRowIndex < 0 || gridColIndex < 0) return null;
     return { rowIndex: gridRowIndex, colIndex: gridColIndex };
-  }, [selected, diffRowNumbers, displayColumns]);
+  }, [selected, diffRowNumbers, displayColumns, useFullTables]);
 
   return (
-    <div
-      style={{
-        border: '1px solid #ccc',
-        padding: 8,
-        height: '100%',
-        minHeight: 0,
-        display: 'flex',
-        flexDirection: 'column',
-        overflow: 'hidden',
-        gap: 4,
-      }}
-    >
+    !useFullTables && !hasDiffData ? (
+      <div>没有检测到任何差异。</div>
+    ) : (
+      <div
+        style={{
+          border: '1px solid #ccc',
+          padding: 8,
+          height: '100%',
+          minHeight: 0,
+          display: 'flex',
+          flexDirection: 'column',
+          overflow: 'hidden',
+          gap: 4,
+        }}
+      >
       <div
         style={{
           display: 'flex',
@@ -575,16 +676,18 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
       </div>
       <div style={{ display: 'flex', gap: 16, flex: 1, minHeight: 0 }}>
         <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0 }}>
-          <VirtualGrid<MergeCell | null>
-            rows={gridRows}
+          <VirtualGrid<any>
+            rows={oursRowsForGrid}
             rowHeight={ROW_HEIGHT}
             overscanRows={OVERSCAN_ROWS}
             frozenRowCount={frozenRowCount}
             frozenColCount={0}
             rowHeaderWidth={120}
             showRowHeader
-            renderRowHeader={makeRowHeaderRenderer('ours')}
-            onRowHeaderContextMenu={(rowIndex, e) => handleRowHeaderContextMenu('ours', rowIndex, e)}
+            renderRowHeader={renderOursRowHeader as any}
+            onRowHeaderContextMenu={
+              useFullTables ? undefined : (rowIndex, e) => handleRowHeaderContextMenu('ours', rowIndex, e)
+            }
             renderCell={oursRenderCell}
             getCellStyle={oursGetCellStyle}
             renderHeaderCell={renderHeaderCell}
@@ -598,16 +701,18 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
           />
         </div>
         <div style={{ display: 'flex', flexDirection: 'column', flex: 1, minWidth: 0 }}>
-          <VirtualGrid<MergeCell | null>
-            rows={gridRows}
+          <VirtualGrid<any>
+            rows={theirsRowsForGrid}
             rowHeight={ROW_HEIGHT}
             overscanRows={OVERSCAN_ROWS}
             frozenRowCount={frozenRowCount}
             frozenColCount={0}
             rowHeaderWidth={120}
             showRowHeader
-            renderRowHeader={makeRowHeaderRenderer('theirs')}
-            onRowHeaderContextMenu={(rowIndex, e) => handleRowHeaderContextMenu('theirs', rowIndex, e)}
+            renderRowHeader={renderTheirsRowHeader as any}
+            onRowHeaderContextMenu={
+              useFullTables ? undefined : (rowIndex, e) => handleRowHeaderContextMenu('theirs', rowIndex, e)
+            }
             renderCell={theirsRenderCell}
             getCellStyle={theirsGetCellStyle}
             renderHeaderCell={renderHeaderCell}
@@ -692,6 +797,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
         )}
       </div>
     </div>
+    )
   );
 };
 

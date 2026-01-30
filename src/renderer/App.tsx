@@ -6,12 +6,12 @@ import type {
   MergeRowMeta,
   MergeSheetData,
   OpenResult,
+  SaveMergeRowOp,
   SaveMergeRequest,
   SheetCell,
   SheetData,
   ThreeWayDiffRequest,
   ThreeWayOpenResult,
-  ThreeWayRowResult,
 } from '../main/preload';
 import { ExcelTable } from './ExcelTable';
 import { MergeSideBySide } from './MergeSideBySide';
@@ -71,19 +71,13 @@ export const App: React.FC = () => {
   const [primaryKeyHint, setPrimaryKeyHint] = useState<string>('');
   // 记录“用户已确认合并”的单元格（resolved），按 sheetIndex 分组，key="row:col"（1-based）
   const [resolvedBySheet, setResolvedBySheet] = useState<Map<number, Set<string>>>(new Map());
-  // 当前选中行的三方原始值（用于构建 merged 行视图；目前以 ours 为基准覆盖 mergedValue）
-  const [selectedThreeWayRow, setSelectedThreeWayRow] = useState<ThreeWayRowResult | null>(null);
-  const [mergedRowColumnWidths, setMergedRowColumnWidths] = useState<number[]>([]);
-
-  // 底部 merged 行视图：当列数变化时重置列宽
-  useEffect(() => {
-    const colCount = selectedThreeWayRow?.colCount ?? 0;
-    if (!colCount) {
-      setMergedRowColumnWidths([]);
-      return;
-    }
-    setMergedRowColumnWidths((prev) => (prev.length === colCount ? prev : Array(colCount).fill(120)));
-  }, [selectedThreeWayRow?.colCount]);
+  const [mergeRowOpsBySheet, setMergeRowOpsBySheet] = useState<Map<number, Map<number, SaveMergeRowOp>>>(new Map());
+  const [mergedPreviewMinRows, setMergedPreviewMinRows] = useState<number>(5);
+  const [mergedPreviewRows, setMergedPreviewRows] = useState<(string | number | null)[][]>([]);
+  const [mergedPreviewRowVisuals, setMergedPreviewRowVisuals] = useState<(number | null)[]>([]);
+  const [showFullTables, setShowFullTables] = useState<boolean>(false);
+  const [fullOursRows, setFullOursRows] = useState<(string | number | null)[][]>([]);
+  const [fullTheirsRows, setFullTheirsRows] = useState<(string | number | null)[][]>([]);
   const [mergeInfo, setMergeInfo] = useState<{
     basePath: string;
     oursPath: string;
@@ -142,6 +136,9 @@ export const App: React.FC = () => {
     setPrimaryKeyHint('');
     setRowSimilarityThreshold(0.9);
     setResolvedBySheet(new Map());
+    setMergeRowOpsBySheet(new Map());
+    setMergedPreviewRows([]);
+    setMergedPreviewRowVisuals([]);
     setMergeInfo({
       basePath: result.basePath,
       oursPath: result.oursPath,
@@ -193,8 +190,10 @@ export const App: React.FC = () => {
       setMergeCells(allMergeSheets[nextIndex]?.cells ?? []);
       setMergeRowsMeta(allMergeSheets[nextIndex]?.rowsMeta ?? []);
       setResolvedBySheet(new Map());
+      setMergeRowOpsBySheet(new Map());
+      setMergedPreviewRows([]);
+      setMergedPreviewRowVisuals([]);
       setSelectedMergeCell(null);
-      setSelectedThreeWayRow(null);
     })();
     return () => {
       cancelled = true;
@@ -298,6 +297,47 @@ export const App: React.FC = () => {
     () => new Set(mergeCells.map((c) => `${c.row}:${c.col}`)),
     [mergeCells],
   );
+  useEffect(() => {
+    if (mode !== 'merge' || !mergeInfo || !showFullTables) {
+      setFullOursRows([]);
+      setFullTheirsRows([]);
+      return;
+    }
+    let cancelled = false;
+    (async () => {
+      const [oursSheet, theirsSheet] = await Promise.all([
+        window.excelAPI.getSheetData({
+          path: mergeInfo.oursPath,
+          sheetName: mergeInfo.sheetName,
+          sheetIndex: selectedMergeSheetIndex,
+        }),
+        window.excelAPI.getSheetData({
+          path: mergeInfo.theirsPath,
+          sheetName: mergeInfo.sheetName,
+          sheetIndex: selectedMergeSheetIndex,
+        }),
+      ]);
+      if (cancelled) return;
+      const oursRows = (oursSheet?.rows ?? []).map((row: SheetCell[]) =>
+        row.map((c: SheetCell) => c.value ?? null),
+      );
+      const theirsRows = (theirsSheet?.rows ?? []).map((row: SheetCell[]) =>
+        row.map((c: SheetCell) => c.value ?? null),
+      );
+      setFullOursRows(oursRows);
+      setFullTheirsRows(theirsRows);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    mode,
+    showFullTables,
+    mergeInfo?.oursPath,
+    mergeInfo?.theirsPath,
+    mergeInfo?.sheetName,
+    selectedMergeSheetIndex,
+  ]);
 
   // 顶部“公式栏”当前要展示的单元格信息
   const selectedMergeCellData = useMemo(() => {
@@ -328,11 +368,6 @@ export const App: React.FC = () => {
     return null;
   }, [mode, selectedMergeCell, mergeCells, primaryKeyCol, mergeRowsMeta]);
 
-  const selectedMergeRowMeta = useMemo(() => {
-    if (mode !== 'merge' || !selectedMergeCell) return null;
-    const visualRowNumber = selectedMergeCell.rowIndex + 1;
-    return mergeRowsMeta.find((m) => m.visualRowNumber === visualRowNumber) ?? null;
-  }, [mode, selectedMergeCell, mergeRowsMeta]);
 
   const mergedPath = useMemo(() => {
     if (!mergeInfo) return null;
@@ -344,38 +379,106 @@ export const App: React.FC = () => {
     }
     return null;
   }, [mergeInfo, cliInfo]);
-
-  // 当选中单元格变化时，按需读取该“整行”的 base/ours/theirs 值，用于底部行级对比视图
+  const mergeCellsByRow = useMemo(() => {
+    const m = new Map<number, MergeCell[]>();
+    mergeCells.forEach((cell) => {
+      if (!m.has(cell.row)) m.set(cell.row, []);
+      m.get(cell.row)!.push(cell);
+    });
+    return m;
+  }, [mergeCells]);
+  const currentRowOps = useMemo(
+    () => mergeRowOpsBySheet.get(selectedMergeSheetIndex) ?? new Map<number, SaveMergeRowOp>(),
+    [mergeRowOpsBySheet, selectedMergeSheetIndex],
+  );
   useEffect(() => {
+    if (mode !== 'merge' || !mergeInfo) {
+      setMergedPreviewRows([]);
+      setMergedPreviewRowVisuals([]);
+      return;
+    }
     let cancelled = false;
     (async () => {
-      if (mode !== 'merge' || !mergeInfo || !selectedMergeCell) {
-        setSelectedThreeWayRow(null);
+      const metas = [...mergeRowsMeta].sort((a, b) => a.visualRowNumber - b.visualRowNumber);
+      const minRows = Math.max(1, Math.floor(mergedPreviewMinRows));
+      if (metas.length === 0) {
+        if (!cancelled) {
+          setMergedPreviewRows(Array.from({ length: minRows }, () => []));
+          setMergedPreviewRowVisuals(Array.from({ length: minRows }, () => null));
+        }
         return;
       }
-
-      const visualRowNumber = selectedMergeCell.rowIndex + 1;
-      const rowMeta = mergeRowsMeta.find((m) => m.visualRowNumber === visualRowNumber);
-      const result = await window.excelAPI.getThreeWayRow({
+      const rowsReq = metas.map((m) => ({
+        rowNumber: m.visualRowNumber,
+        baseRowNumber: m.baseRowNumber,
+        oursRowNumber: m.oursRowNumber,
+        theirsRowNumber: m.theirsRowNumber,
+      }));
+      const result = await window.excelAPI.getThreeWayRows({
         basePath: mergeInfo.basePath,
         oursPath: mergeInfo.oursPath,
         theirsPath: mergeInfo.theirsPath,
         sheetName: mergeInfo.sheetName,
         sheetIndex: selectedMergeSheetIndex,
-        rowNumber: visualRowNumber,
-        baseRowNumber: rowMeta?.baseRowNumber ?? null,
-        oursRowNumber: rowMeta?.oursRowNumber ?? null,
-        theirsRowNumber: rowMeta?.theirsRowNumber ?? null,
+        rows: rowsReq,
       });
-
+      if (!result || cancelled) return;
+      const colCount = result.colCount ?? 0;
+      const mergedRows: (string | number | null)[][] = [];
+      const mergedVisuals: (number | null)[] = [];
+      result.rows.forEach((rowRes: any, idx: number) => {
+        const meta = metas[idx];
+        const visualRowNumber = meta?.visualRowNumber ?? rowRes.rowNumber ?? idx + 1;
+        const op = currentRowOps.get(visualRowNumber);
+        const oursMissing = !meta?.oursRowNumber;
+        if (oursMissing && op?.action !== 'insert') return;
+        if (!oursMissing && op?.action === 'delete') return;
+        let rowValues: (string | number | null)[] = [];
+        if (op?.action === 'insert' && op.values && op.values.length > 0) {
+          rowValues = op.values.slice(0, colCount);
+        } else if (meta?.oursRowNumber) {
+          rowValues = rowRes.ours;
+        } else if (meta?.baseRowNumber) {
+          rowValues = rowRes.base;
+        } else if (meta?.theirsRowNumber) {
+          rowValues = rowRes.theirs;
+        } else {
+          rowValues = Array(colCount).fill(null);
+        }
+        const mergedRow = rowValues.slice(0, colCount);
+        if (mergedRow.length < colCount) {
+          mergedRow.push(...Array(colCount - mergedRow.length).fill(null));
+        }
+        const diffCells = mergeCellsByRow.get(visualRowNumber) ?? [];
+        diffCells.forEach((cell) => {
+          if (cell.col >= 1 && cell.col <= colCount) {
+            mergedRow[cell.col - 1] = cell.mergedValue ?? null;
+          }
+        });
+        mergedRows.push(mergedRow);
+        mergedVisuals.push(visualRowNumber);
+      });
+      while (mergedRows.length < minRows) {
+        mergedRows.push(Array(colCount).fill(null));
+        mergedVisuals.push(null);
+      }
       if (cancelled) return;
-      setSelectedThreeWayRow(result);
+      setMergedPreviewRows(mergedRows);
+      setMergedPreviewRowVisuals(mergedVisuals);
     })();
-
     return () => {
       cancelled = true;
     };
-  }, [mode, mergeInfo, selectedMergeCell, selectedMergeSheetIndex, mergeRowsMeta]);
+  }, [
+    mode,
+    mergeInfo,
+    mergeRowsMeta,
+    mergeCellsByRow,
+    mergedPreviewMinRows,
+    selectedMergeSheetIndex,
+    currentRowOps,
+  ]);
+
 
   // 顶部“公式栏”当前要展示的单元格坐标和值（single / merge 共用）
   let currentCellAddress = '';
@@ -393,6 +496,72 @@ export const App: React.FC = () => {
   const handleSelectMergeCell = useCallback((rowIndex: number, colIndex: number) => {
     setSelectedMergeCell({ rowIndex, colIndex });
   }, []);
+  const updateRowOpForSheet = useCallback(
+    (sheetIndex: number, visualRowNumber: number, op: SaveMergeRowOp | null) => {
+      setMergeRowOpsBySheet((prev) => {
+        const next = new Map(prev);
+        const sheetOps = new Map(next.get(sheetIndex) ?? new Map<number, SaveMergeRowOp>());
+        if (op) sheetOps.set(visualRowNumber, op);
+        else sheetOps.delete(visualRowNumber);
+        if (sheetOps.size === 0) next.delete(sheetIndex);
+        else next.set(sheetIndex, sheetOps);
+        return next;
+      });
+    },
+    [],
+  );
+  const computeInsertTargetRowNumber = useCallback(
+    (visualRowNumber: number) => {
+      const list = [...mergeRowsMeta].sort((a, b) => a.visualRowNumber - b.visualRowNumber);
+      const idx = list.findIndex((m) => m.visualRowNumber === visualRowNumber);
+      if (idx < 0) return 1;
+      for (let i = idx - 1; i >= 0; i -= 1) {
+        const r = list[i].oursRowNumber;
+        if (r) return r + 1;
+      }
+      for (let i = idx + 1; i < list.length; i += 1) {
+        const r = list[i].oursRowNumber;
+        if (r) return r;
+      }
+      return 1;
+    },
+    [mergeRowsMeta],
+  );
+  const buildMergedRowValues = useCallback(
+    async (visualRowNumber: number, rowMeta: MergeRowMeta) => {
+      if (!mergeInfo) return null;
+      const result = await window.excelAPI.getThreeWayRow({
+        basePath: mergeInfo.basePath,
+        oursPath: mergeInfo.oursPath,
+        theirsPath: mergeInfo.theirsPath,
+        sheetName: mergeInfo.sheetName,
+        sheetIndex: selectedMergeSheetIndex,
+        rowNumber: visualRowNumber,
+        baseRowNumber: rowMeta.baseRowNumber ?? null,
+        oursRowNumber: rowMeta.oursRowNumber ?? null,
+        theirsRowNumber: rowMeta.theirsRowNumber ?? null,
+      });
+      if (!result) return null;
+      const colCount = result.colCount;
+      let baseRow: (string | number | null)[] = [];
+      if (rowMeta.oursRowNumber) baseRow = result.ours;
+      else if (rowMeta.baseRowNumber) baseRow = result.base;
+      else if (rowMeta.theirsRowNumber) baseRow = result.theirs;
+      else baseRow = Array(colCount).fill(null);
+      const mergedRow = baseRow.slice(0, colCount);
+      if (mergedRow.length < colCount) {
+        mergedRow.push(...Array(colCount - mergedRow.length).fill(null));
+      }
+      const diffCells = mergeCellsByRow.get(visualRowNumber) ?? [];
+      diffCells.forEach((cell) => {
+        if (cell.col >= 1 && cell.col <= colCount) {
+          mergedRow[cell.col - 1] = cell.mergedValue ?? null;
+        }
+      });
+      return mergedRow;
+    },
+    [mergeInfo, selectedMergeSheetIndex, mergeCellsByRow],
+  );
 
   /**
    * merge 模式下，在右侧详情中点击“用 base / ours / theirs”按钮时：
@@ -456,7 +625,7 @@ export const App: React.FC = () => {
   );
 
   const handleApplyMergeRowChoice = useCallback(
-    (rowNumber: number, source: 'ours' | 'theirs') => {
+    async (rowNumber: number, source: 'ours' | 'theirs') => {
       const valueFrom = (cell: MergeCell) => (source === 'ours' ? cell.oursValue : cell.theirsValue);
 
       // 标记这一行所有差异单元格为 resolved
@@ -483,8 +652,49 @@ export const App: React.FC = () => {
           return { ...cell, mergedValue: valueFrom(cell) };
         }),
       );
+      const rowMeta = mergeRowsMeta.find((m) => m.visualRowNumber === rowNumber);
+      if (!rowMeta || !mergeInfo) return;
+      const oursRowNumber = rowMeta.oursRowNumber ?? null;
+      const theirsRowNumber = rowMeta.theirsRowNumber ?? null;
+      let op: SaveMergeRowOp | null = null;
+      if (!oursRowNumber && theirsRowNumber) {
+        if (source === 'theirs') {
+          const values = await buildMergedRowValues(rowNumber, rowMeta);
+          if (values) {
+            op = {
+              sheetName: mergeInfo.sheetName,
+              action: 'insert',
+              targetRowNumber: computeInsertTargetRowNumber(rowNumber),
+              values,
+              visualRowNumber: rowNumber,
+            };
+          }
+        }
+      } else if (oursRowNumber && !theirsRowNumber) {
+        if (source === 'theirs') {
+          op = {
+            sheetName: mergeInfo.sheetName,
+            action: 'delete',
+            targetRowNumber: oursRowNumber,
+            visualRowNumber: rowNumber,
+          };
+        }
+      }
+      if (op || currentRowOps.has(rowNumber)) {
+        updateRowOpForSheet(selectedMergeSheetIndex, rowNumber, op);
+      }
     },
-    [selectedMergeSheetIndex, mergeCells, markResolvedKeys],
+    [
+      selectedMergeSheetIndex,
+      mergeCells,
+      markResolvedKeys,
+      mergeRowsMeta,
+      mergeInfo,
+      buildMergedRowValues,
+      computeInsertTargetRowNumber,
+      updateRowOpForSheet,
+      currentRowOps,
+    ],
   );
 
   const handleApplyMergeCellChoice = useCallback(
@@ -625,10 +835,21 @@ export const App: React.FC = () => {
         })
         .filter(Boolean) as { sheetName: string; address: string; value: string | number | null }[];
     });
+    const rowOps = Array.from(mergeRowOpsBySheet.entries()).flatMap(([sheetIndex, opsMap]) => {
+      const sheetName = mergeSheets[sheetIndex]?.sheetName ?? mergeInfo.sheetName;
+      return Array.from(opsMap.values()).map((op) => ({
+        ...op,
+        sheetName: op.sheetName || sheetName,
+      }));
+    });
 
     const payload: SaveMergeRequest = {
       templatePath: mergeInfo.oursPath,
       cells,
+      rowOps,
+      basePath: mergeInfo.basePath,
+      oursPath: mergeInfo.oursPath,
+      theirsPath: mergeInfo.theirsPath,
     };
 
     try {
@@ -643,7 +864,77 @@ export const App: React.FC = () => {
     } catch (e) {
       alert(`保存合并结果失败：${String(e)}`);
     }
-  }, [mergeInfo, mergeSheets]);
+  }, [mergeInfo, mergeSheets, mergeRowOpsBySheet]);
+  const mergedPreviewScrollToCell = useMemo(() => {
+    if (!selectedMergeCell) return null;
+    const visualRowNumber = selectedMergeCell.rowIndex + 1;
+    const rowIndex = mergedPreviewRowVisuals.indexOf(visualRowNumber);
+    if (rowIndex < 0) return null;
+    return { rowIndex, colIndex: selectedMergeCell.colIndex };
+  }, [selectedMergeCell, mergedPreviewRowVisuals]);
+  const renderMergedPreviewRowHeader = (rowIndex: number) => {
+    const visual = mergedPreviewRowVisuals[rowIndex];
+    return visual == null ? '' : visual;
+  };
+  const renderMergedPreviewHeaderCell = (colIndex: number) => colNumberToLabel(colIndex + 1);
+  const renderMergedPreviewCell = (cell: string | number | null, ctx: any) => {
+    const visualRowNumber = mergedPreviewRowVisuals[ctx.rowIndex];
+    const value = cell == null ? '' : String(cell);
+    return (
+      <div
+        onMouseDown={() => {
+          if (visualRowNumber == null) return;
+          setSelectedMergeCell({ rowIndex: visualRowNumber - 1, colIndex: ctx.colIndex });
+        }}
+        title={value}
+        style={{
+          width: '100%',
+          height: '100%',
+          boxSizing: 'border-box',
+          backgroundColor: 'transparent',
+          whiteSpace: 'nowrap',
+          overflow: 'hidden',
+          textOverflow: 'ellipsis',
+          cursor: 'pointer',
+          userSelect: 'none',
+        }}
+      >
+        {value}
+      </div>
+    );
+  };
+  const getMergedPreviewCellStyle = (_cell: any, ctx: any): React.CSSProperties => {
+    const style: React.CSSProperties = {};
+    if (ctx.isFrozenRow || ctx.isFrozenCol) {
+      style.backgroundColor = '#f5f5f5';
+    }
+    if (selectedMergeCell) {
+      const visualRowNumber = mergedPreviewRowVisuals[ctx.rowIndex];
+      if (
+        visualRowNumber === selectedMergeCell.rowIndex + 1 &&
+        ctx.colIndex === selectedMergeCell.colIndex
+      ) {
+        style.outline = '2px solid #ff8000';
+        style.outlineOffset = '-2px';
+        style.position = 'relative';
+        style.zIndex = 6;
+      }
+    }
+    return style;
+  };
+  const mergedPreviewSafeRows = useMemo(() => {
+    const minRows = Math.max(1, Math.floor(mergedPreviewMinRows));
+    if (!mergedPreviewRows || mergedPreviewRows.length === 0) {
+      return Array.from({ length: minRows }, () => [null]);
+    }
+    const first = mergedPreviewRows[0];
+    const hasCols = Array.isArray(first) && first.length > 0;
+    if (!hasCols) {
+      return mergedPreviewRows.map(() => [null]);
+    }
+    return mergedPreviewRows;
+  }, [mergedPreviewRows, mergedPreviewMinRows]);
+  const mergedPreviewMinHeight = Math.max(mergedPreviewMinRows, 1) * 24 + 28;
 
   return (
     <div
@@ -940,6 +1231,30 @@ export const App: React.FC = () => {
                 />
                 <span style={{ fontSize: 12, color: '#666' }}>（例如 3 表示固定前 3 行）</span>
               </div>
+              <div style={{ display: 'flex', alignItems: 'center', marginTop: 4, gap: 8 }}>
+                <label style={{ display: 'inline-flex', alignItems: 'center', gap: 6, fontSize: 12 }}>
+                  <input
+                    type="checkbox"
+                    checked={showFullTables}
+                    onChange={(e) => setShowFullTables(e.target.checked)}
+                  />
+                  显示 ours/theirs 全表
+                </label>
+              </div>
+              <div style={{ display: 'flex', alignItems: 'center', marginTop: 4, gap: 4 }}>
+                <span>merged 预览最少行数:</span>
+                <input
+                  type="number"
+                  min={1}
+                  value={mergedPreviewMinRows}
+                  onChange={(e) => {
+                    const v = Number(e.target.value);
+                    if (Number.isNaN(v)) return;
+                    setMergedPreviewMinRows(Math.max(1, Math.floor(v)));
+                  }}
+                  style={{ width: 60, padding: '2px 6px', boxSizing: 'border-box' }}
+                />
+              </div>
               <div style={{ display: 'flex', alignItems: 'center', marginTop: 4, gap: 4 }}>
                 <span>行相似度阈值:</span>
                 <input
@@ -1046,95 +1361,60 @@ export const App: React.FC = () => {
                   oursPath={mergeInfo?.oursPath ?? null}
                   basePath={mergeInfo?.basePath ?? null}
                   theirsPath={mergeInfo?.theirsPath ?? null}
+                  showFullTables={showFullTables}
+                  fullOursRows={fullOursRows}
+                  fullTheirsRows={fullTheirsRows}
                 />
             </div>
-            {selectedMergeCell && selectedThreeWayRow && (
-              <div style={{ marginTop: 8, border: '1px solid #ccc', overflow: 'hidden' }}>
-                <div
-                  style={{
-                    padding: 6,
-                    borderBottom: '1px solid #eee',
-                    display: 'flex',
-                    alignItems: 'center',
-                    gap: 8,
-                    flexWrap: 'wrap',
-                    fontSize: 12,
-                    backgroundColor: '#fafafa',
-                  }}
-                >
-                  {mergedPath ? (
-                    <span
-                      title={mergedPath}
-                      style={{ maxWidth: 520, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
-                    >
-                      merged: {mergedPath}
-                    </span>
-                  ) : (
-                    <span>没有设置 merged 路径</span>
-                  )}
-                </div>
-
-                {(() => {
-                  const colCount = selectedThreeWayRow.colCount;
-                  const selectedColIndex = selectedMergeCell.colIndex; // 0-based
-                  const visualRowNumber = selectedMergeCell.rowIndex + 1;
-
-                  // 基于 ours 行作为模板，覆盖本行所有 diff cell 的 mergedValue
-                  const mergedRowValues = Array.from({ length: colCount }, (_v, i) =>
-                    selectedThreeWayRow.ours[i] ?? null,
-                  );
-                  mergeCells.forEach((c) => {
-                    if (c.row === visualRowNumber && c.col >= 1 && c.col <= colCount) {
-                      mergedRowValues[c.col - 1] = c.mergedValue ?? null;
-                    }
-                  });
-
-                  const renderValueCell = (v: string | number | null) => (
-                    <div
-                      title={v == null ? '' : String(v)}
-                      style={{
-                        width: '100%',
-                        height: '100%',
-                        overflow: 'hidden',
-                        textOverflow: 'ellipsis',
-                        whiteSpace: 'nowrap',
-                      }}
-                    >
-                      {v == null ? '' : String(v)}
-                    </div>
-                  );
-
-                  const getCellStyle = (_v: any, ctx: any): React.CSSProperties => {
-                    const style: React.CSSProperties = {};
-                    if (ctx.colIndex === selectedColIndex) {
-                      style.border = '2px solid #ff8000';
-                    }
-                    return style;
-                  };
-
-                  const scrollToCell = { rowIndex: 0, colIndex: selectedColIndex };
-
-                  return (
-                    <div style={{ padding: 6 }}>
-                      <div style={{ height: 84 }}>
-                        <VirtualGrid<(string | number | null)>
-                          rows={[mergedRowValues]}
-                          showRowHeader
-                          renderRowHeader={() => visualRowNumber}
-                          renderCell={(cell) => renderValueCell(cell)}
-                          getCellStyle={getCellStyle}
-                          frozenRowCount={0}
-                          frozenColCount={0}
-                          columnWidths={mergedRowColumnWidths}
-                          onColumnWidthsChange={setMergedRowColumnWidths}
-                          scrollToCell={scrollToCell}
-                        />
-                      </div>
-                    </div>
-                  );
-                })()}
+            <div
+              style={{
+                marginTop: 8,
+                border: '1px solid #ccc',
+                overflow: 'hidden',
+                flexShrink: 0,
+                minHeight: mergedPreviewMinHeight + 24,
+              }}
+            >
+              <div
+                style={{
+                  padding: 6,
+                  borderBottom: '1px solid #eee',
+                  display: 'flex',
+                  alignItems: 'center',
+                  gap: 8,
+                  flexWrap: 'wrap',
+                  fontSize: 12,
+                  backgroundColor: '#fafafa',
+                }}
+              >
+                {mergedPath ? (
+                  <span
+                    title={mergedPath}
+                    style={{ maxWidth: 520, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                  >
+                    merged: {mergedPath}
+                  </span>
+                ) : (
+                  <span>没有设置 merged 路径</span>
+                )}
               </div>
-            )}
+              <div style={{ padding: 6 }}>
+                <div style={{ height: mergedPreviewMinHeight }}>
+                  <VirtualGrid<(string | number | null)>
+                    rows={mergedPreviewSafeRows}
+                    showRowHeader
+                    renderRowHeader={renderMergedPreviewRowHeader}
+                    renderHeaderCell={renderMergedPreviewHeaderCell}
+                    renderCell={renderMergedPreviewCell}
+                    getCellStyle={getMergedPreviewCellStyle}
+                    frozenRowCount={0}
+                    frozenColCount={0}
+                    defaultColWidth={120}
+                    scrollToCell={mergedPreviewScrollToCell}
+                  />
+                </div>
+              </div>
+            </div>
           </div>
         ) : (
           <div>请先选择 base / ours / theirs 三个 Excel 文件。</div>

@@ -17,6 +17,11 @@ interface SheetData {
   sheetName: string;
   rows: SheetCell[][];
 }
+interface GetSheetDataRequest {
+  path: string;
+  sheetName?: string;
+  sheetIndex?: number; // 0-based
+}
 
 interface OpenResult {
   filePath: string;
@@ -85,10 +90,21 @@ interface SaveMergeCellInput {
   address: string;
   value: string | number | null;
 }
+interface SaveMergeRowOp {
+  sheetName: string;
+  action: 'insert' | 'delete';
+  targetRowNumber: number; // 1-based in template (ours)
+  values?: (string | number | null)[];
+  visualRowNumber?: number; // for stable ordering
+}
 
 interface SaveMergeRequest {
   templatePath: string;
   cells: SaveMergeCellInput[];
+  rowOps?: SaveMergeRowOp[];
+  basePath?: string;
+  oursPath?: string;
+  theirsPath?: string;
 }
 
 interface SaveMergeResponse {
@@ -129,6 +145,24 @@ interface ThreeWayRowResult {
   ours: (string | number | null)[];
   theirs: (string | number | null)[];
 }
+interface ThreeWayRowsRequest {
+  basePath: string;
+  oursPath: string;
+  theirsPath: string;
+  sheetName?: string;
+  sheetIndex?: number; // 0-based
+  rows: Array<{
+    rowNumber?: number;
+    baseRowNumber?: number | null;
+    oursRowNumber?: number | null;
+    theirsRowNumber?: number | null;
+  }>;
+}
+interface ThreeWayRowsResult {
+  sheetName: string;
+  colCount: number;
+  rows: ThreeWayRowResult[];
+}
 
 /**
  * 暴露给渲染进程的所有 Excel 相关操作。
@@ -147,6 +181,10 @@ const excelAPI = {
     const result = await ipcRenderer.invoke('excel:openThreeWay');
     return result as ThreeWayOpenResult | null;
   },
+  getSheetData: async (req: GetSheetDataRequest): Promise<SheetData | null> => {
+    const result = await ipcRenderer.invoke('excel:getSheetData', req);
+    return result as SheetData | null;
+  },
   computeThreeWayDiff: async (req: ThreeWayDiffRequest): Promise<ThreeWayOpenResult | null> => {
     const result = await ipcRenderer.invoke('excel:computeThreeWayDiff', req);
     return result as ThreeWayOpenResult | null;
@@ -163,6 +201,10 @@ const excelAPI = {
     const result = await ipcRenderer.invoke('excel:getThreeWayRow', req);
     return result as ThreeWayRowResult | null;
   },
+  getThreeWayRows: async (req: ThreeWayRowsRequest): Promise<ThreeWayRowsResult | null> => {
+    const result = await ipcRenderer.invoke('excel:getThreeWayRows', req);
+    return result as ThreeWayRowsResult | null;
+  },
 };
 
 contextBridge.exposeInMainWorld('excelAPI', excelAPI);
@@ -170,6 +212,7 @@ contextBridge.exposeInMainWorld('excelAPI', excelAPI);
 export type {
   SheetCell,
   SheetData,
+  GetSheetDataRequest,
   OpenResult,
   CellChange,
   MergeCell,
@@ -179,9 +222,12 @@ export type {
   ThreeWayOpenResult,
   ThreeWayDiffRequest,
   SaveMergeCellInput,
+  SaveMergeRowOp,
   SaveMergeRequest,
   SaveMergeResponse,
   CliThreeWayInfo,
   ThreeWayRowRequest,
   ThreeWayRowResult,
+  ThreeWayRowsRequest,
+  ThreeWayRowsResult,
 };

@@ -1,6 +1,7 @@
 import type {
   CellChange,
   CliThreeWayInfo,
+  GetSheetDataRequest,
   OpenResult,
   SaveMergeRequest,
   SaveMergeResponse,
@@ -8,6 +9,8 @@ import type {
   ThreeWayOpenResult,
   ThreeWayRowRequest,
   ThreeWayRowResult,
+  ThreeWayRowsRequest,
+  ThreeWayRowsResult,
 } from '../main/preload';
 
 /**
@@ -20,10 +23,12 @@ declare global {
       openFile: () => Promise<OpenResult | null>;
       saveChanges: (changes: CellChange[]) => Promise<void>;
       openThreeWay: () => Promise<ThreeWayOpenResult | null>;
+      getSheetData: (req: GetSheetDataRequest) => Promise<SheetData | null>;
       computeThreeWayDiff: (req: ThreeWayDiffRequest) => Promise<ThreeWayOpenResult | null>;
       saveMergeResult: (req: SaveMergeRequest) => Promise<SaveMergeResponse>;
       getCliThreeWayInfo: () => Promise<CliThreeWayInfo | null>;
       getThreeWayRow: (req: ThreeWayRowRequest) => Promise<ThreeWayRowResult | null>;
+      getThreeWayRows: (req: ThreeWayRowsRequest) => Promise<ThreeWayRowsResult | null>;
     };
   }
 }
