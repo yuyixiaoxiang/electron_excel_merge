@@ -13,6 +13,8 @@
     "start": "npm run build && electron .",
     "dist": "npm run build && electron-builder --win",
     "pack:win": "npm run build && electron-builder --win portable --x64",
+    "pack:unpacked": "npm run build && electron-builder --win dir --x64",
+    "pack:nsis": "npm run build && electron-builder --win nsis --x64",
     "clean-cache": "rimraf %LOCALAPPDATA%/electron/Cache/* %LOCALAPPDATA%/electron-builder/Cache/*",
     "fix-build": "npm run clean-cache && npm install"
   },
@@ -61,6 +63,7 @@
     ],
     "win": {
       "icon": "build/icon.ico",
+      "signAndEditExecutable": false,
       "target": [
         {
           "target": "nsis",
@@ -70,6 +73,12 @@
         },
         {
           "target": "portable",
+          "arch": [
+            "x64"
+          ]
+        },
+        {
+          "target": "dir",
           "arch": [
             "x64"
           ]

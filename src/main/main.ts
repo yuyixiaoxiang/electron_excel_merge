@@ -3,6 +3,7 @@
  * 并通过 IPC 向渲染进程提供 Excel 读写与三方 diff / merge 的能力。
  */
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
+import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { Workbook, Worksheet, Row, Cell, CellValue } from 'exceljs';
@@ -13,6 +14,7 @@ let mainWindow: BrowserWindow | null = null;
 const isDev = process.env.NODE_ENV === 'development';
 const DEFAULT_FROZEN_HEADER_ROWS = 3;
 const DEFAULT_ROW_SIMILARITY_THRESHOLD = 0.9;
+const IGNORE_BASE_IN_DIFF = true;
 
 /**
  * CLI three-way merge arguments for git/Fork integration.
@@ -43,11 +45,35 @@ const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
   // 对于打包后的 exe: process.argv = [app.exe, ...args]
   const argStartIndex = app?.isPackaged ? 1 : 2;
   const rawArgs = process.argv.slice(argStartIndex);
-  const userArgs = rawArgs.filter((arg) => !arg.startsWith('--'));
+  const stripOuterQuotes = (s: string) => s.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
+  const normalizeCliPath = (p: string) => {
+    const raw = stripOuterQuotes(p);
+    if (!raw) return raw;
+    return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
+  };
+  const userArgs = rawArgs
+    .map((arg) => stripOuterQuotes(arg))
+    .filter((arg) => !!arg && !arg.startsWith('--'));
+  // 兼容开发模式下 `electron .` 带来的 app path 参数
+  if (userArgs.length >= 3) {
+    const first = userArgs[0];
+    const appPath = app.getAppPath ? app.getAppPath() : '';
+    const firstResolved = path.resolve(first);
+    const appResolved = appPath ? path.resolve(appPath) : '';
+    let isDir = false;
+    try {
+      isDir = fs.statSync(firstResolved).isDirectory();
+    } catch {
+      isDir = false;
+    }
+    if (first === '.' || (!!appResolved && firstResolved === appResolved) || isDir) {
+      userArgs.shift();
+    }
+  }
 
   // 2 个参数: 认为是 diff 模式 -> base 与 ours 相同（仅用于计算差异）
   if (userArgs.length === 2) {
-    const [oursPath, theirsPath] = userArgs;
+    const [oursPath, theirsPath] = userArgs.map(normalizeCliPath);
     return { basePath: oursPath, oursPath, theirsPath, mode: 'diff' };
   }
 
@@ -55,7 +81,7 @@ const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
     return null;
   }
 
-  const [basePath, oursPath, theirsPath, mergedPath] = userArgs;
+  const [basePath, oursPath, theirsPath, mergedPath] = userArgs.map(normalizeCliPath);
   return { basePath, oursPath, theirsPath, mergedPath, mode: 'merge' };
 };
 
@@ -771,6 +797,115 @@ const alignRowsBySequence = (
   return { aligned, ambiguousOurs: oursAlign.ambiguousSide, ambiguousTheirs: theirsAlign.ambiguousSide };
 };
 
+// Align rows by content using unique anchors, then diff segments to reduce misalignment noise.
+const alignRowsByContent = (
+  oursRows: RowRecord[],
+  theirsRows: RowRecord[],
+): { aligned: AlignedRow[]; ambiguousOurs: Set<number>; ambiguousTheirs: Set<number> } => {
+  if (oursRows.length === 0 && theirsRows.length === 0) {
+    return { aligned: [], ambiguousOurs: new Set(), ambiguousTheirs: new Set() };
+  }
+  if (oursRows.length === 0) {
+    return { aligned: theirsRows.map((r) => ({ theirs: r })), ambiguousOurs: new Set(), ambiguousTheirs: new Set() };
+  }
+  if (theirsRows.length === 0) {
+    return {
+      aligned: oursRows.map((r) => ({ base: r, ours: r })),
+      ambiguousOurs: new Set(),
+      ambiguousTheirs: new Set(),
+    };
+  }
+
+  const tokenOf = (r: RowRecord) => r.values.map((v) => normalizeCellValue(v)).join('||');
+  const oursTokens = oursRows.map((r) => tokenOf(r));
+  const theirsTokens = theirsRows.map((r) => tokenOf(r));
+
+  const countTokens = (tokens: string[]) => {
+    const m = new Map<string, number>();
+    tokens.forEach((t) => m.set(t, (m.get(t) ?? 0) + 1));
+    return m;
+  };
+  const oursCount = countTokens(oursTokens);
+  const theirsCount = countTokens(theirsTokens);
+  const theirsUniqueIndex = new Map<string, number>();
+  theirsTokens.forEach((t, idx) => {
+    if ((theirsCount.get(t) ?? 0) === 1) theirsUniqueIndex.set(t, idx);
+  });
+
+  const anchors: Array<{ o: number; t: number }> = [];
+  oursTokens.forEach((t, o) => {
+    if ((oursCount.get(t) ?? 0) !== 1) return;
+    const tIdx = theirsUniqueIndex.get(t);
+    if (typeof tIdx === 'number') anchors.push({ o, t: tIdx });
+  });
+
+  const selectIncreasingAnchors = (pairs: Array<{ o: number; t: number }>) => {
+    if (pairs.length === 0) return [];
+    // pairs are already in ours order; compute LIS on t
+    const tails: number[] = [];
+    const prev = new Array(pairs.length).fill(-1);
+    for (let i = 0; i < pairs.length; i += 1) {
+      const tVal = pairs[i].t;
+      let l = 0;
+      let r = tails.length;
+      while (l < r) {
+        const m = Math.floor((l + r) / 2);
+        if (pairs[tails[m]].t < tVal) l = m + 1;
+        else r = m;
+      }
+      if (l > 0) prev[i] = tails[l - 1];
+      if (l === tails.length) tails.push(i);
+      else tails[l] = i;
+    }
+    const result: Array<{ o: number; t: number }> = [];
+    let k = tails[tails.length - 1];
+    while (k >= 0) {
+      result.push(pairs[k]);
+      k = prev[k];
+    }
+    return result.reverse();
+  };
+
+  const inOrderAnchors = selectIncreasingAnchors(anchors);
+  if (inOrderAnchors.length === 0) {
+    // fallback to sequence alignment with ours as base
+    return alignRowsBySequence(oursRows, oursRows, theirsRows);
+  }
+
+  const aligned: AlignedRow[] = [];
+  const addSegment = (oStart: number, oEnd: number, tStart: number, tEnd: number) => {
+    const oSeg = oursRows.slice(oStart, oEnd);
+    const tSeg = theirsRows.slice(tStart, tEnd);
+    if (oSeg.length === 0 && tSeg.length === 0) return;
+    if (oSeg.length === 0) {
+      tSeg.forEach((r) => aligned.push({ theirs: r }));
+      return;
+    }
+    if (tSeg.length === 0) {
+      oSeg.forEach((r) => aligned.push({ base: r, ours: r }));
+      return;
+    }
+    const segAligned = alignRowsBySequence(oSeg, oSeg, tSeg).aligned;
+    aligned.push(...segAligned);
+  };
+
+  let prevO = -1;
+  let prevT = -1;
+  for (const anchor of inOrderAnchors) {
+    addSegment(prevO + 1, anchor.o, prevT + 1, anchor.t);
+    aligned.push({
+      base: oursRows[anchor.o],
+      ours: oursRows[anchor.o],
+      theirs: theirsRows[anchor.t],
+    });
+    prevO = anchor.o;
+    prevT = anchor.t;
+  }
+  addSegment(prevO + 1, oursRows.length, prevT + 1, theirsRows.length);
+
+  return { aligned, ambiguousOurs: new Set(), ambiguousTheirs: new Set() };
+};
+
 const buildMergeSheetWithRowAlign = (
   baseWs: any,
   oursWs: any,
@@ -779,33 +914,33 @@ const buildMergeSheetWithRowAlign = (
   frozenRowCount: number,
   rowSimilarityThreshold: number,
 ): MergeSheetData => {
+  const sheetsEqualByCoordinate = (a: any, b: any) => {
+    const maxRow = Math.max(getRowCount(a), getRowCount(b));
+    const maxCol = Math.max(getColCount(a), getColCount(b));
+    for (let r = 1; r <= maxRow; r += 1) {
+      const rowA = a.getRow(r);
+      const rowB = b.getRow(r);
+      for (let c = 1; c <= maxCol; c += 1) {
+        const av = normalizeCellValue(getSimpleValueForMerge(rowA.getCell(c)?.value));
+        const bv = normalizeCellValue(getSimpleValueForMerge(rowB.getCell(c)?.value));
+        if (av !== bv) return false;
+      }
+    }
+    return true;
+  };
   const getRowCount = (ws: any) =>
     (ws?.actualRowCount ?? 0) > 0 ? ws.actualRowCount : ws?.rowCount ?? 0;
   const getColCount = (ws: any) =>
     (ws?.actualColumnCount ?? 0) > 0 ? ws.actualColumnCount : ws?.columnCount ?? 0;
-  const hasExactCellDiff = (base: any, ours: any, theirs: any) => {
-    const maxRow = Math.max(getRowCount(base), getRowCount(ours), getRowCount(theirs));
-    const maxCol = Math.max(getColCount(base), getColCount(ours), getColCount(theirs));
-    for (let r = 1; r <= maxRow; r += 1) {
-      const baseRow = base.getRow(r);
-      const oursRow = ours.getRow(r);
-      const theirsRow = theirs.getRow(r);
-      for (let c = 1; c <= maxCol; c += 1) {
-        const baseValue = getSimpleValueForMerge(baseRow.getCell(c)?.value);
-        const oursValue = getSimpleValueForMerge(oursRow.getCell(c)?.value);
-        const theirsValue = getSimpleValueForMerge(theirsRow.getCell(c)?.value);
-        if (baseValue !== oursValue || baseValue !== theirsValue || oursValue !== theirsValue) {
-          return true;
-        }
-      }
-    }
-    return false;
-  };
-  const detectImplicitKeyCol = (rows: RowRecord[], totalCols: number) => {
+  // note: hasExactDiff will be derived from visible diff cells (ours/theirs/conflict)
+  const detectKeyColByThreshold = (
+    rows: RowRecord[],
+    totalCols: number,
+    minCoverage: number,
+    minUniq: number,
+  ) => {
     const total = rows.length;
     if (total === 0) return null;
-    const minCoverage = 0.8;
-    const minUniq = 0.9;
     const minNonEmpty = Math.max(3, Math.floor(total * minCoverage));
     let bestCol: number | null = null;
     let bestScore = 0;
@@ -830,6 +965,26 @@ const buildMergeSheetWithRowAlign = (
     }
     return bestCol;
   };
+  const detectImplicitKeyCol = (rows: RowRecord[], totalCols: number) =>
+    detectKeyColByThreshold(rows, totalCols, 0.8, 0.9);
+  const detectWeakKeyCol = (rows: RowRecord[], totalCols: number) =>
+    detectKeyColByThreshold(rows, totalCols, 0.6, 0.9);
+  const detectHeaderKeyCol = (ws: any, totalCols: number, headerRows: number) => {
+    const maxHeader = Math.max(1, Math.min(Math.floor(headerRows), 3));
+    for (let r = 1; r <= maxHeader; r += 1) {
+      const row = ws.getRow(r);
+      for (let c = 1; c <= totalCols; c += 1) {
+        const raw = getSimpleValueForMerge(row.getCell(c)?.value);
+        if (raw == null) continue;
+        const text = String(raw).trim();
+        if (!text) continue;
+        if (/id/i.test(text) || /编号|主键/.test(text)) {
+          return c;
+        }
+      }
+    }
+    return null;
+  };
   const applyKeyFromColumn = (rows: RowRecord[], col: number): RowRecord[] =>
     rows.map((r) => ({
       ...r,
@@ -843,11 +998,19 @@ const buildMergeSheetWithRowAlign = (
   const headerCount = Math.max(0, Math.floor(frozenRowCount));
   const useKey = primaryKeyCol >= 1 && primaryKeyCol <= colCount;
   const keyCol = useKey ? primaryKeyCol : -1;
-  const baseRows = buildRowRecords(baseWs, colCount, keyCol).filter((r) => r.rowNumber > headerCount);
+  const baseWsForAlign = IGNORE_BASE_IN_DIFF ? oursWs : baseWs;
+  if (IGNORE_BASE_IN_DIFF && sheetsEqualByCoordinate(oursWs, theirsWs)) {
+    return { sheetName: baseWs.name, cells: [], rowsMeta: [], hasExactDiff: false };
+  }
+  const baseRows = buildRowRecords(baseWsForAlign, colCount, keyCol).filter((r) => r.rowNumber > headerCount);
   const oursRows = buildRowRecords(oursWs, colCount, keyCol).filter((r) => r.rowNumber > headerCount);
   const theirsRows = buildRowRecords(theirsWs, colCount, keyCol).filter((r) => r.rowNumber > headerCount);
   const implicitKeyCol = useKey ? null : detectImplicitKeyCol(baseRows, colCount);
-  const alignKeyCol = useKey ? keyCol : implicitKeyCol ?? -1;
+  const headerKeyCol =
+    !useKey && implicitKeyCol == null ? detectHeaderKeyCol(baseWsForAlign, colCount, headerCount) : null;
+  const weakKeyCol =
+    !useKey && implicitKeyCol == null && headerKeyCol == null ? detectWeakKeyCol(baseRows, colCount) : null;
+  const alignKeyCol = useKey ? keyCol : implicitKeyCol ?? headerKeyCol ?? weakKeyCol ?? -1;
   const alignedResult =
     alignKeyCol >= 1
       ? alignRowsByKey(
@@ -857,16 +1020,19 @@ const buildMergeSheetWithRowAlign = (
           alignKeyCol,
           rowSimilarityThreshold,
         )
-      : alignRowsBySequence(baseRows, oursRows, theirsRows);
+      : IGNORE_BASE_IN_DIFF
+        ? alignRowsByContent(oursRows, theirsRows)
+        : alignRowsBySequence(baseRows, oursRows, theirsRows);
 
   const aligned = alignedResult.aligned;
 
   const rowsMeta: MergeRowMeta[] = [];
   // 1) Header rows: compare by fixed row number (no alignment)
+  const metaKeyCol = alignKeyCol >= 1 ? alignKeyCol : keyCol;
   for (let r = 1; r <= headerCount; r += 1) {
-    const baseRow = buildHeaderRowRecord(baseWs, r, colCount, keyCol);
-    const oursRow = buildHeaderRowRecord(oursWs, r, colCount, keyCol);
-    const theirsRow = buildHeaderRowRecord(theirsWs, r, colCount, keyCol);
+    const baseRow = buildHeaderRowRecord(baseWsForAlign, r, colCount, metaKeyCol);
+    const oursRow = buildHeaderRowRecord(oursWs, r, colCount, metaKeyCol);
+    const theirsRow = buildHeaderRowRecord(theirsWs, r, colCount, metaKeyCol);
     const oursSim = rowSimilarity(baseRow, oursRow);
     const theirsSim = rowSimilarity(baseRow, theirsRow);
     rowsMeta.push({
@@ -888,7 +1054,7 @@ const buildMergeSheetWithRowAlign = (
     const theirsSim = row.base && row.theirs ? rowSimilarity(row.base, row.theirs) : null;
     rowsMeta.push({
       visualRowNumber,
-      key: useKey ? row.key ?? row.base?.key ?? row.ours?.key ?? row.theirs?.key ?? null : null,
+      key: alignKeyCol >= 1 ? row.key ?? row.base?.key ?? row.ours?.key ?? row.theirs?.key ?? null : null,
       baseRowNumber: row.base?.rowNumber ?? null,
       oursRowNumber: row.ours?.rowNumber ?? null,
       theirsRowNumber: row.theirs?.rowNumber ?? null,
@@ -901,13 +1067,13 @@ const buildMergeSheetWithRowAlign = (
 
   const same = (a: SimpleCellValue, b: SimpleCellValue) => normalizeCellValue(a) === normalizeCellValue(b);
   const cells: MergeCell[] = [];
-  const hasExactDiff = hasExactCellDiff(baseWs, oursWs, theirsWs);
+  let hasExactDiff = false;
 
-  // Header rows diff by fixed row number
+  // Header rows diff by fixed row number (compare ours vs theirs only)
   for (let r = 1; r <= headerCount; r += 1) {
-    const baseRow = buildHeaderRowRecord(baseWs, r, colCount, keyCol);
-    const oursRow = buildHeaderRowRecord(oursWs, r, colCount, keyCol);
-    const theirsRow = buildHeaderRowRecord(theirsWs, r, colCount, keyCol);
+    const baseRow = buildHeaderRowRecord(baseWsForAlign, r, colCount, metaKeyCol);
+    const oursRow = buildHeaderRowRecord(oursWs, r, colCount, metaKeyCol);
+    const theirsRow = buildHeaderRowRecord(theirsWs, r, colCount, metaKeyCol);
     const cols = new Set<number>();
     baseRow.nonEmptyCols.forEach((c) => cols.add(c));
     oursRow.nonEmptyCols.forEach((c) => cols.add(c));
@@ -917,24 +1083,13 @@ const buildMergeSheetWithRowAlign = (
       const oursValue = oursRow.values[col - 1] ?? null;
       const theirsValue = theirsRow.values[col - 1] ?? null;
 
-      const equalBO = same(baseValue, oursValue);
-      const equalBT = same(baseValue, theirsValue);
       const equalOT = same(oursValue, theirsValue);
 
       let status: MergeCell['status'];
-      let mergedValue: SimpleCellValue = baseValue;
+      let mergedValue: SimpleCellValue = oursValue;
 
-      if (equalBO && equalBT) {
+      if (equalOT) {
         status = 'unchanged';
-        mergedValue = baseValue;
-      } else if (!equalBO && equalBT) {
-        status = 'ours-changed';
-        mergedValue = oursValue;
-      } else if (equalBO && !equalBT) {
-        status = 'theirs-changed';
-        mergedValue = theirsValue;
-      } else if (!equalBO && !equalBT && equalOT) {
-        status = 'both-changed-same';
         mergedValue = oursValue;
       } else {
         status = 'conflict';
@@ -952,11 +1107,12 @@ const buildMergeSheetWithRowAlign = (
           status,
           mergedValue,
         });
+        hasExactDiff = true;
       }
     }
   }
 
-  // Body rows diff via alignment
+  // Body rows diff via alignment (compare ours vs theirs only)
   aligned.forEach((row, visualIndex) => {
     const visualRowNumber = headerCount + visualIndex + 1;
     const cols = new Set<number>();
@@ -970,24 +1126,13 @@ const buildMergeSheetWithRowAlign = (
       const oursValue = row.ours?.values[col - 1] ?? null;
       const theirsValue = row.theirs?.values[col - 1] ?? null;
 
-      const equalBO = same(baseValue, oursValue);
-      const equalBT = same(baseValue, theirsValue);
       const equalOT = same(oursValue, theirsValue);
 
       let status: MergeCell['status'];
-      let mergedValue: SimpleCellValue = baseValue;
+      let mergedValue: SimpleCellValue = oursValue;
 
-      if (equalBO && equalBT) {
+      if (equalOT) {
         status = 'unchanged';
-        mergedValue = baseValue;
-      } else if (!equalBO && equalBT) {
-        status = 'ours-changed';
-        mergedValue = oursValue;
-      } else if (equalBO && !equalBT) {
-        status = 'theirs-changed';
-        mergedValue = theirsValue;
-      } else if (!equalBO && !equalBT && equalOT) {
-        status = 'both-changed-same';
         mergedValue = oursValue;
       } else {
         status = 'conflict';
@@ -1007,6 +1152,7 @@ const buildMergeSheetWithRowAlign = (
           status,
           mergedValue,
         });
+        hasExactDiff = true;
       }
     }
   });
@@ -1017,9 +1163,9 @@ const buildMergeSheetWithRowAlign = (
     if (diffColumns.size > 0) {
       const existing = new Set<string>(cells.map((c) => `${c.row}:${c.col}`));
       for (let r = 1; r <= headerCount; r += 1) {
-        const baseRow = buildHeaderRowRecord(baseWs, r, colCount, keyCol);
-        const oursRow = buildHeaderRowRecord(oursWs, r, colCount, keyCol);
-        const theirsRow = buildHeaderRowRecord(theirsWs, r, colCount, keyCol);
+        const baseRow = buildHeaderRowRecord(baseWsForAlign, r, colCount, metaKeyCol);
+        const oursRow = buildHeaderRowRecord(oursWs, r, colCount, metaKeyCol);
+        const theirsRow = buildHeaderRowRecord(theirsWs, r, colCount, metaKeyCol);
         for (const col of diffColumns) {
           const key = `${r}:${col}`;
           if (existing.has(key)) continue;
