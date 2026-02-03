@@ -87,6 +87,25 @@ const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
 
 // 解析启动参数得到的三方合并信息（若无参数则为 null，走交互式模式）
 const cliThreeWayArgs: CliThreeWayArgs | null = parseCliThreeWayArgs();
+const getBundledGitInfo = (): { gitPath: string; env: NodeJS.ProcessEnv } | null => {
+  const basePath = app?.isPackaged
+    ? path.join(process.resourcesPath, 'git')
+    : path.join(app.getAppPath(), 'resources', 'portable-git');
+  const gitPath = path.join(basePath, 'cmd', 'git.exe');
+  if (!fs.existsSync(gitPath)) return null;
+
+  const env = { ...process.env };
+  const extraPaths = [
+    path.join(basePath, 'cmd'),
+    path.join(basePath, 'mingw64', 'bin'),
+    path.join(basePath, 'usr', 'bin'),
+  ];
+  const currentPath = env.PATH || env.Path || '';
+  const newPath = [...extraPaths, currentPath].filter(Boolean).join(path.delimiter);
+  env.PATH = newPath;
+  env.Path = newPath;
+  return { gitPath, env };
+};
 
 /**
  * 尝试在目标文件所在目录执行一次 `git add <filePath>`，
@@ -97,7 +116,9 @@ const cliThreeWayArgs: CliThreeWayArgs | null = parseCliThreeWayArgs();
 const gitAddFile = (filePath: string): Promise<void> => {
   return new Promise((resolve) => {
     const cwd = path.dirname(filePath);
-    const child = spawn('git', ['add', filePath], { cwd, stdio: 'ignore' });
+    const gitInfo = getBundledGitInfo();
+    const gitCommand = gitInfo?.gitPath ?? 'git';
+    const child = spawn(gitCommand, ['add', filePath], { cwd, stdio: 'ignore', env: gitInfo?.env });
 
     child.on('error', (err) => {
       console.error('git add failed', err);

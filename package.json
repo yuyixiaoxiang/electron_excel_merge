@@ -61,6 +61,16 @@
       "dist/**/*",
       "package.json"
     ],
+    "extraResources": [
+      {
+        "from": "resources/portable-git",
+        "to": "git"
+      }
+    ],
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true
+    },
     "win": {
       "icon": "build/icon.ico",
       "signAndEditExecutable": false,
