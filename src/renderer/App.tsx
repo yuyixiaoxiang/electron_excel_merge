@@ -3,9 +3,11 @@ import type {
   CellChange,
   CliThreeWayInfo,
   MergeCell,
+  MergeColumnMeta,
   MergeRowMeta,
   MergeSheetData,
   OpenResult,
+  SaveMergeColOp,
   SaveMergeRowOp,
   SaveMergeRequest,
   SheetCell,
@@ -65,6 +67,7 @@ export const App: React.FC = () => {
   const [selectedMergeSheetIndex, setSelectedMergeSheetIndex] = useState<number>(0);
   const [mergeCells, setMergeCells] = useState<MergeCell[]>([]);
   const [mergeRowsMeta, setMergeRowsMeta] = useState<MergeRowMeta[]>([]);
+  const [mergeColumnsMeta, setMergeColumnsMeta] = useState<MergeColumnMeta[]>([]);
   const [primaryKeyCol, setPrimaryKeyCol] = useState<number>(1);
   const [autoHasPrimaryKey, setAutoHasPrimaryKey] = useState<boolean>(true);
   const [lastPrimaryKeyCol, setLastPrimaryKeyCol] = useState<number>(1);
@@ -72,6 +75,7 @@ export const App: React.FC = () => {
   // 记录“用户已确认合并”的单元格（resolved），按 sheetIndex 分组，key="row:col"（1-based）
   const [resolvedBySheet, setResolvedBySheet] = useState<Map<number, Set<string>>>(new Map());
   const [mergeRowOpsBySheet, setMergeRowOpsBySheet] = useState<Map<number, Map<number, SaveMergeRowOp>>>(new Map());
+  const [mergeColOpsBySheet, setMergeColOpsBySheet] = useState<Map<number, Map<number, SaveMergeColOp>>>(new Map());
   const [mergedPreviewMinRows, setMergedPreviewMinRows] = useState<number>(5);
   const [mergedPreviewRows, setMergedPreviewRows] = useState<(string | number | null)[][]>([]);
   const [mergedPreviewRowVisuals, setMergedPreviewRowVisuals] = useState<(number | null)[]>([]);
@@ -89,6 +93,11 @@ export const App: React.FC = () => {
     rowIndex: number;
     colIndex: number;
   } | null>(null);
+  const displayPrimaryKeyCol = useMemo(() => {
+    if (typeof primaryKeyCol !== 'number' || primaryKeyCol < 1) return primaryKeyCol;
+    const hit = mergeColumnsMeta.find((c) => c.oursCol === primaryKeyCol);
+    return hit ? hit.col : primaryKeyCol;
+  }, [primaryKeyCol, mergeColumnsMeta]);
 
   /**
    * 交互式选择一个 Excel 文件并进入单文件编辑模式。
@@ -130,6 +139,7 @@ export const App: React.FC = () => {
     setSelectedMergeSheetIndex(0);
     setMergeCells(allMergeSheets[0]?.cells ?? []);
     setMergeRowsMeta(allMergeSheets[0]?.rowsMeta ?? []);
+    setMergeColumnsMeta(allMergeSheets[0]?.columnsMeta ?? []);
     setPrimaryKeyCol(1);
     setAutoHasPrimaryKey(true);
     setLastPrimaryKeyCol(1);
@@ -137,6 +147,7 @@ export const App: React.FC = () => {
     setRowSimilarityThreshold(0.9);
     setResolvedBySheet(new Map());
     setMergeRowOpsBySheet(new Map());
+    setMergeColOpsBySheet(new Map());
     setMergedPreviewRows([]);
     setMergedPreviewRowVisuals([]);
     setMergeInfo({
@@ -189,8 +200,10 @@ export const App: React.FC = () => {
       setSelectedMergeSheetIndex(nextIndex);
       setMergeCells(allMergeSheets[nextIndex]?.cells ?? []);
       setMergeRowsMeta(allMergeSheets[nextIndex]?.rowsMeta ?? []);
+      setMergeColumnsMeta(allMergeSheets[nextIndex]?.columnsMeta ?? []);
       setResolvedBySheet(new Map());
       setMergeRowOpsBySheet(new Map());
+      setMergeColOpsBySheet(new Map());
       setMergedPreviewRows([]);
       setMergedPreviewRowVisuals([]);
       setSelectedMergeCell(null);
@@ -348,7 +361,9 @@ export const App: React.FC = () => {
     const hit = mergeCells.find((c) => `${c.row}:${c.col}` === key);
     if (hit) return hit;
     const keyCol =
-      typeof primaryKeyCol === 'number' && primaryKeyCol >= 1 ? Math.floor(primaryKeyCol) : -1;
+      typeof displayPrimaryKeyCol === 'number' && displayPrimaryKeyCol >= 1
+        ? Math.floor(displayPrimaryKeyCol)
+        : -1;
     if (keyCol > 0 && colNumber === keyCol) {
       const meta = mergeRowsMeta.find((m) => m.visualRowNumber === rowNumber);
       if (!meta) return null;
@@ -366,7 +381,7 @@ export const App: React.FC = () => {
       };
     }
     return null;
-  }, [mode, selectedMergeCell, mergeCells, primaryKeyCol, mergeRowsMeta]);
+  }, [mode, selectedMergeCell, mergeCells, displayPrimaryKeyCol, mergeRowsMeta]);
 
 
   const mergedPath = useMemo(() => {
@@ -390,6 +405,10 @@ export const App: React.FC = () => {
   const currentRowOps = useMemo(
     () => mergeRowOpsBySheet.get(selectedMergeSheetIndex) ?? new Map<number, SaveMergeRowOp>(),
     [mergeRowOpsBySheet, selectedMergeSheetIndex],
+  );
+  const currentColOps = useMemo(
+    () => mergeColOpsBySheet.get(selectedMergeSheetIndex) ?? new Map<number, SaveMergeColOp>(),
+    [mergeColOpsBySheet, selectedMergeSheetIndex],
   );
   useEffect(() => {
     if (mode !== 'merge' || !mergeInfo) {
@@ -420,10 +439,42 @@ export const App: React.FC = () => {
         theirsPath: mergeInfo.theirsPath,
         sheetName: mergeInfo.sheetName,
         sheetIndex: selectedMergeSheetIndex,
+        frozenRowCount: mergeFrozenRowCount,
         rows: rowsReq,
       });
       if (!result || cancelled) return;
-      const colCount = result.colCount ?? 0;
+      const rawColCount = result.colCount ?? 0;
+      // Build effective column list considering col ops
+      const deletedAlignedCols = new Set<number>();
+      const insertedAlignedCols: number[] = [];
+      currentColOps.forEach((op, alignedCol) => {
+        if (op.action === 'delete') deletedAlignedCols.add(alignedCol);
+        else if (op.action === 'insert') insertedAlignedCols.push(alignedCol);
+      });
+      // Map aligned col -> ours col for non-deleted columns
+      const effectiveColMap: { alignedCol: number; oursCol: number | null }[] = [];
+      for (let c = 1; c <= rawColCount; c += 1) {
+        if (deletedAlignedCols.has(c)) continue;
+        const meta = mergeColumnsMeta.find((m) => m.col === c);
+        effectiveColMap.push({ alignedCol: c, oursCol: meta?.oursCol ?? null });
+      }
+      // Add inserted columns (theirs-only)
+      insertedAlignedCols.sort((a, b) => a - b);
+      for (const ac of insertedAlignedCols) {
+        const meta = mergeColumnsMeta.find((m) => m.col === ac);
+        if (meta && !meta.oursCol && meta.theirsCol) {
+          // Find insertion position
+          let insertIdx = effectiveColMap.length;
+          for (let i = 0; i < effectiveColMap.length; i += 1) {
+            if (effectiveColMap[i].alignedCol > ac) {
+              insertIdx = i;
+              break;
+            }
+          }
+          effectiveColMap.splice(insertIdx, 0, { alignedCol: ac, oursCol: null });
+        }
+      }
+      const colCount = effectiveColMap.length;
       const mergedRows: (string | number | null)[][] = [];
       const mergedVisuals: (number | null)[] = [];
       result.rows.forEach((rowRes: any, idx: number) => {
@@ -433,28 +484,30 @@ export const App: React.FC = () => {
         const oursMissing = !meta?.oursRowNumber;
         if (oursMissing && op?.action !== 'insert') return;
         if (!oursMissing && op?.action === 'delete') return;
-        let rowValues: (string | number | null)[] = [];
-        if (op?.action === 'insert' && op.values && op.values.length > 0) {
-          rowValues = op.values.slice(0, colCount);
-        } else if (meta?.oursRowNumber) {
-          rowValues = rowRes.ours;
-        } else if (meta?.baseRowNumber) {
-          rowValues = rowRes.base;
-        } else if (meta?.theirsRowNumber) {
-          rowValues = rowRes.theirs;
-        } else {
-          rowValues = Array(colCount).fill(null);
-        }
-        const mergedRow = rowValues.slice(0, colCount);
-        if (mergedRow.length < colCount) {
-          mergedRow.push(...Array(colCount - mergedRow.length).fill(null));
-        }
-        const diffCells = mergeCellsByRow.get(visualRowNumber) ?? [];
-        diffCells.forEach((cell) => {
-          if (cell.col >= 1 && cell.col <= colCount) {
-            mergedRow[cell.col - 1] = cell.mergedValue ?? null;
+        // Build merged row based on effective columns
+        const mergedRow: (string | number | null)[] = [];
+        for (const colInfo of effectiveColMap) {
+          const alignedCol = colInfo.alignedCol;
+          const colMeta = mergeColumnsMeta.find((m) => m.col === alignedCol);
+          // Check if there's a diff cell override
+          const diffCell = (mergeCellsByRow.get(visualRowNumber) ?? []).find((c) => c.col === alignedCol);
+          if (diffCell) {
+            mergedRow.push(diffCell.mergedValue ?? null);
+            continue;
           }
-        });
+          // Otherwise get from ours/theirs raw data
+          if (op?.action === 'insert' && op.values) {
+            // For inserted rows, use op.values by aligned col index
+            mergedRow.push(op.values[alignedCol - 1] ?? null);
+          } else if (colMeta?.oursCol && rowRes.ours) {
+            mergedRow.push(rowRes.ours[alignedCol - 1] ?? null);
+          } else if (colMeta?.theirsCol && rowRes.theirs) {
+            // For theirs-only columns that are being inserted
+            mergedRow.push(rowRes.theirs[alignedCol - 1] ?? null);
+          } else {
+            mergedRow.push(null);
+          }
+        }
         mergedRows.push(mergedRow);
         mergedVisuals.push(visualRowNumber);
       });
@@ -475,8 +528,11 @@ export const App: React.FC = () => {
     mergeRowsMeta,
     mergeCellsByRow,
     mergedPreviewMinRows,
+    mergeFrozenRowCount,
     selectedMergeSheetIndex,
     currentRowOps,
+    currentColOps,
+    mergeColumnsMeta,
   ]);
 
 
@@ -510,6 +566,37 @@ export const App: React.FC = () => {
     },
     [],
   );
+  const updateColOpForSheet = useCallback(
+    (sheetIndex: number, alignedColNumber: number, op: SaveMergeColOp | null) => {
+      setMergeColOpsBySheet((prev) => {
+        const next = new Map(prev);
+        const sheetOps = new Map(next.get(sheetIndex) ?? new Map<number, SaveMergeColOp>());
+        if (op) sheetOps.set(alignedColNumber, op);
+        else sheetOps.delete(alignedColNumber);
+        if (sheetOps.size === 0) next.delete(sheetIndex);
+        else next.set(sheetIndex, sheetOps);
+        return next;
+      });
+    },
+    [],
+  );
+  const computeInsertTargetColNumber = useCallback(
+    (alignedColNumber: number) => {
+      if (!mergeColumnsMeta || mergeColumnsMeta.length === 0) return 1;
+      const metaMap = new Map<number, MergeColumnMeta>();
+      mergeColumnsMeta.forEach((m) => metaMap.set(m.col, m));
+      for (let c = alignedColNumber - 1; c >= 1; c -= 1) {
+        const meta = metaMap.get(c);
+        if (meta?.oursCol) return meta.oursCol + 1;
+      }
+      for (let c = alignedColNumber + 1; c <= metaMap.size; c += 1) {
+        const meta = metaMap.get(c);
+        if (meta?.oursCol) return meta.oursCol;
+      }
+      return 1;
+    },
+    [mergeColumnsMeta],
+  );
   const computeInsertTargetRowNumber = useCallback(
     (visualRowNumber: number) => {
       const list = [...mergeRowsMeta].sort((a, b) => a.visualRowNumber - b.visualRowNumber);
@@ -536,6 +623,7 @@ export const App: React.FC = () => {
         theirsPath: mergeInfo.theirsPath,
         sheetName: mergeInfo.sheetName,
         sheetIndex: selectedMergeSheetIndex,
+        frozenRowCount: mergeFrozenRowCount,
         rowNumber: visualRowNumber,
         baseRowNumber: rowMeta.baseRowNumber ?? null,
         oursRowNumber: rowMeta.oursRowNumber ?? null,
@@ -560,7 +648,7 @@ export const App: React.FC = () => {
       });
       return mergedRow;
     },
-    [mergeInfo, selectedMergeSheetIndex, mergeCellsByRow],
+    [mergeInfo, selectedMergeSheetIndex, mergeCellsByRow, mergeFrozenRowCount],
   );
 
   /**
@@ -726,6 +814,128 @@ export const App: React.FC = () => {
     [selectedMergeSheetIndex, markResolvedKeys, mergeCellKeySet],
   );
 
+  const buildMergedColumnValues = useCallback(
+    async (colNumber: number) => {
+      if (!mergeInfo) return null;
+      // Get all rows for this sheet to build column values
+      const metas = [...mergeRowsMeta].sort((a, b) => a.visualRowNumber - b.visualRowNumber);
+      if (metas.length === 0) return [];
+      
+      const rowsReq = metas.map((m) => ({
+        rowNumber: m.visualRowNumber,
+        baseRowNumber: m.baseRowNumber,
+        oursRowNumber: m.oursRowNumber,
+        theirsRowNumber: m.theirsRowNumber,
+      }));
+      const result = await window.excelAPI.getThreeWayRows({
+        basePath: mergeInfo.basePath,
+        oursPath: mergeInfo.oursPath,
+        theirsPath: mergeInfo.theirsPath,
+        sheetName: mergeInfo.sheetName,
+        sheetIndex: selectedMergeSheetIndex,
+        frozenRowCount: mergeFrozenRowCount,
+        rows: rowsReq,
+      });
+      if (!result || !result.rows) return [];
+      
+      // Extract column values from result
+      const columnValues: (string | number | null)[] = [];
+      result.rows.forEach((rowRes: any) => {
+        // Check if this row should be included based on ops
+        const visualRowNumber = rowRes.rowNumber ?? 0;
+        const rowMeta = metas.find((m) => m.visualRowNumber === visualRowNumber);
+        const rowOp = currentRowOps.get(visualRowNumber);
+        const oursMissing = !rowMeta?.oursRowNumber;
+        // Skip rows that won't be in final output
+        if (oursMissing && rowOp?.action !== 'insert') return;
+        if (!oursMissing && rowOp?.action === 'delete') return;
+        
+        // Get value from aligned column (colNumber is 1-based aligned col)
+        const diffCell = (mergeCellsByRow.get(visualRowNumber) ?? []).find((c) => c.col === colNumber);
+        if (diffCell) {
+          columnValues.push(diffCell.mergedValue ?? null);
+        } else if (rowRes.theirs && colNumber >= 1 && colNumber <= rowRes.theirs.length) {
+          columnValues.push(rowRes.theirs[colNumber - 1] ?? null);
+        } else {
+          columnValues.push(null);
+        }
+      });
+      return columnValues;
+    },
+    [mergeInfo, selectedMergeSheetIndex, mergeRowsMeta, mergeFrozenRowCount, currentRowOps, mergeCellsByRow],
+  );
+
+  const handleApplyMergeColumnChoice = useCallback(
+    async (colNumber: number, source: 'ours' | 'theirs') => {
+      const valueFrom = (cell: MergeCell) => (source === 'theirs' ? cell.theirsValue : cell.oursValue);
+      const keys = mergeCells.filter((c) => c.col === colNumber).map((c) => `${c.row}:${c.col}`);
+      markResolvedKeys(selectedMergeSheetIndex, keys);
+
+      setMergeSheets((prev) =>
+        prev.map((sheet: MergeSheetData, sIdx: number) => {
+          if (sIdx !== selectedMergeSheetIndex) return sheet;
+          const newCells = sheet.cells.map((cell) => {
+            if (cell.col !== colNumber) return cell;
+            return { ...cell, mergedValue: valueFrom(cell) };
+          });
+          return { ...sheet, cells: newCells };
+        }),
+      );
+
+      setMergeCells((prev) =>
+        prev.map((cell) => {
+          if (cell.col !== colNumber) return cell;
+          return { ...cell, mergedValue: valueFrom(cell) };
+        }),
+      );
+
+      if (!mergeInfo) return;
+      const meta = mergeColumnsMeta.find((c) => c.col === colNumber);
+      // theirs-only column -> insert
+      const canInsert = source === 'theirs' && meta && !meta.oursCol && meta.theirsCol;
+      // ours-only column but user chooses theirs (which is empty) -> delete
+      const canDelete = source === 'theirs' && meta && meta.oursCol && !meta.theirsCol;
+      if (canInsert) {
+        const targetColNumber = computeInsertTargetColNumber(colNumber);
+        const values = await buildMergedColumnValues(colNumber);
+        if (values) {
+          const op: SaveMergeColOp = {
+            sheetName: mergeInfo.sheetName,
+            action: 'insert',
+            targetColNumber,
+            alignedColNumber: colNumber,
+            source,
+            values,
+          };
+          updateColOpForSheet(selectedMergeSheetIndex, colNumber, op);
+        }
+      } else if (canDelete && meta.oursCol) {
+        const op: SaveMergeColOp = {
+          sheetName: mergeInfo.sheetName,
+          action: 'delete',
+          targetColNumber: meta.oursCol,
+          alignedColNumber: colNumber,
+          source,
+        };
+        updateColOpForSheet(selectedMergeSheetIndex, colNumber, op);
+      } else if (currentColOps.has(colNumber)) {
+        // Clear any existing op if user changes mind
+        updateColOpForSheet(selectedMergeSheetIndex, colNumber, null);
+      }
+    },
+    [
+      mergeCells,
+      markResolvedKeys,
+      selectedMergeSheetIndex,
+      mergeInfo,
+      mergeColumnsMeta,
+      computeInsertTargetColNumber,
+      buildMergedColumnValues,
+      updateColOpForSheet,
+      currentColOps,
+    ],
+  );
+
   const handleApplyMergeCellsChoice = useCallback(
     (keys: { rowNumber: number; colNumber: number }[], source: 'ours' | 'theirs') => {
       if (!keys.length) return;
@@ -777,11 +987,16 @@ export const App: React.FC = () => {
       sheet.cells.forEach((cell: MergeCell) => {
         const meta = rowMetaMap.get(cell.row);
         const targetRowNumber = meta?.oursRowNumber ?? null;
+        const targetColNumber = cell.oursCol ?? null;
         if (hasRowMeta && !targetRowNumber) {
           skippedCells += 1;
           return;
         }
-        const address = targetRowNumber ? makeAddress(cell.col, targetRowNumber) : cell.address;
+        if (!targetColNumber) {
+          skippedCells += 1;
+          return;
+        }
+        const address = targetRowNumber ? makeAddress(targetColNumber, targetRowNumber) : makeAddress(targetColNumber, cell.row);
         changedCells.push({
           sheetName: sheet.sheetName,
           address,
@@ -805,7 +1020,7 @@ export const App: React.FC = () => {
       lines.push(`…… 还有 ${changedCells.length - maxLines} 个单元格未展示`);
     }
     if (skippedCells > 0) {
-      lines.push(`（提示：有 ${skippedCells} 个单元格因 ours 侧缺少对应行而未写入）`);
+      lines.push(`（提示：有 ${skippedCells} 个单元格因 ours 侧缺少对应行/列而未写入）`);
     }
 
     const preview =
@@ -826,7 +1041,9 @@ export const App: React.FC = () => {
           const meta = rowMetaMap.get(cell.row);
           const targetRowNumber = meta?.oursRowNumber ?? null;
           if (hasRowMeta && !targetRowNumber) return null;
-          const address = targetRowNumber ? makeAddress(cell.col, targetRowNumber) : cell.address;
+          const targetColNumber = cell.oursCol ?? null;
+          if (!targetColNumber) return null;
+          const address = targetRowNumber ? makeAddress(targetColNumber, targetRowNumber) : makeAddress(targetColNumber, cell.row);
           return {
             sheetName: sheet.sheetName,
             address,
@@ -842,11 +1059,35 @@ export const App: React.FC = () => {
         sheetName: op.sheetName || sheetName,
       }));
     });
+    const buildMergedColumnValues = (sheet: MergeSheetData, alignedColNumber: number) => {
+      const rowsMeta = sheet.rowsMeta ?? [];
+      const rowMetaMap = new Map<number, MergeRowMeta>();
+      rowsMeta.forEach((m) => rowMetaMap.set(m.visualRowNumber, m));
+      const maxRow = rowsMeta.reduce((m, r) => Math.max(m, r.oursRowNumber ?? 0), 0);
+      const values: (string | number | null)[] = Array(maxRow).fill(null);
+      sheet.cells.forEach((cell) => {
+        if (cell.col !== alignedColNumber) return;
+        const meta = rowMetaMap.get(cell.row);
+        if (!meta?.oursRowNumber) return;
+        values[meta.oursRowNumber - 1] = cell.mergedValue ?? null;
+      });
+      return values;
+    };
+    const colOps = Array.from(mergeColOpsBySheet.entries()).flatMap(([sheetIndex, opsMap]) => {
+      const sheet = mergeSheets[sheetIndex];
+      const sheetName = sheet?.sheetName ?? mergeInfo.sheetName;
+      return Array.from(opsMap.values()).map((op) => ({
+        ...op,
+        sheetName: op.sheetName || sheetName,
+        values: sheet && op.alignedColNumber ? buildMergedColumnValues(sheet, op.alignedColNumber) : op.values,
+      }));
+    });
 
     const payload: SaveMergeRequest = {
       templatePath: mergeInfo.oursPath,
       cells,
       rowOps,
+      colOps,
       basePath: mergeInfo.basePath,
       oursPath: mergeInfo.oursPath,
       theirsPath: mergeInfo.theirsPath,
@@ -864,7 +1105,7 @@ export const App: React.FC = () => {
     } catch (e) {
       alert(`保存合并结果失败：${String(e)}`);
     }
-  }, [mergeInfo, mergeSheets, mergeRowOpsBySheet]);
+  }, [mergeInfo, mergeSheets, mergeRowOpsBySheet, mergeColOpsBySheet]);
   const mergedPreviewScrollToCell = useMemo(() => {
     if (!selectedMergeCell) return null;
     const visualRowNumber = selectedMergeCell.rowIndex + 1;
@@ -1164,6 +1405,7 @@ export const App: React.FC = () => {
                           );
                           setMergeCells(sheet?.cells ?? []);
                           setMergeRowsMeta(sheet?.rowsMeta ?? []);
+                          setMergeColumnsMeta(sheet?.columnsMeta ?? []);
                           setSelectedMergeCell(null);
                         }}
                         style={{
@@ -1355,9 +1597,11 @@ export const App: React.FC = () => {
                   onApplyRowChoice={handleApplyMergeRowChoice}
                   onApplyCellChoice={handleApplyMergeCellChoice}
                   onApplyCellsChoice={handleApplyMergeCellsChoice}
+                  onApplyColumnChoice={handleApplyMergeColumnChoice}
                   resolvedCellKeys={resolvedBySheet.get(selectedMergeSheetIndex)}
                   frozenRowCount={mergeFrozenRowCount}
-                  primaryKeyCol={primaryKeyCol}
+                  primaryKeyCol={displayPrimaryKeyCol}
+                  columnsMeta={mergeColumnsMeta}
                   oursPath={mergeInfo?.oursPath ?? null}
                   basePath={mergeInfo?.basePath ?? null}
                   theirsPath={mergeInfo?.theirsPath ?? null}

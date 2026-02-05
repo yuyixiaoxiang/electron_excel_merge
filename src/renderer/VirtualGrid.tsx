@@ -26,6 +26,7 @@ export interface VirtualGridProps<Cell> {
   getCellStyle?: (cell: Cell | null, ctx: VirtualGridRenderCtx) => CSSProperties | undefined;
   // 列头
   renderHeaderCell?: (colIndex: number) => React.ReactNode;
+  onHeaderContextMenu?: (colIndex: number, e: React.MouseEvent<HTMLTableCellElement>) => void;
   // 初始列宽（像素），如果没提供则用 120
   defaultColWidth?: number;
   // 可选：外部受控列宽（用于左右表格列宽一致）
@@ -62,6 +63,7 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
     renderCell,
     getCellStyle,
     renderHeaderCell,
+    onHeaderContextMenu,
     defaultColWidth = 120,
   } = props;
 
@@ -446,6 +448,11 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
                 return (
                   <th
                     key={colIndex}
+                    onContextMenu={(e) => {
+                      if (onHeaderContextMenu) {
+                        onHeaderContextMenu(colIndex, e);
+                      }
+                    }}
                     style={{
                       position: isFrozenCol ? 'sticky' : 'relative',
                       left: stickyLeft,
@@ -460,6 +467,7 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
                       overflow: 'hidden',
                       textOverflow: 'ellipsis',
                       whiteSpace: 'nowrap',
+                      cursor: onHeaderContextMenu ? 'context-menu' : 'default',
                     }}
                   >
                     {renderHeaderCell ? renderHeaderCell(colIndex) : String.fromCharCode('A'.charCodeAt(0) + (colIndex % 26))}

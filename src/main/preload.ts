@@ -53,11 +53,20 @@ interface MergeCell {
   address: string;
   row: number;
   col: number;
+  baseCol?: number | null;
+  oursCol?: number | null;
+  theirsCol?: number | null;
   baseValue: string | number | null;
   oursValue: string | number | null;
   theirsValue: string | number | null;
   status: 'unchanged' | 'ours-changed' | 'theirs-changed' | 'both-changed-same' | 'conflict';
   mergedValue: string | number | null;
+}
+interface MergeColumnMeta {
+  col: number;
+  baseCol: number | null;
+  oursCol: number | null;
+  theirsCol: number | null;
 }
 
 interface MergeSheetData {
@@ -66,6 +75,7 @@ interface MergeSheetData {
   cells: MergeCell[];
   rowsMeta?: MergeRowMeta[];
   hasExactDiff?: boolean;
+  columnsMeta?: MergeColumnMeta[];
 }
 
 interface ThreeWayOpenResult {
@@ -97,11 +107,20 @@ interface SaveMergeRowOp {
   values?: (string | number | null)[];
   visualRowNumber?: number; // for stable ordering
 }
+interface SaveMergeColOp {
+  sheetName: string;
+  action: 'insert' | 'delete';
+  targetColNumber: number; // 1-based in template (ours)
+  alignedColNumber?: number; // 1-based aligned column index
+  values?: (string | number | null)[];
+  source?: 'theirs' | 'base' | 'ours';
+}
 
 interface SaveMergeRequest {
   templatePath: string;
   cells: SaveMergeCellInput[];
   rowOps?: SaveMergeRowOp[];
+  colOps?: SaveMergeColOp[];
   basePath?: string;
   oursPath?: string;
   theirsPath?: string;
@@ -128,6 +147,7 @@ interface ThreeWayRowRequest {
   theirsPath: string;
   sheetName?: string;
   sheetIndex?: number; // 0-based
+  frozenRowCount?: number;
   rowNumber?: number; // 1-based fallback for all sides
   baseRowNumber?: number | null;
   oursRowNumber?: number | null;
@@ -151,6 +171,7 @@ interface ThreeWayRowsRequest {
   theirsPath: string;
   sheetName?: string;
   sheetIndex?: number; // 0-based
+  frozenRowCount?: number;
   rows: Array<{
     rowNumber?: number;
     baseRowNumber?: number | null;
@@ -216,6 +237,7 @@ export type {
   OpenResult,
   CellChange,
   MergeCell,
+  MergeColumnMeta,
   MergeSheetData,
   MergeRowMeta,
   RowStatus,
@@ -223,6 +245,7 @@ export type {
   ThreeWayDiffRequest,
   SaveMergeCellInput,
   SaveMergeRowOp,
+  SaveMergeColOp,
   SaveMergeRequest,
   SaveMergeResponse,
   CliThreeWayInfo,

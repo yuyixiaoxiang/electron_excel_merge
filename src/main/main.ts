@@ -187,6 +187,26 @@ interface RowRecord {
   nonEmptyCols: number[]; // 1-based column indices with non-empty values
   key?: string | null;
 }
+interface ColumnTypeSignature {
+  num: number;
+  str: number;
+  empty: number;
+  other: number;
+}
+
+interface ColumnRecord {
+  colNumber: number; // 1-based Excel column number
+  headerText: string; // normalized header text (joined by "|")
+  headerKey: string; // stronger normalized key for matching
+  typeSig: ColumnTypeSignature;
+  sampleValues: string[]; // normalized sample values
+}
+
+interface AlignedColumn {
+  baseCol?: number | null;
+  oursCol?: number | null;
+  theirsCol?: number | null;
+}
 
 interface AlignedRow {
   base?: RowRecord | null;
@@ -197,20 +217,42 @@ interface AlignedRow {
   ambiguousTheirs?: boolean;
 }
 
+/**
+ * 将 ExcelJS 的复杂单元格值转换为简单值（string | number | null）。
+ * 
+ * ExcelJS 的单元格值可能是：
+ * - 简单类型：string、number
+ * - 富文本：{ richText: [{text: '...'}] }
+ * - 公式：{ formula: '...', result: value }
+ * - 超链接等其他对象类型
+ * 
+ * 该函数统一提取其中的实际文本/数值内容，忽略格式信息。
+ */
 const getSimpleValueForMerge = (v: any): SimpleCellValue => {
   if (v === null || v === undefined) return null;
+  // 处理富文本：拼接所有文本片段
   if (typeof v === 'object' && Array.isArray((v as any).richText)) {
     const parts = (v as any).richText
       .map((p: any) => (p && typeof p.text === 'string' ? p.text : ''))
       .join('');
     return parts;
   }
+  // 处理超链接等包含 text 属性的对象
   if (typeof v === 'object' && 'text' in v) return (v as any).text ?? null;
+  // 处理公式单元格：取计算结果
   if (typeof v === 'object' && 'result' in v) return (v as any).result ?? null;
+  // 简单类型直接返回
   if (typeof v === 'string' || typeof v === 'number') return v;
+  // 其他类型转字符串
   return String(v);
 };
 
+/**
+ * 将单元格值标准化为字符串，用于比较和显示。
+ * - null/undefined → 空字符串
+ * - 字符串 → 去除首尾空格
+ * - 数字 → 转字符串
+ */
 const normalizeCellValue = (v: SimpleCellValue): string => {
   if (v === null || v === undefined) return '';
   if (typeof v === 'string') return v.trim();
@@ -218,9 +260,337 @@ const normalizeCellValue = (v: SimpleCellValue): string => {
   return String(v);
 };
 
+/**
+ * 标准化主键列的值，用于行对齐。
+ * 空字符串视为 null（即无主键），方便后续判断。
+ */
 const normalizeKeyValue = (v: SimpleCellValue): string | null => {
   const s = normalizeCellValue(v);
   return s === '' ? null : s;
+};
+
+/**
+ * 标准化表头文本，用于列匹配。
+ * 转为小写以忽略大小写差异。
+ */
+const normalizeHeaderText = (v: SimpleCellValue): string => {
+  const s = normalizeCellValue(v);
+  if (!s) return '';
+  return s.toLowerCase();
+};
+/**
+ * 生成更强的表头匹配键，用于精确匹配列。
+ * - 转小写
+ * - 去除所有空白
+ * - 只保留字母、数字、中文字符
+ * 
+ * 例如："Icon名称, Asset..." → "icon名称asset"
+ * 这样即使格式略有不同，也能匹配上相同语义的列。
+ */
+const normalizeHeaderKey = (text: string): string => {
+  if (!text) return '';
+  return text
+    .toLowerCase()
+    .replace(/\s+/g, '')
+    .replace(/[^0-9a-z\u4e00-\u9fa5]/gi, '');
+};
+
+/**
+ * 为工作表的每一列提取特征信息，用于列对齐算法。
+ * 
+ * @param ws ExcelJS 工作表对象
+ * @param headerCount 表头行数（前N行视为表头）
+ * @param sampleRows 采样行数（用于类型和样本值统计）
+ * @returns 列特征记录数组
+ * 
+ * 特征包括：
+ * 1. headerText: 表头文本（多行用 | 分隔）
+ * 2. headerKey: 标准化的表头键（用于精确匹配）
+ * 3. typeSig: 数据类型签名（num/str/empty/other 的分布）
+ * 4. sampleValues: 样本值集合（用于内容相似度比较）
+ * 
+ * 注意：完全空的列（表头和数据都为空）会被跳过，不生成记录。
+ */
+const buildColumnRecords = (
+  ws: any,
+  headerCount: number,
+  sampleRows: number,
+): ColumnRecord[] => {
+  if (!ws) return [];
+  // 获取工作表实际列数
+  const actualColCount = Math.max(ws?.actualColumnCount ?? 0, ws?.columnCount ?? 0);
+  const maxRow = Math.max(ws?.actualRowCount ?? 0, ws?.rowCount ?? 0, headerCount);
+  const records: ColumnRecord[] = [];
+  
+  // 遍历每一列
+  for (let col = 1; col <= actualColCount; col += 1) {
+    // 1. 提取表头文本（拼接前 headerCount 行）
+    const headerParts: string[] = [];
+    for (let r = 1; r <= headerCount; r += 1) {
+      const row = ws.getRow(r);
+      const raw = getSimpleValueForMerge(row.getCell(col)?.value);
+      const text = normalizeHeaderText(raw);
+      if (text) headerParts.push(text);
+    }
+  const headerText = headerParts.join('|');
+  const headerKey = normalizeHeaderKey(headerText);
+    const typeSig: ColumnTypeSignature = { num: 0, str: 0, empty: 0, other: 0 };
+    const sampleSet = new Set<string>();
+    let sampled = 0;
+    for (let r = headerCount + 1; r <= maxRow && sampled < sampleRows; r += 1) {
+      const row = ws.getRow(r);
+      const raw = getSimpleValueForMerge(row.getCell(col)?.value);
+      const norm = normalizeCellValue(raw);
+      if (norm === '') {
+        typeSig.empty += 1;
+        sampled += 1;
+        continue;
+      }
+      if (typeof raw === 'number') typeSig.num += 1;
+      else if (typeof raw === 'string') typeSig.str += 1;
+      else typeSig.other += 1;
+      sampleSet.add(norm);
+      sampled += 1;
+    }
+    const sampleValues = Array.from(sampleSet).slice(0, 12);
+    const hasDataSample = sampleValues.length > 0 || typeSig.num > 0 || typeSig.str > 0 || typeSig.other > 0;
+    const isFullyEmpty = !headerText && !hasDataSample;
+    if (isFullyEmpty) continue;
+
+    records.push({
+      colNumber: col,
+      headerText,
+      headerKey,
+      typeSig,
+      sampleValues,
+    });
+  }
+  return records;
+};
+
+/**
+ * 计算两个字符串的相似度（使用 Levenshtein 距离）。
+ * 
+ * @returns 0-1 之间的相似度，1 表示完全相同，0 表示完全不同。
+ * 
+ * 算法：Levenshtein 跍离算法（动态规划）
+ * - 计算将字符串 a 转换为 b 所需的最小编辑步骤（插入、删除、替换）
+ * - 相似度 = 1 - (跍离 / 较长字符串长度)
+ */
+const stringSimilarity = (a: string, b: string): number => {
+  if (!a && !b) return 1;
+  if (!a || !b) return 0;
+  const s = a.toLowerCase();
+  const t = b.toLowerCase();
+  if (s === t) return 1;
+  const n = s.length;
+  const m = t.length;
+  if (n === 0 || m === 0) return 0;
+  // 动态规划计算编辑距离
+  const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  // 初始化：第i个字符转换为空需要i步
+  for (let i = 0; i <= n; i += 1) dp[i][0] = i;
+  for (let j = 0; j <= m; j += 1) dp[0][j] = j;
+  // 填表：计算每个子问题的最小编辑距离
+  for (let i = 1; i <= n; i += 1) {
+    for (let j = 1; j <= m; j += 1) {
+      const cost = s[i - 1] === t[j - 1] ? 0 : 1;  // 字符相同无需替换
+      dp[i][j] = Math.min(
+        dp[i - 1][j] + 1,       // 删除
+        dp[i][j - 1] + 1,       // 插入
+        dp[i - 1][j - 1] + cost, // 替换
+      );
+    }
+  }
+  const dist = dp[n][m];
+  // 归一化为 0-1 之间的相似度
+  return 1 - dist / Math.max(n, m);
+};
+
+/**
+ * 计算两个列的数据类型签名相似度。
+ * 
+ * 类型签名 = { num, str, empty, other } 的分布比例。
+ * 相似度 = 1 - (比例差异的总和 / 2)。
+ * 
+ * 例如：
+ * - A列：80% 数字，20% 字符串
+ * - B列：85% 数字，15% 字符串
+ * - 相似度很高，很可能是同一列
+ */
+const typeSignatureSimilarity = (a: ColumnTypeSignature, b: ColumnTypeSignature): number => {
+  const totalA = a.num + a.str + a.empty + a.other;
+  const totalB = b.num + b.str + b.empty + b.other;
+  if (totalA === 0 && totalB === 0) return 1;
+  if (totalA === 0 || totalB === 0) return 0;
+  const pa = {
+    num: a.num / totalA,
+    str: a.str / totalA,
+    empty: a.empty / totalA,
+    other: a.other / totalA,
+  };
+  const pb = {
+    num: b.num / totalB,
+    str: b.str / totalB,
+    empty: b.empty / totalB,
+    other: b.other / totalB,
+  };
+  const dist =
+    Math.abs(pa.num - pb.num) +
+    Math.abs(pa.str - pb.str) +
+    Math.abs(pa.empty - pb.empty) +
+    Math.abs(pa.other - pb.other);
+  return 1 - dist / 2;
+};
+
+const valueSimilarity = (a: string[], b: string[]): number => {
+  if (a.length === 0 && b.length === 0) return 1;
+  if (a.length === 0 || b.length === 0) return 0;
+  const setA = new Set(a);
+  const setB = new Set(b);
+  let intersect = 0;
+  setA.forEach((v) => {
+    if (setB.has(v)) intersect += 1;
+  });
+  const union = setA.size + setB.size - intersect;
+  if (union === 0) return 0;
+  return intersect / union;
+};
+
+const columnSimilarity = (a: ColumnRecord, b: ColumnRecord): number => {
+  const headerSim = stringSimilarity(a.headerKey || a.headerText, b.headerKey || b.headerText);
+  const typeSim = typeSignatureSimilarity(a.typeSig, b.typeSig);
+  const valSim = valueSimilarity(a.sampleValues, b.sampleValues);
+  const hasHeader = (a.headerKey || a.headerText) && (b.headerKey || b.headerText);
+  const wHeader = hasHeader ? 0.6 : 0.2;
+  const wType = 0.2;
+  const wVal = 0.2;
+  const sum = wHeader + wType + wVal;
+  return (wHeader * headerSim + wType * typeSim + wVal * valSim) / sum;
+};
+
+const alignColumnsBySimilarity = (
+  baseCols: ColumnRecord[],
+  sideCols: ColumnRecord[],
+): { matched: Map<number, number>; gaps: Map<number, ColumnRecord[]> } => {
+  const baseTokens = baseCols.map((c, i) => (c.headerKey || c.headerText ? (c.headerKey || c.headerText) : `__EMPTY_${i}`));
+  const sideTokens = sideCols.map((c, i) => (c.headerKey || c.headerText ? (c.headerKey || c.headerText) : `__EMPTY_${i}`));
+  const anchorPairs = lcsMatchPairs(baseTokens, sideTokens);
+  const matched = new Map<number, number>();
+  const usedSide = new Set<number>();
+  for (const p of anchorPairs) {
+    matched.set(p.aIndex, p.bIndex);
+    usedSide.add(p.bIndex);
+  }
+
+  anchorPairs.sort((a, b) => a.aIndex - b.aIndex);
+
+  const threshold = 0.55;
+  const headerThreshold = 0.8;
+  const matchSegment = (baseIdxs: number[], sideIdxs: number[]) => {
+    if (baseIdxs.length === 0 || sideIdxs.length === 0) return;
+    const pairs: Array<{ b: number; s: number; score: number }> = [];
+    for (const b of baseIdxs) {
+      for (const s of sideIdxs) {
+        const headerA = baseCols[b].headerKey || baseCols[b].headerText;
+        const headerB = sideCols[s].headerKey || sideCols[s].headerText;
+        const headerSim = stringSimilarity(headerA, headerB);
+        if (headerA && headerB && headerSim < headerThreshold) continue;
+        const score = columnSimilarity(baseCols[b], sideCols[s]);
+        if (score >= threshold) pairs.push({ b, s, score });
+      }
+    }
+    pairs.sort((a, b) => b.score - a.score);
+    for (const p of pairs) {
+      if (matched.has(p.b)) continue;
+      if (usedSide.has(p.s)) continue;
+      matched.set(p.b, p.s);
+      usedSide.add(p.s);
+    }
+  };
+
+  let prevBase = -1;
+  let prevSide = -1;
+  for (const anchor of anchorPairs) {
+    const baseIdxs: number[] = [];
+    const sideIdxs: number[] = [];
+    for (let b = prevBase + 1; b < anchor.aIndex; b += 1) baseIdxs.push(b);
+    for (let s = prevSide + 1; s < anchor.bIndex; s += 1) sideIdxs.push(s);
+    matchSegment(baseIdxs, sideIdxs);
+    prevBase = anchor.aIndex;
+    prevSide = anchor.bIndex;
+  }
+  if (prevBase < baseCols.length - 1 || prevSide < sideCols.length - 1) {
+    const baseIdxs: number[] = [];
+    const sideIdxs: number[] = [];
+    for (let b = prevBase + 1; b < baseCols.length; b += 1) baseIdxs.push(b);
+    for (let s = prevSide + 1; s < sideCols.length; s += 1) sideIdxs.push(s);
+    matchSegment(baseIdxs, sideIdxs);
+  }
+
+  const gaps = new Map<number, ColumnRecord[]>();
+  const matchedPairsBySide = Array.from(matched.entries())
+    .map(([baseIndex, sideIndex]) => ({ baseIndex, sideIndex }))
+    .sort((a, b) => a.sideIndex - b.sideIndex);
+  for (let s = 0; s < sideCols.length; s += 1) {
+    if (usedSide.has(s)) continue;
+    let gap = -1;
+    for (const p of matchedPairsBySide) {
+      if (p.sideIndex < s) gap = p.baseIndex;
+      if (p.sideIndex >= s) break;
+    }
+    if (!gaps.has(gap)) gaps.set(gap, []);
+    gaps.get(gap)!.push(sideCols[s]);
+  }
+
+  return { matched, gaps };
+};
+
+const buildAlignedColumns = (
+  baseWs: any,
+  oursWs: any,
+  theirsWs: any,
+  headerCount: number,
+): AlignedColumn[] => {
+  const sampleRows = 20;
+  const baseCols = buildColumnRecords(baseWs, headerCount, sampleRows);
+  const oursCols = buildColumnRecords(oursWs, headerCount, sampleRows);
+  const theirsCols = buildColumnRecords(theirsWs, headerCount, sampleRows);
+
+  const alignBase = baseCols.length > 0 ? baseCols : oursCols.length > 0 ? oursCols : theirsCols;
+  const baseRefCols = alignBase;
+  const oursAlign = alignColumnsBySimilarity(baseRefCols, oursCols);
+  const theirsAlign = alignColumnsBySimilarity(baseRefCols, theirsCols);
+
+  const aligned: AlignedColumn[] = [];
+  const addGapCols = (gapIndex: number) => {
+    const oursGap = oursAlign.gaps.get(gapIndex) ?? [];
+    const theirsGap = theirsAlign.gaps.get(gapIndex) ?? [];
+    for (const c of oursGap) aligned.push({ oursCol: c.colNumber ?? null });
+    for (const c of theirsGap) aligned.push({ theirsCol: c.colNumber ?? null });
+  };
+
+  addGapCols(-1);
+  for (let i = 0; i < baseRefCols.length; i += 1) {
+    const baseColNumber = baseRefCols[i]?.colNumber ?? null;
+    const oursIndex = oursAlign.matched.get(i);
+    const theirsIndex = theirsAlign.matched.get(i);
+    aligned.push({
+      baseCol: baseColNumber,
+      oursCol: typeof oursIndex === 'number' ? oursCols[oursIndex]?.colNumber ?? null : null,
+      theirsCol: typeof theirsIndex === 'number' ? theirsCols[theirsIndex]?.colNumber ?? null : null,
+    });
+    addGapCols(i);
+  }
+
+  if (baseRefCols.length === 0) {
+    // base/ours 모두为空时，直接按 theirs 追加
+    for (const c of theirsCols) {
+      aligned.push({ theirsCol: c.colNumber ?? null });
+    }
+  }
+
+  return aligned;
 };
 
 const colNumberToLabel = (colNumber: number): string => {
@@ -234,12 +604,29 @@ const colNumberToLabel = (colNumber: number): string => {
   return s;
 };
 
+/**
+ * 从工作表中提取行记录（未对齐版本，用于单文件或列对齐前）。
+ * 
+ * @param ws ExcelJS 工作表对象
+ * @param colCount 列数
+ * @param primaryKeyCol 主键列号（1-based，-1 表示无主键）
+ * @returns 行记录数组，每条记录包含：
+ *   - rowNumber: Excel 中的原始行号
+ *   - index: 在提取列表中的索引
+ *   - values: 所有列的值数组
+ *   - nonEmptyCols: 非空列的列号列表
+ *   - key: 主键值（如果有）
+ * 
+ * 注意：完全空的行会被跳过。
+ */
 const buildRowRecords = (ws: any, colCount: number, primaryKeyCol: number): RowRecord[] => {
   const rows: RowRecord[] = [];
   let index = 0;
+  // 遍历所有非空行
   ws.eachRow({ includeEmpty: false }, (row: any, rowNumber: number) => {
     const values: SimpleCellValue[] = [];
     const nonEmptyCols: number[] = [];
+    // 读取每一列的值
     for (let col = 1; col <= colCount; col += 1) {
       const cell = row.getCell(col);
       const value = getSimpleValueForMerge(cell?.value);
@@ -248,7 +635,9 @@ const buildRowRecords = (ws: any, colCount: number, primaryKeyCol: number): RowR
         nonEmptyCols.push(col);
       }
     }
+    // 跳过完全空的行
     if (nonEmptyCols.length === 0) return;
+    // 提取主键值（如果有指定主键列）
     const key =
       primaryKeyCol >= 1 && primaryKeyCol <= colCount
         ? normalizeKeyValue(values[primaryKeyCol - 1])
@@ -284,10 +673,106 @@ const buildHeaderRowRecord = (ws: any, rowNumber: number, colCount: number, prim
   };
 };
 
+/**
+ * 从工作表中提取行记录（列对齐版本）。
+ * 
+ * 与 buildRowRecords 的区别：
+ * - 使用对齐后的列顺序
+ * - 根据 side 参数从对应的物理列读取值
+ * - 如果某一列在该 side 不存在，对应位置填 null
+ * 
+ * @param alignedColumns 对齐后的列元信息
+ * @param primaryKeyColAligned 主键列在对齐后序列中的位置
+ * @param side 当前处理的是 base/ours/theirs 哪一侧
+ * 
+ * 例如：
+ * - alignedColumns[2] = { baseCol: 3, oursCol: null, theirsCol: 2 }
+ * - 对于 ours 侧，第3个对齐列的值会是 null（因为 ours 没有这一列）
+ */
+const buildRowRecordsAligned = (
+  ws: any,
+  alignedColumns: AlignedColumn[],
+  primaryKeyColAligned: number,
+  side: 'base' | 'ours' | 'theirs',
+): RowRecord[] => {
+  const rows: RowRecord[] = [];
+  let index = 0;
+  ws.eachRow({ includeEmpty: false }, (row: any, rowNumber: number) => {
+    const values: SimpleCellValue[] = [];
+    const nonEmptyCols: number[] = [];
+    // 按照对齐后的列顺序读取值
+    for (let i = 0; i < alignedColumns.length; i += 1) {
+      const colMeta = alignedColumns[i];
+      // 根据 side 获取对应的物理列号
+      const colNumber =
+        side === 'base' ? colMeta.baseCol : side === 'ours' ? colMeta.oursCol : colMeta.theirsCol;
+      let value: SimpleCellValue = null;
+      // 如果该 side 有这一列，则读取值；否则为 null
+      if (colNumber) {
+        const cell = row.getCell(colNumber);
+        value = getSimpleValueForMerge(cell?.value);
+      }
+      values.push(value);
+      if (value !== null && value !== '') nonEmptyCols.push(i + 1);
+    }
+    if (nonEmptyCols.length === 0) return;
+    const key =
+      primaryKeyColAligned >= 1 && primaryKeyColAligned <= alignedColumns.length
+        ? normalizeKeyValue(values[primaryKeyColAligned - 1])
+        : null;
+    rows.push({ rowNumber, index, values, nonEmptyCols, key });
+    index += 1;
+  });
+  return rows;
+};
+
+const buildHeaderRowRecordAligned = (
+  ws: any,
+  rowNumber: number,
+  alignedColumns: AlignedColumn[],
+  primaryKeyColAligned: number,
+  side: 'base' | 'ours' | 'theirs',
+): RowRecord => {
+  const values: SimpleCellValue[] = [];
+  const nonEmptyCols: number[] = [];
+  const row = ws.getRow(rowNumber);
+  for (let i = 0; i < alignedColumns.length; i += 1) {
+    const colMeta = alignedColumns[i];
+    const colNumber =
+      side === 'base' ? colMeta.baseCol : side === 'ours' ? colMeta.oursCol : colMeta.theirsCol;
+    let value: SimpleCellValue = null;
+    if (colNumber) {
+      const cell = row.getCell(colNumber);
+      value = getSimpleValueForMerge(cell?.value);
+    }
+    values.push(value);
+    if (value !== null && value !== '') nonEmptyCols.push(i + 1);
+  }
+  const key =
+    primaryKeyColAligned >= 1 && primaryKeyColAligned <= alignedColumns.length
+      ? normalizeKeyValue(values[primaryKeyColAligned - 1])
+      : null;
+  return {
+    rowNumber,
+    index: rowNumber - 1,
+    values,
+    nonEmptyCols,
+    key,
+  };
+};
+
+/**
+ * 判断两行是否完全相等。
+ * 
+ * 相等的定义：所有非空列的值完全相同。
+ * 只比较两行中至少有一行非空的列。
+ */
 const rowsEqual = (a: RowRecord, b: RowRecord): boolean => {
+  // 收集两行的所有非空列
   const cols = new Set<number>();
   a.nonEmptyCols.forEach((c) => cols.add(c));
   b.nonEmptyCols.forEach((c) => cols.add(c));
+  // 逐列比较
   for (const col of cols) {
     const av = normalizeCellValue(a.values[col - 1] ?? null);
     const bv = normalizeCellValue(b.values[col - 1] ?? null);
@@ -296,6 +781,21 @@ const rowsEqual = (a: RowRecord, b: RowRecord): boolean => {
   return true;
 };
 
+/**
+ * 计算两行的相似度。
+ * 
+ * @returns 0-1 之间的相似度，1 表示完全相同。
+ * 
+ * 算法：
+ * 1. 收集两行的所有非空列
+ * 2. 计算相同值的列数 / 总列数
+ * 3. 跳过两边都为空的列（不计入总数）
+ * 
+ * 例如：
+ * - A行: [1, "abc", null, "xyz"]
+ * - B行: [1, "abc", "new", "xyz"]
+ * - 相似度 = 3/4 = 0.75（第3列不同）
+ */
 const rowSimilarity = (a: RowRecord, b: RowRecord): number => {
   const cols = new Set<number>();
   a.nonEmptyCols.forEach((c) => cols.add(c));
@@ -306,6 +806,7 @@ const rowSimilarity = (a: RowRecord, b: RowRecord): number => {
   for (const col of cols) {
     const av = normalizeCellValue(a.values[col - 1] ?? null);
     const bv = normalizeCellValue(b.values[col - 1] ?? null);
+    // 跳过两边都为空的列
     if (av === '' && bv === '') continue;
     total += 1;
     if (av === bv) same += 1;
@@ -314,6 +815,16 @@ const rowSimilarity = (a: RowRecord, b: RowRecord): number => {
   return same / total;
 };
 
+/**
+ * 计算行的状态（基于三方对比）。
+ * 
+ * @returns 行状态：
+ *   - 'ambiguous': 匹配有歧义（多个候选行）
+ *   - 'added': 新增行（base 没有，side 有）
+ *   - 'deleted': 删除行（base 有，side 没有）
+ *   - 'unchanged': 未变化（内容完全相同）
+ *   - 'modified': 修改行（内容不同）
+ */
 const computeRowStatus = (
   baseRow: RowRecord | null | undefined,
   sideRow: RowRecord | null | undefined,
@@ -358,6 +869,56 @@ type DiffOp =
   | { type: 'equal'; aIndex: number; bIndex: number }
   | { type: 'delete'; aIndex: number }
   | { type: 'insert'; bIndex: number };
+/**
+ * 计算最长公共子序列（LCS）并返回匹配对。
+ * 
+ * 用于列/行对齐的锁点匹配：找到两个序列中确定相同的元素作为“锁点”。
+ * 
+ * @param a 第一个字符串数组
+ * @param b 第二个字符串数组
+ * @returns 匹配对数组，按照出现顺序排列
+ * 
+ * 例如：
+ * - a = ["A", "B", "C", "D"]
+ * - b = ["A", "X", "B", "D"]
+ * - 返回: [{ aIndex: 0, bIndex: 0 }, { aIndex: 1, bIndex: 2 }, { aIndex: 3, bIndex: 3 }]
+ * - 即 A, B, D 三个元素是公共的
+ * 
+ * 算法：动态规划 + 回溯
+ * - dp[i][j] = a[0..i-1] 和 b[0..j-1] 的 LCS 长度
+ * - 回溯找到实际匹配的位置
+ */
+const lcsMatchPairs = (a: string[], b: string[]): Array<{ aIndex: number; bIndex: number }> => {
+  const n = a.length;
+  const m = b.length;
+  // 动态规划表：dp[i][j] = LCS 长度
+  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
+  // 填表：计算 LCS 长度
+  for (let i = 1; i <= n; i += 1) {
+    for (let j = 1; j <= m; j += 1) {
+      if (a[i - 1] === b[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;  // 匹配，长度+1
+      else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);        // 不匹配，取最大值
+    }
+  }
+  // 回溯：从 dp 表中提取实际匹配对
+  const pairs: Array<{ aIndex: number; bIndex: number }> = [];
+  let i = n;
+  let j = m;
+  while (i > 0 && j > 0) {
+    if (a[i - 1] === b[j - 1]) {
+      // 当前元素匹配，记录并继续回溯
+      pairs.push({ aIndex: i - 1, bIndex: j - 1 });
+      i -= 1;
+      j -= 1;
+    } else if (dp[i - 1][j] >= dp[i][j - 1]) {
+      i -= 1;  // 向上回溯
+    } else {
+      j -= 1;  // 向左回溯
+    }
+  }
+  // 回溯是从后往前，需要反转
+  return pairs.reverse();
+};
 
 const myersDiff = (a: string[], b: string[]): DiffOp[] => {
   const n = a.length;
@@ -422,6 +983,29 @@ const myersDiff = (a: string[], b: string[]): DiffOp[] => {
   return [];
 };
 
+/**
+ * 基于主键列对齐行。
+ * 
+ * 这是行对齐的主要方法，适用于有唯一标识列（如 ID）的数据。
+ * 
+ * @param baseRows base 的行记录
+ * @param oursRows ours 的行记录
+ * @param theirsRows theirs 的行记录
+ * @param keyCol 主键列号（1-based）
+ * @param rowSimilarityThreshold 相似度阈值（用于歧义检测）
+ * @returns 对齐结果 + 歧义行集合
+ * 
+ * 算法步骤：
+ * 1. 按主键值分组：Map<key, RowRecord[]>
+ * 2. 对每个主键值：
+ *    - 如果 base/ours/theirs 都有且每侧只有 1 条 → 直接匹配
+ *    - 如果某侧有多条相同主键 → 检测歧义（相似度匹配）
+ * 3. 返回对齐后的三元组：(base, ours, theirs)
+ * 
+ * 歧义场景：
+ * - 主键值相同但其他列内容不同的多行
+ * - 此时无法确定哪一行对应哪一行，标记为 ambiguous
+ */
 const alignRowsByKey = (
   baseRows: RowRecord[],
   oursRows: RowRecord[],
@@ -1011,27 +1595,44 @@ const buildMergeSheetWithRowAlign = (
       ...r,
       key: col >= 1 ? normalizeKeyValue(r.values[col - 1] ?? null) : null,
     }));
-  const colCount = Math.max(
+  const rawColCount = Math.max(
     baseWs?.actualColumnCount ?? baseWs?.columnCount ?? 0,
     oursWs?.actualColumnCount ?? oursWs?.columnCount ?? 0,
     theirsWs?.actualColumnCount ?? theirsWs?.columnCount ?? 0,
   );
   const headerCount = Math.max(0, Math.floor(frozenRowCount));
-  const useKey = primaryKeyCol >= 1 && primaryKeyCol <= colCount;
-  const keyCol = useKey ? primaryKeyCol : -1;
   const baseWsForAlign = IGNORE_BASE_IN_DIFF ? oursWs : baseWs;
+  const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, headerCount);
+  const colCount = Math.max(alignedColumns.length, 0);
+  const useKey = primaryKeyCol >= 1 && primaryKeyCol <= rawColCount;
   if (IGNORE_BASE_IN_DIFF && sheetsEqualByCoordinate(oursWs, theirsWs)) {
     return { sheetName: baseWs.name, cells: [], rowsMeta: [], hasExactDiff: false };
   }
-  const baseRows = buildRowRecords(baseWsForAlign, colCount, keyCol).filter((r) => r.rowNumber > headerCount);
-  const oursRows = buildRowRecords(oursWs, colCount, keyCol).filter((r) => r.rowNumber > headerCount);
-  const theirsRows = buildRowRecords(theirsWs, colCount, keyCol).filter((r) => r.rowNumber > headerCount);
+  const mapRawToAligned = (rawCol: number, side: 'base' | 'ours' | 'theirs'): number | null => {
+    if (rawCol < 1) return null;
+    const idx = alignedColumns.findIndex((c) =>
+      side === 'base' ? c.baseCol === rawCol : side === 'ours' ? c.oursCol === rawCol : c.theirsCol === rawCol,
+    );
+    return idx >= 0 ? idx + 1 : null;
+  };
+  const keyColAligned = useKey ? mapRawToAligned(primaryKeyCol, 'ours') ?? -1 : -1;
+
+  const baseRows = buildRowRecordsAligned(baseWsForAlign, alignedColumns, keyColAligned, 'base').filter(
+    (r) => r.rowNumber > headerCount,
+  );
+  const oursRows = buildRowRecordsAligned(oursWs, alignedColumns, keyColAligned, 'ours').filter(
+    (r) => r.rowNumber > headerCount,
+  );
+  const theirsRows = buildRowRecordsAligned(theirsWs, alignedColumns, keyColAligned, 'theirs').filter(
+    (r) => r.rowNumber > headerCount,
+  );
   const implicitKeyCol = useKey ? null : detectImplicitKeyCol(baseRows, colCount);
-  const headerKeyCol =
-    !useKey && implicitKeyCol == null ? detectHeaderKeyCol(baseWsForAlign, colCount, headerCount) : null;
+  const headerKeyColRaw =
+    !useKey && implicitKeyCol == null ? detectHeaderKeyCol(baseWsForAlign, rawColCount, headerCount) : null;
+  const headerKeyCol = headerKeyColRaw ? mapRawToAligned(headerKeyColRaw, 'base') : null;
   const weakKeyCol =
     !useKey && implicitKeyCol == null && headerKeyCol == null ? detectWeakKeyCol(baseRows, colCount) : null;
-  const alignKeyCol = useKey ? keyCol : implicitKeyCol ?? headerKeyCol ?? weakKeyCol ?? -1;
+  const alignKeyCol = useKey ? keyColAligned ?? -1 : implicitKeyCol ?? headerKeyCol ?? weakKeyCol ?? -1;
   const alignedResult =
     alignKeyCol >= 1
       ? alignRowsByKey(
@@ -1049,11 +1650,11 @@ const buildMergeSheetWithRowAlign = (
 
   const rowsMeta: MergeRowMeta[] = [];
   // 1) Header rows: compare by fixed row number (no alignment)
-  const metaKeyCol = alignKeyCol >= 1 ? alignKeyCol : keyCol;
+  const metaKeyCol = alignKeyCol >= 1 ? alignKeyCol : keyColAligned;
   for (let r = 1; r <= headerCount; r += 1) {
-    const baseRow = buildHeaderRowRecord(baseWsForAlign, r, colCount, metaKeyCol);
-    const oursRow = buildHeaderRowRecord(oursWs, r, colCount, metaKeyCol);
-    const theirsRow = buildHeaderRowRecord(theirsWs, r, colCount, metaKeyCol);
+    const baseRow = buildHeaderRowRecordAligned(baseWsForAlign, r, alignedColumns, metaKeyCol, 'base');
+    const oursRow = buildHeaderRowRecordAligned(oursWs, r, alignedColumns, metaKeyCol, 'ours');
+    const theirsRow = buildHeaderRowRecordAligned(theirsWs, r, alignedColumns, metaKeyCol, 'theirs');
     const oursSim = rowSimilarity(baseRow, oursRow);
     const theirsSim = rowSimilarity(baseRow, theirsRow);
     rowsMeta.push({
@@ -1092,9 +1693,9 @@ const buildMergeSheetWithRowAlign = (
 
   // Header rows diff by fixed row number (compare ours vs theirs only)
   for (let r = 1; r <= headerCount; r += 1) {
-    const baseRow = buildHeaderRowRecord(baseWsForAlign, r, colCount, metaKeyCol);
-    const oursRow = buildHeaderRowRecord(oursWs, r, colCount, metaKeyCol);
-    const theirsRow = buildHeaderRowRecord(theirsWs, r, colCount, metaKeyCol);
+    const baseRow = buildHeaderRowRecordAligned(baseWsForAlign, r, alignedColumns, metaKeyCol, 'base');
+    const oursRow = buildHeaderRowRecordAligned(oursWs, r, alignedColumns, metaKeyCol, 'ours');
+    const theirsRow = buildHeaderRowRecordAligned(theirsWs, r, alignedColumns, metaKeyCol, 'theirs');
     const cols = new Set<number>();
     baseRow.nonEmptyCols.forEach((c) => cols.add(c));
     oursRow.nonEmptyCols.forEach((c) => cols.add(c));
@@ -1118,10 +1719,14 @@ const buildMergeSheetWithRowAlign = (
       }
 
       if (status !== 'unchanged') {
+        const colMeta = alignedColumns[col - 1];
         cells.push({
           address: makeAddress(col, r),
           row: r,
           col,
+          baseCol: colMeta?.baseCol ?? null,
+          oursCol: colMeta?.oursCol ?? null,
+          theirsCol: colMeta?.theirsCol ?? null,
           baseValue,
           oursValue,
           theirsValue,
@@ -1163,10 +1768,14 @@ const buildMergeSheetWithRowAlign = (
       if (status !== 'unchanged') {
         const addressRow =
           row.ours?.rowNumber ?? row.base?.rowNumber ?? row.theirs?.rowNumber ?? visualRowNumber;
+        const colMeta = alignedColumns[col - 1];
         cells.push({
           address: makeAddress(col, addressRow),
           row: visualRowNumber,
           col,
+          baseCol: colMeta?.baseCol ?? null,
+          oursCol: colMeta?.oursCol ?? null,
+          theirsCol: colMeta?.theirsCol ?? null,
           baseValue,
           oursValue,
           theirsValue,
@@ -1184,19 +1793,23 @@ const buildMergeSheetWithRowAlign = (
     if (diffColumns.size > 0) {
       const existing = new Set<string>(cells.map((c) => `${c.row}:${c.col}`));
       for (let r = 1; r <= headerCount; r += 1) {
-        const baseRow = buildHeaderRowRecord(baseWsForAlign, r, colCount, metaKeyCol);
-        const oursRow = buildHeaderRowRecord(oursWs, r, colCount, metaKeyCol);
-        const theirsRow = buildHeaderRowRecord(theirsWs, r, colCount, metaKeyCol);
+        const baseRow = buildHeaderRowRecordAligned(baseWsForAlign, r, alignedColumns, metaKeyCol, 'base');
+        const oursRow = buildHeaderRowRecordAligned(oursWs, r, alignedColumns, metaKeyCol, 'ours');
+        const theirsRow = buildHeaderRowRecordAligned(theirsWs, r, alignedColumns, metaKeyCol, 'theirs');
         for (const col of diffColumns) {
           const key = `${r}:${col}`;
           if (existing.has(key)) continue;
           const baseValue = baseRow.values[col - 1] ?? null;
           const oursValue = oursRow.values[col - 1] ?? null;
           const theirsValue = theirsRow.values[col - 1] ?? null;
+          const colMeta = alignedColumns[col - 1];
           cells.push({
             address: makeAddress(col, r),
             row: r,
             col,
+            baseCol: colMeta?.baseCol ?? null,
+            oursCol: colMeta?.oursCol ?? null,
+            theirsCol: colMeta?.theirsCol ?? null,
             baseValue,
             oursValue,
             theirsValue,
@@ -1215,6 +1828,12 @@ const buildMergeSheetWithRowAlign = (
     cells,
     rowsMeta,
     hasExactDiff,
+    columnsMeta: alignedColumns.map((c, idx) => ({
+      col: idx + 1,
+      baseCol: c.baseCol ?? null,
+      oursCol: c.oursCol ?? null,
+      theirsCol: c.theirsCol ?? null,
+    })),
   };
 };
 
@@ -1341,11 +1960,20 @@ interface MergeCell {
   address: string;
   row: number;
   col: number;
+  baseCol?: number | null;
+  oursCol?: number | null;
+  theirsCol?: number | null;
   baseValue: string | number | null;
   oursValue: string | number | null;
   theirsValue: string | number | null;
   status: 'unchanged' | 'ours-changed' | 'theirs-changed' | 'both-changed-same' | 'conflict';
   mergedValue: string | number | null;
+}
+interface MergeColumnMeta {
+  col: number; // aligned column index (1-based)
+  baseCol: number | null;
+  oursCol: number | null;
+  theirsCol: number | null;
 }
 
 interface MergeSheetData {
@@ -1353,6 +1981,7 @@ interface MergeSheetData {
   cells: MergeCell[];
   rowsMeta?: MergeRowMeta[];
   hasExactDiff?: boolean;
+  columnsMeta?: MergeColumnMeta[];
 }
 
 interface SaveMergeCellInput {
@@ -1367,10 +1996,20 @@ interface SaveMergeRowOp {
   visualRowNumber?: number;
 }
 
+interface SaveMergeColOp {
+  sheetName: string;
+  action: 'insert' | 'delete';
+  targetColNumber: number; // 1-based in template (ours)
+  alignedColNumber?: number; // 1-based aligned column index
+  values?: (string | number | null)[];
+  source?: 'theirs' | 'base' | 'ours';
+}
+
 interface SaveMergeRequest {
   templatePath: string;
   cells: SaveMergeCellInput[];
   rowOps?: SaveMergeRowOp[];
+  colOps?: SaveMergeColOp[];
   basePath?: string;
   oursPath?: string;
   theirsPath?: string;
@@ -1584,10 +2223,11 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
   }
 
   try {
-    const { templatePath, cells, rowOps } = req as {
+    const { templatePath, cells, rowOps, colOps } = req as {
       templatePath: string;
       cells: { sheetName: string; address: string; value: string | number | null }[];
       rowOps?: SaveMergeRowOp[];
+      colOps?: SaveMergeColOp[];
     };
     let targetPath: string | undefined;
 
@@ -1618,6 +2258,74 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
       const ws = workbook.getWorksheet(cellInfo.sheetName) ?? workbook.worksheets[0];
       const cell = ws.getCell(cellInfo.address);
       cell.value = cellInfo.value as any;
+    }
+    if (colOps && colOps.length > 0) {
+      const opsBySheet = new Map<string, SaveMergeColOp[]>();
+      colOps.forEach((op) => {
+        const key = op.sheetName || '';
+        if (!opsBySheet.has(key)) opsBySheet.set(key, []);
+        opsBySheet.get(key)!.push(op);
+      });
+      opsBySheet.forEach((ops, sheetName) => {
+        const ws = workbook.getWorksheet(sheetName) ?? workbook.worksheets[0];
+        const sorted = ops.slice().sort((a, b) => {
+          const va = a.alignedColNumber ?? 0;
+          const vb = b.alignedColNumber ?? 0;
+          if (va !== vb) return va - vb;
+          return a.targetColNumber - b.targetColNumber;
+        });
+        // Process deletes first (sorted by col descending to maintain positions)
+        const deletes = sorted.filter(op => op.action === 'delete').sort((a, b) => b.targetColNumber - a.targetColNumber);
+        for (const op of deletes) {
+          const colNumber = Math.max(1, Math.floor(op.targetColNumber));
+          if (typeof (ws as any).spliceColumns === 'function') {
+            (ws as any).spliceColumns(colNumber, 1);
+          } else {
+            // fallback: manual delete by shifting cells left
+            const maxRow = ws?.actualRowCount ?? ws?.rowCount ?? 0;
+            const maxCol = ws?.actualColumnCount ?? ws?.columnCount ?? 0;
+            for (let r = 1; r <= maxRow; r += 1) {
+              for (let c = colNumber; c < maxCol; c += 1) {
+                const from = ws.getRow(r).getCell(c + 1);
+                const to = ws.getRow(r).getCell(c);
+                to.value = from.value as any;
+              }
+              // Clear last column
+              ws.getRow(r).getCell(maxCol).value = null;
+            }
+          }
+        }
+        // Then process inserts (sorted by aligned col ascending)
+        const inserts = sorted.filter(op => op.action === 'insert');
+        let offset = 0;
+        for (const op of inserts) {
+          const baseCol = Math.max(1, Math.floor(op.targetColNumber));
+          const colNumber = baseCol + offset;
+          const maxRow = Math.max(
+            ws?.actualRowCount ?? ws?.rowCount ?? 0,
+            op.values?.length ?? 0,
+          );
+          const values: (string | number | null)[] = [];
+          for (let i = 0; i < maxRow; i += 1) {
+            values.push(op.values && i < op.values.length ? op.values[i] ?? null : null);
+          }
+          if (typeof (ws as any).spliceColumns === 'function') {
+            (ws as any).spliceColumns(colNumber, 0, values);
+          } else {
+            // fallback: manual insert by shifting cells (rare)
+            for (let r = maxRow; r >= 1; r -= 1) {
+              for (let c = (ws?.actualColumnCount ?? ws?.columnCount ?? 0); c >= colNumber; c -= 1) {
+                const from = ws.getRow(r).getCell(c);
+                const to = ws.getRow(r).getCell(c + 1);
+                to.value = from.value as any;
+              }
+              const cell = ws.getRow(r).getCell(colNumber);
+              cell.value = values[r - 1] ?? null;
+            }
+          }
+          offset += 1;
+        }
+      });
     }
     if (rowOps && rowOps.length > 0) {
       const opsBySheet = new Map<string, SaveMergeRowOp[]>();
@@ -1774,6 +2482,7 @@ interface ThreeWayRowRequest {
   theirsPath: string;
   sheetName?: string;
   sheetIndex?: number; // 0-based
+  frozenRowCount?: number;
   rowNumber?: number; // 1-based fallback for all sides
   baseRowNumber?: number | null;
   oursRowNumber?: number | null;
@@ -1797,6 +2506,7 @@ interface ThreeWayRowsRequest {
   theirsPath: string;
   sheetName?: string;
   sheetIndex?: number; // 0-based
+  frozenRowCount?: number;
   rows: Array<{
     rowNumber?: number;
     baseRowNumber?: number | null;
@@ -1901,22 +2611,34 @@ ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): 
   const theirsWs = getWorksheetSafe(theirsWb, req.sheetName, req.sheetIndex);
 
   const resolvedSheetName = baseWs?.name ?? req.sheetName ?? '';
+  const headerCount =
+    typeof req.frozenRowCount === 'number' && !Number.isNaN(req.frozenRowCount)
+      ? Math.max(0, Math.floor(req.frozenRowCount))
+      : DEFAULT_FROZEN_HEADER_ROWS;
+  const baseWsForAlign = IGNORE_BASE_IN_DIFF ? oursWs : baseWs;
+  const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, headerCount);
+  const colCount = alignedColumns.length;
 
-  const colCount = Math.max(
-    baseWs?.actualColumnCount ?? baseWs?.columnCount ?? 0,
-    oursWs?.actualColumnCount ?? oursWs?.columnCount ?? 0,
-    theirsWs?.actualColumnCount ?? theirsWs?.columnCount ?? 0,
-  );
-
-  const readRow = (ws: any, rowNum: number | null): (string | number | null)[] => {
+  const readRowAligned = (
+    ws: any,
+    rowNum: number | null,
+    side: 'base' | 'ours' | 'theirs',
+  ): (string | number | null)[] => {
     const arr: (string | number | null)[] = [];
     if (!rowNum) {
       for (let col = 1; col <= colCount; col += 1) arr.push(null);
       return arr;
     }
     const row = ws.getRow(rowNum);
-    for (let col = 1; col <= colCount; col += 1) {
-      const cell = row.getCell(col);
+    for (let i = 0; i < alignedColumns.length; i += 1) {
+      const meta = alignedColumns[i];
+      const colNumber =
+        side === 'base' ? meta.baseCol : side === 'ours' ? meta.oursCol : meta.theirsCol;
+      if (!colNumber) {
+        arr.push(null);
+        continue;
+      }
+      const cell = row.getCell(colNumber);
       arr.push(getSimpleValueForThreeWay(cell?.value));
     }
     return arr;
@@ -1929,9 +2651,9 @@ ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): 
     oursRowNumber: oursRowNumber ?? null,
     theirsRowNumber: theirsRowNumber ?? null,
     colCount,
-    base: readRow(baseWs, baseRowNumber ?? null),
-    ours: readRow(oursWs, oursRowNumber ?? null),
-    theirs: readRow(theirsWs, theirsRowNumber ?? null),
+    base: readRowAligned(baseWs, baseRowNumber ?? null, 'base'),
+    ours: readRowAligned(oursWs, oursRowNumber ?? null, 'ours'),
+    theirs: readRowAligned(theirsWs, theirsRowNumber ?? null, 'theirs'),
   };
 });
 ipcMain.handle('excel:getThreeWayRows', async (_event, req: ThreeWayRowsRequest): Promise<ThreeWayRowsResult | null> => {
@@ -1948,22 +2670,34 @@ ipcMain.handle('excel:getThreeWayRows', async (_event, req: ThreeWayRowsRequest)
   const theirsWs = getWorksheetSafe(theirsWb, req.sheetName, req.sheetIndex);
 
   const resolvedSheetName = baseWs?.name ?? req.sheetName ?? '';
+  const headerCount =
+    typeof req.frozenRowCount === 'number' && !Number.isNaN(req.frozenRowCount)
+      ? Math.max(0, Math.floor(req.frozenRowCount))
+      : DEFAULT_FROZEN_HEADER_ROWS;
+  const baseWsForAlign = IGNORE_BASE_IN_DIFF ? oursWs : baseWs;
+  const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, headerCount);
+  const colCount = alignedColumns.length;
 
-  const colCount = Math.max(
-    baseWs?.actualColumnCount ?? baseWs?.columnCount ?? 0,
-    oursWs?.actualColumnCount ?? oursWs?.columnCount ?? 0,
-    theirsWs?.actualColumnCount ?? theirsWs?.columnCount ?? 0,
-  );
-
-  const readRow = (ws: any, rowNum: number | null): (string | number | null)[] => {
+  const readRowAligned = (
+    ws: any,
+    rowNum: number | null,
+    side: 'base' | 'ours' | 'theirs',
+  ): (string | number | null)[] => {
     const arr: (string | number | null)[] = [];
     if (!rowNum) {
       for (let col = 1; col <= colCount; col += 1) arr.push(null);
       return arr;
     }
     const row = ws.getRow(rowNum);
-    for (let col = 1; col <= colCount; col += 1) {
-      const cell = row.getCell(col);
+    for (let i = 0; i < alignedColumns.length; i += 1) {
+      const meta = alignedColumns[i];
+      const colNumber =
+        side === 'base' ? meta.baseCol : side === 'ours' ? meta.oursCol : meta.theirsCol;
+      if (!colNumber) {
+        arr.push(null);
+        continue;
+      }
+      const cell = row.getCell(colNumber);
       arr.push(getSimpleValueForThreeWay(cell?.value));
     }
     return arr;
@@ -1986,9 +2720,9 @@ ipcMain.handle('excel:getThreeWayRows', async (_event, req: ThreeWayRowsRequest)
       oursRowNumber: oursRowNumber ?? null,
       theirsRowNumber: theirsRowNumber ?? null,
       colCount,
-      base: readRow(baseWs, baseRowNumber ?? null),
-      ours: readRow(oursWs, oursRowNumber ?? null),
-      theirs: readRow(theirsWs, theirsRowNumber ?? null),
+      base: readRowAligned(baseWs, baseRowNumber ?? null, 'base'),
+      ours: readRowAligned(oursWs, oursRowNumber ?? null, 'ours'),
+      theirs: readRowAligned(theirsWs, theirsRowNumber ?? null, 'theirs'),
     };
   });
 

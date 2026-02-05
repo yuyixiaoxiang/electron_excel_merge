@@ -1,5 +1,5 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
-import type { MergeCell, MergeRowMeta, RowStatus } from '../main/preload';
+import type { MergeCell, MergeColumnMeta, MergeRowMeta, RowStatus } from '../main/preload';
 import { VirtualGrid, VirtualGridRenderCtx } from './VirtualGrid';
 
 const ROW_HEIGHT = 24; // px, approximate row height for virtualization
@@ -27,6 +27,10 @@ export interface MergeSideBySideProps {
   frozenRowCount?: number;
   /** 主键列（1-based）；传入时会在 diff 视图中额外展示该列 */
   primaryKeyCol?: number;
+  /** 列对齐元信息 */
+  columnsMeta?: MergeColumnMeta[];
+  /** 选择整列（新增列） */
+  onApplyColumnChoice?: (colNumber: number, source: 'ours' | 'theirs') => void;
   /** ours/theirs 文件路径，用于顶部标识 */
   oursPath?: string | null;
   theirsPath?: string | null;
@@ -96,6 +100,8 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   showFullTables,
   fullOursRows,
   fullTheirsRows,
+  columnsMeta,
+  onApplyColumnChoice,
 }) => {
   const useFullTables =
     !!showFullTables && Array.isArray(fullOursRows) && Array.isArray(fullTheirsRows);
@@ -166,6 +172,11 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
     (rowsMeta ?? []).forEach((r) => m.set(r.visualRowNumber, r));
     return m;
   }, [rowsMeta]);
+  const columnsMetaMap = useMemo(() => {
+    const m = new Map<number, MergeColumnMeta>();
+    (columnsMeta ?? []).forEach((c) => m.set(c.col, c));
+    return m;
+  }, [columnsMeta]);
 
   // 差异行号（对齐后的视觉行号）
   const diffRowNumbers = useMemo(() => {
@@ -356,6 +367,13 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
         colNumber: number;
         source: 'ours' | 'theirs';
       }
+    | {
+        type: 'column';
+        x: number;
+        y: number;
+        colNumber: number;
+        source: 'ours' | 'theirs';
+      }
     | null
   >(null);
 
@@ -380,6 +398,26 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
     const rowNumber = diffRowNumbers[gridRowIndex];
     if (!rowNumber) return;
     setContextMenu({ type: 'row', x: e.clientX, y: e.clientY, rowNumber, source });
+  };
+
+  const handleHeaderContextMenu = (
+    source: 'ours' | 'theirs',
+    gridColIndex: number,
+    e: React.MouseEvent<HTMLTableCellElement>,
+  ) => {
+    e.preventDefault();
+    e.stopPropagation();
+    if (useFullTables) return;
+    if (!onApplyColumnChoice) return;
+    const colNumber = displayColumns[gridColIndex];
+    if (!colNumber) return;
+    const meta = columnsMetaMap.get(colNumber);
+    if (!meta) return;
+    // Allow context menu on any column from either side
+    // This enables operations like:
+    // - Deleting ours-only columns by right-clicking on theirs side
+    // - Inserting theirs-only columns by right-clicking on theirs side
+    setContextMenu({ type: 'column', x: e.clientX, y: e.clientY, colNumber, source });
   };
 
   // 框选多选：以 diffRows/diffColumns 的矩形范围来计算选中单元格 key（仅包含存在的 diff cell）
@@ -691,6 +729,9 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
             renderCell={oursRenderCell}
             getCellStyle={oursGetCellStyle}
             renderHeaderCell={renderHeaderCell}
+            onHeaderContextMenu={
+              useFullTables ? undefined : (colIndex, e) => handleHeaderContextMenu('ours', colIndex, e)
+            }
             defaultColWidth={DATA_COL_WIDTH}
             columnWidths={columnWidths}
             onColumnWidthsChange={setColumnWidths}
@@ -716,6 +757,9 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
             renderCell={theirsRenderCell}
             getCellStyle={theirsGetCellStyle}
             renderHeaderCell={renderHeaderCell}
+            onHeaderContextMenu={
+              useFullTables ? undefined : (colIndex, e) => handleHeaderContextMenu('theirs', colIndex, e)
+            }
             defaultColWidth={DATA_COL_WIDTH}
             columnWidths={columnWidths}
             onColumnWidthsChange={setColumnWidths}
@@ -743,7 +787,9 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
             <div style={{ padding: '6px 10px', borderBottom: '1px solid #eee', color: '#666' }}>
               {contextMenu.type === 'row'
                 ? `行 ${contextMenu.rowNumber}`
-                : `单元格 ${colNumberToLabel(contextMenu.colNumber)}${contextMenu.rowNumber}`}
+                : contextMenu.type === 'column'
+                  ? `列 ${colNumberToLabel(contextMenu.colNumber)}`
+                  : `单元格 ${colNumberToLabel(contextMenu.colNumber)}${contextMenu.rowNumber}`}
               （来源：{contextMenu.source}）
             </div>
 
@@ -757,6 +803,19 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
                 }}
               >
                 使用整行单元格数据
+              </button>
+            )}
+
+            {contextMenu.type === 'column' && (
+              <button
+                type="button"
+                style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer' }}
+                onClick={() => {
+                  if (onApplyColumnChoice) onApplyColumnChoice(contextMenu.colNumber, contextMenu.source);
+                  setContextMenu(null);
+                }}
+              >
+                使用本列数据
               </button>
             )}
 
