@@ -1,6 +1,6 @@
-/**
- * 主进程入口：负责创建 Electron 窗口、解析 git/Fork 传入的三方合并参数，
- * 并通过 IPC 向渲染进程提供 Excel 读写与三方 diff / merge 的能力。
+﻿/**
+ * 涓昏繘绋嬪叆鍙ｏ細璐熻矗鍒涘缓 Electron 绐楀彛銆佽В鏋?git/Fork 浼犲叆鐨勪笁鏂瑰悎骞跺弬鏁帮紝
+ * 骞堕€氳繃 IPC 鍚戞覆鏌撹繘绋嬫彁渚?Excel 璇诲啓涓庝笁鏂?diff / merge 鐨勮兘鍔涖€?
  */
 import { app, BrowserWindow, dialog, ipcMain } from 'electron';
 import * as fs from 'fs';
@@ -8,7 +8,7 @@ import * as path from 'path';
 import { spawn } from 'child_process';
 import { Workbook, Worksheet, Row, Cell, CellValue } from 'exceljs';
 
-// 保持对主窗口的引用，避免被 GC 回收导致窗口被意外关闭
+// 淇濇寔瀵逛富绐楀彛鐨勫紩鐢紝閬垮厤琚?GC 鍥炴敹瀵艰嚧绐楀彛琚剰澶栧叧闂?
 let mainWindow: BrowserWindow | null = null;
 
 const isDev = process.env.NODE_ENV === 'development';
@@ -19,12 +19,12 @@ const IGNORE_BASE_IN_DIFF = true;
 /**
  * CLI three-way merge arguments for git/Fork integration.
  *
- * 约定（以 Fork / git mergetool 为例）：
- *   - diff 模式:   app.exe OURS THEIRS
- *   - merge 模式:  app.exe BASE OURS THEIRS [MERGED]
+ * 绾﹀畾锛堜互 Fork / git mergetool 涓轰緥锛夛細
+ *   - diff 妯″紡:   app.exe OURS THEIRS
+ *   - merge 妯″紡:  app.exe BASE OURS THEIRS [MERGED]
  *
- * 当带有 mergedPath 时，保存结果会直接写回 MERGED 文件；
- * 否则会回退到覆盖 ours（当前分支工作区文件）。
+ * 褰撳甫鏈?mergedPath 鏃讹紝淇濆瓨缁撴灉浼氱洿鎺ュ啓鍥?MERGED 鏂囦欢锛?
+ * 鍚﹀垯浼氬洖閫€鍒拌鐩?ours锛堝綋鍓嶅垎鏀伐浣滃尯鏂囦欢锛夈€?
  */
 interface CliThreeWayArgs {
   basePath: string;
@@ -35,14 +35,14 @@ interface CliThreeWayArgs {
 }
 
 /**
- * 从 process.argv 中解析三方合并相关参数。
+ * 浠?process.argv 涓В鏋愪笁鏂瑰悎骞剁浉鍏冲弬鏁般€?
  *
- * - 开发环境下 argv 形如: [electron, main.js, '.', ...args]
- * - 打包后 exe 下 argv 形如: [app.exe, ...args]
+ * - 寮€鍙戠幆澧冧笅 argv 褰㈠: [electron, main.js, '.', ...args]
+ * - 鎵撳寘鍚?exe 涓?argv 褰㈠: [app.exe, ...args]
  */
 const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
-  // 对于开发环境: process.argv = [electron, main.js, '.', ...args]
-  // 对于打包后的 exe: process.argv = [app.exe, ...args]
+  // 瀵逛簬寮€鍙戠幆澧? process.argv = [electron, main.js, '.', ...args]
+  // 瀵逛簬鎵撳寘鍚庣殑 exe: process.argv = [app.exe, ...args]
   const argStartIndex = app?.isPackaged ? 1 : 2;
   const rawArgs = process.argv.slice(argStartIndex);
   const stripOuterQuotes = (s: string) => s.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
@@ -54,7 +54,7 @@ const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
   const userArgs = rawArgs
     .map((arg) => stripOuterQuotes(arg))
     .filter((arg) => !!arg && !arg.startsWith('--'));
-  // 兼容开发模式下 `electron .` 带来的 app path 参数
+  // 鍏煎寮€鍙戞ā寮忎笅 `electron .` 甯︽潵鐨?app path 鍙傛暟
   if (userArgs.length >= 3) {
     const first = userArgs[0];
     const appPath = app.getAppPath ? app.getAppPath() : '';
@@ -71,7 +71,7 @@ const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
     }
   }
 
-  // 2 个参数: 认为是 diff 模式 -> base 与 ours 相同（仅用于计算差异）
+  // 2 涓弬鏁? 璁や负鏄?diff 妯″紡 -> base 涓?ours 鐩稿悓锛堜粎鐢ㄤ簬璁＄畻宸紓锛?
   if (userArgs.length === 2) {
     const [oursPath, theirsPath] = userArgs.map(normalizeCliPath);
     return { basePath: oursPath, oursPath, theirsPath, mode: 'diff' };
@@ -85,7 +85,7 @@ const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
   return { basePath, oursPath, theirsPath, mergedPath, mode: 'merge' };
 };
 
-// 解析启动参数得到的三方合并信息（若无参数则为 null，走交互式模式）
+// 瑙ｆ瀽鍚姩鍙傛暟寰楀埌鐨勪笁鏂瑰悎骞朵俊鎭紙鑻ユ棤鍙傛暟鍒欎负 null锛岃蛋浜や簰寮忔ā寮忥級
 const cliThreeWayArgs: CliThreeWayArgs | null = parseCliThreeWayArgs();
 const getBundledGitInfo = (): { gitPath: string; env: NodeJS.ProcessEnv } | null => {
   const basePath = app?.isPackaged
@@ -108,10 +108,10 @@ const getBundledGitInfo = (): { gitPath: string; env: NodeJS.ProcessEnv } | null
 };
 
 /**
- * 尝试在目标文件所在目录执行一次 `git add <filePath>`，
- * 方便在作为 merge tool 运行时自动标记冲突已解决。
+ * 灏濊瘯鍦ㄧ洰鏍囨枃浠舵墍鍦ㄧ洰褰曟墽琛屼竴娆?`git add <filePath>`锛?
+ * 鏂逛究鍦ㄤ綔涓?merge tool 杩愯鏃惰嚜鍔ㄦ爣璁板啿绐佸凡瑙ｅ喅銆?
  *
- * 注意：这里做的是“尽力而为”的操作，失败只会打印日志，不会中断主流程。
+ * 娉ㄦ剰锛氳繖閲屽仛鐨勬槸鈥滃敖鍔涜€屼负鈥濈殑鎿嶄綔锛屽け璐ュ彧浼氭墦鍗版棩蹇楋紝涓嶄細涓柇涓绘祦绋嬨€?
  */
 const gitAddFile = (filePath: string): Promise<void> => {
   return new Promise((resolve) => {
@@ -135,10 +135,10 @@ const gitAddFile = (filePath: string): Promise<void> => {
 };
 
 /**
- * 创建主浏览器窗口并加载前端页面。
+ * 鍒涘缓涓绘祻瑙堝櫒绐楀彛骞跺姞杞藉墠绔〉闈€?
  *
- * 开发模式下连接本地 webpack dev server，
- * 生产模式下加载打包到 dist 中的 index.html。
+ * 寮€鍙戞ā寮忎笅杩炴帴鏈湴 webpack dev server锛?
+ * 鐢熶骇妯″紡涓嬪姞杞芥墦鍖呭埌 dist 涓殑 index.html銆?
  */
 function createWindow() {
   mainWindow = new BrowserWindow({
@@ -218,40 +218,42 @@ interface AlignedRow {
 }
 
 /**
- * 将 ExcelJS 的复杂单元格值转换为简单值（string | number | null）。
+ * 灏?ExcelJS 鐨勫鏉傚崟鍏冩牸鍊艰浆鎹负绠€鍗曞€硷紙string | number | null锛夈€?
  * 
- * ExcelJS 的单元格值可能是：
- * - 简单类型：string、number
- * - 富文本：{ richText: [{text: '...'}] }
- * - 公式：{ formula: '...', result: value }
- * - 超链接等其他对象类型
+ * ExcelJS 鐨勫崟鍏冩牸鍊煎彲鑳芥槸锛?
+ * - 绠€鍗曠被鍨嬶細string銆乶umber
+ * - 瀵屾枃鏈細{ richText: [{text: '...'}] }
+ * - 鍏紡锛歿 formula: '...', result: value }
+ * - 瓒呴摼鎺ョ瓑鍏朵粬瀵硅薄绫诲瀷
  * 
- * 该函数统一提取其中的实际文本/数值内容，忽略格式信息。
+ * 璇ュ嚱鏁扮粺涓€鎻愬彇鍏朵腑鐨勫疄闄呮枃鏈?鏁板€煎唴瀹癸紝蹇界暐鏍煎紡淇℃伅銆?
  */
 const getSimpleValueForMerge = (v: any): SimpleCellValue => {
   if (v === null || v === undefined) return null;
-  // 处理富文本：拼接所有文本片段
+  // 澶勭悊鏃ユ湡瀵硅薄锛氳浆涓?ISO 瀛楃涓诧紝淇濇寔涓?excel:open 涓?getSimpleValue 涓€鑷?
+  if (v instanceof Date) return v.toISOString();
+  // 澶勭悊瀵屾枃鏈細鎷兼帴鎵€鏈夋枃鏈墖娈?
   if (typeof v === 'object' && Array.isArray((v as any).richText)) {
     const parts = (v as any).richText
       .map((p: any) => (p && typeof p.text === 'string' ? p.text : ''))
       .join('');
     return parts;
   }
-  // 处理超链接等包含 text 属性的对象
+  // 澶勭悊瓒呴摼鎺ョ瓑鍖呭惈 text 灞炴€х殑瀵硅薄
   if (typeof v === 'object' && 'text' in v) return (v as any).text ?? null;
-  // 处理公式单元格：取计算结果
+  // 澶勭悊鍏紡鍗曞厓鏍硷細鍙栬绠楃粨鏋?
   if (typeof v === 'object' && 'result' in v) return (v as any).result ?? null;
-  // 简单类型直接返回
+  // 绠€鍗曠被鍨嬬洿鎺ヨ繑鍥?
   if (typeof v === 'string' || typeof v === 'number') return v;
-  // 其他类型转字符串
+  // 鍏朵粬绫诲瀷杞瓧绗︿覆
   return String(v);
 };
 
 /**
- * 将单元格值标准化为字符串，用于比较和显示。
- * - null/undefined → 空字符串
- * - 字符串 → 去除首尾空格
- * - 数字 → 转字符串
+ * 灏嗗崟鍏冩牸鍊兼爣鍑嗗寲涓哄瓧绗︿覆锛岀敤浜庢瘮杈冨拰鏄剧ず銆?
+ * - null/undefined 鈫?绌哄瓧绗︿覆
+ * - 瀛楃涓?鈫?鍘婚櫎棣栧熬绌烘牸
+ * - 鏁板瓧 鈫?杞瓧绗︿覆
  */
 const normalizeCellValue = (v: SimpleCellValue): string => {
   if (v === null || v === undefined) return '';
@@ -261,8 +263,8 @@ const normalizeCellValue = (v: SimpleCellValue): string => {
 };
 
 /**
- * 标准化主键列的值，用于行对齐。
- * 空字符串视为 null（即无主键），方便后续判断。
+ * 鏍囧噯鍖栦富閿垪鐨勫€硷紝鐢ㄤ簬琛屽榻愩€?
+ * 绌哄瓧绗︿覆瑙嗕负 null锛堝嵆鏃犱富閿級锛屾柟渚垮悗缁垽鏂€?
  */
 const normalizeKeyValue = (v: SimpleCellValue): string | null => {
   const s = normalizeCellValue(v);
@@ -270,8 +272,8 @@ const normalizeKeyValue = (v: SimpleCellValue): string | null => {
 };
 
 /**
- * 标准化表头文本，用于列匹配。
- * 转为小写以忽略大小写差异。
+ * 鏍囧噯鍖栬〃澶存枃鏈紝鐢ㄤ簬鍒楀尮閰嶃€?
+ * 杞负灏忓啓浠ュ拷鐣ュぇ灏忓啓宸紓銆?
  */
 const normalizeHeaderText = (v: SimpleCellValue): string => {
   const s = normalizeCellValue(v);
@@ -279,13 +281,13 @@ const normalizeHeaderText = (v: SimpleCellValue): string => {
   return s.toLowerCase();
 };
 /**
- * 生成更强的表头匹配键，用于精确匹配列。
- * - 转小写
- * - 去除所有空白
- * - 只保留字母、数字、中文字符
+ * 鐢熸垚鏇村己鐨勮〃澶村尮閰嶉敭锛岀敤浜庣簿纭尮閰嶅垪銆?
+ * - 杞皬鍐?
+ * - 鍘婚櫎鎵€鏈夌┖鐧?
+ * - 鍙繚鐣欏瓧姣嶃€佹暟瀛椼€佷腑鏂囧瓧绗?
  * 
- * 例如："Icon名称, Asset..." → "icon名称asset"
- * 这样即使格式略有不同，也能匹配上相同语义的列。
+ * 渚嬪锛?Icon鍚嶇О, Asset..." 鈫?"icon鍚嶇Оasset"
+ * 杩欐牱鍗充娇鏍煎紡鐣ユ湁涓嶅悓锛屼篃鑳藉尮閰嶄笂鐩稿悓璇箟鐨勫垪銆?
  */
 const normalizeHeaderKey = (text: string): string => {
   if (!text) return '';
@@ -296,20 +298,20 @@ const normalizeHeaderKey = (text: string): string => {
 };
 
 /**
- * 为工作表的每一列提取特征信息，用于列对齐算法。
+ * 涓哄伐浣滆〃鐨勬瘡涓€鍒楁彁鍙栫壒寰佷俊鎭紝鐢ㄤ簬鍒楀榻愮畻娉曘€?
  * 
- * @param ws ExcelJS 工作表对象
- * @param headerCount 表头行数（前N行视为表头）
- * @param sampleRows 采样行数（用于类型和样本值统计）
- * @returns 列特征记录数组
+ * @param ws ExcelJS 宸ヤ綔琛ㄥ璞?
+ * @param headerCount 琛ㄥご琛屾暟锛堝墠N琛岃涓鸿〃澶达級
+ * @param sampleRows 閲囨牱琛屾暟锛堢敤浜庣被鍨嬪拰鏍锋湰鍊肩粺璁★級
+ * @returns 鍒楃壒寰佽褰曟暟缁?
  * 
- * 特征包括：
- * 1. headerText: 表头文本（多行用 | 分隔）
- * 2. headerKey: 标准化的表头键（用于精确匹配）
- * 3. typeSig: 数据类型签名（num/str/empty/other 的分布）
- * 4. sampleValues: 样本值集合（用于内容相似度比较）
+ * 鐗瑰緛鍖呮嫭锛?
+ * 1. headerText: 琛ㄥご鏂囨湰锛堝琛岀敤 | 鍒嗛殧锛?
+ * 2. headerKey: 鏍囧噯鍖栫殑琛ㄥご閿紙鐢ㄤ簬绮剧‘鍖归厤锛?
+ * 3. typeSig: 鏁版嵁绫诲瀷绛惧悕锛坣um/str/empty/other 鐨勫垎甯冿級
+ * 4. sampleValues: 鏍锋湰鍊奸泦鍚堬紙鐢ㄤ簬鍐呭鐩镐技搴︽瘮杈冿級
  * 
- * 注意：完全空的列（表头和数据都为空）会被跳过，不生成记录。
+ * 娉ㄦ剰锛氬畬鍏ㄧ┖鐨勫垪锛堣〃澶村拰鏁版嵁閮戒负绌猴級浼氳璺宠繃锛屼笉鐢熸垚璁板綍銆?
  */
 const buildColumnRecords = (
   ws: any,
@@ -317,14 +319,14 @@ const buildColumnRecords = (
   sampleRows: number,
 ): ColumnRecord[] => {
   if (!ws) return [];
-  // 获取工作表实际列数
+  // 鑾峰彇宸ヤ綔琛ㄥ疄闄呭垪鏁?
   const actualColCount = Math.max(ws?.actualColumnCount ?? 0, ws?.columnCount ?? 0);
   const maxRow = Math.max(ws?.actualRowCount ?? 0, ws?.rowCount ?? 0, headerCount);
   const records: ColumnRecord[] = [];
   
-  // 遍历每一列
+  // 閬嶅巻姣忎竴鍒?
   for (let col = 1; col <= actualColCount; col += 1) {
-    // 1. 提取表头文本（拼接前 headerCount 行）
+    // 1. 鎻愬彇琛ㄥご鏂囨湰锛堟嫾鎺ュ墠 headerCount 琛岋級
     const headerParts: string[] = [];
     for (let r = 1; r <= headerCount; r += 1) {
       const row = ws.getRow(r);
@@ -369,13 +371,13 @@ const buildColumnRecords = (
 };
 
 /**
- * 计算两个字符串的相似度（使用 Levenshtein 距离）。
+ * 璁＄畻涓や釜瀛楃涓茬殑鐩镐技搴︼紙浣跨敤 Levenshtein 璺濈锛夈€?
  * 
- * @returns 0-1 之间的相似度，1 表示完全相同，0 表示完全不同。
+ * @returns 0-1 涔嬮棿鐨勭浉浼煎害锛? 琛ㄧず瀹屽叏鐩稿悓锛? 琛ㄧず瀹屽叏涓嶅悓銆?
  * 
- * 算法：Levenshtein 跍离算法（动态规划）
- * - 计算将字符串 a 转换为 b 所需的最小编辑步骤（插入、删除、替换）
- * - 相似度 = 1 - (跍离 / 较长字符串长度)
+ * 绠楁硶锛歀evenshtein 璺嶇绠楁硶锛堝姩鎬佽鍒掞級
+ * - 璁＄畻灏嗗瓧绗︿覆 a 杞崲涓?b 鎵€闇€鐨勬渶灏忕紪杈戞楠わ紙鎻掑叆銆佸垹闄ゃ€佹浛鎹級
+ * - 鐩镐技搴?= 1 - (璺嶇 / 杈冮暱瀛楃涓查暱搴?
  */
 const stringSimilarity = (a: string, b: string): number => {
   if (!a && !b) return 1;
@@ -386,37 +388,37 @@ const stringSimilarity = (a: string, b: string): number => {
   const n = s.length;
   const m = t.length;
   if (n === 0 || m === 0) return 0;
-  // 动态规划计算编辑距离
+  // 鍔ㄦ€佽鍒掕绠楃紪杈戣窛绂?
   const dp = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
-  // 初始化：第i个字符转换为空需要i步
+  // 鍒濆鍖栵細绗琲涓瓧绗﹁浆鎹负绌洪渶瑕乮姝?
   for (let i = 0; i <= n; i += 1) dp[i][0] = i;
   for (let j = 0; j <= m; j += 1) dp[0][j] = j;
-  // 填表：计算每个子问题的最小编辑距离
+  // 濉〃锛氳绠楁瘡涓瓙闂鐨勬渶灏忕紪杈戣窛绂?
   for (let i = 1; i <= n; i += 1) {
     for (let j = 1; j <= m; j += 1) {
-      const cost = s[i - 1] === t[j - 1] ? 0 : 1;  // 字符相同无需替换
+      const cost = s[i - 1] === t[j - 1] ? 0 : 1;  // 瀛楃鐩稿悓鏃犻渶鏇挎崲
       dp[i][j] = Math.min(
-        dp[i - 1][j] + 1,       // 删除
-        dp[i][j - 1] + 1,       // 插入
-        dp[i - 1][j - 1] + cost, // 替换
+        dp[i - 1][j] + 1,       // 鍒犻櫎
+        dp[i][j - 1] + 1,       // 鎻掑叆
+        dp[i - 1][j - 1] + cost, // 鏇挎崲
       );
     }
   }
   const dist = dp[n][m];
-  // 归一化为 0-1 之间的相似度
+  // 褰掍竴鍖栦负 0-1 涔嬮棿鐨勭浉浼煎害
   return 1 - dist / Math.max(n, m);
 };
 
 /**
- * 计算两个列的数据类型签名相似度。
+ * 璁＄畻涓や釜鍒楃殑鏁版嵁绫诲瀷绛惧悕鐩镐技搴︺€?
  * 
- * 类型签名 = { num, str, empty, other } 的分布比例。
- * 相似度 = 1 - (比例差异的总和 / 2)。
+ * 绫诲瀷绛惧悕 = { num, str, empty, other } 鐨勫垎甯冩瘮渚嬨€?
+ * 鐩镐技搴?= 1 - (姣斾緥宸紓鐨勬€诲拰 / 2)銆?
  * 
- * 例如：
- * - A列：80% 数字，20% 字符串
- * - B列：85% 数字，15% 字符串
- * - 相似度很高，很可能是同一列
+ * 渚嬪锛?
+ * - A鍒楋細80% 鏁板瓧锛?0% 瀛楃涓?
+ * - B鍒楋細85% 鏁板瓧锛?5% 瀛楃涓?
+ * - 鐩镐技搴﹀緢楂橈紝寰堝彲鑳芥槸鍚屼竴鍒?
  */
 const typeSignatureSimilarity = (a: ColumnTypeSignature, b: ColumnTypeSignature): number => {
   const totalA = a.num + a.str + a.empty + a.other;
@@ -584,7 +586,7 @@ const buildAlignedColumns = (
   }
 
   if (baseRefCols.length === 0) {
-    // base/ours 모두为空时，直接按 theirs 追加
+    // base/ours 氇憪涓虹┖鏃讹紝鐩存帴鎸?theirs 杩藉姞
     for (const c of theirsCols) {
       aligned.push({ theirsCol: c.colNumber ?? null });
     }
@@ -605,28 +607,28 @@ const colNumberToLabel = (colNumber: number): string => {
 };
 
 /**
- * 从工作表中提取行记录（未对齐版本，用于单文件或列对齐前）。
+ * 浠庡伐浣滆〃涓彁鍙栬璁板綍锛堟湭瀵归綈鐗堟湰锛岀敤浜庡崟鏂囦欢鎴栧垪瀵归綈鍓嶏級銆?
  * 
- * @param ws ExcelJS 工作表对象
- * @param colCount 列数
- * @param primaryKeyCol 主键列号（1-based，-1 表示无主键）
- * @returns 行记录数组，每条记录包含：
- *   - rowNumber: Excel 中的原始行号
- *   - index: 在提取列表中的索引
- *   - values: 所有列的值数组
- *   - nonEmptyCols: 非空列的列号列表
- *   - key: 主键值（如果有）
+ * @param ws ExcelJS 宸ヤ綔琛ㄥ璞?
+ * @param colCount 鍒楁暟
+ * @param primaryKeyCol 涓婚敭鍒楀彿锛?-based锛?1 琛ㄧず鏃犱富閿級
+ * @returns 琛岃褰曟暟缁勶紝姣忔潯璁板綍鍖呭惈锛?
+ *   - rowNumber: Excel 涓殑鍘熷琛屽彿
+ *   - index: 鍦ㄦ彁鍙栧垪琛ㄤ腑鐨勭储寮?
+ *   - values: 鎵€鏈夊垪鐨勫€兼暟缁?
+ *   - nonEmptyCols: 闈炵┖鍒楃殑鍒楀彿鍒楄〃
+ *   - key: 涓婚敭鍊硷紙濡傛灉鏈夛級
  * 
- * 注意：完全空的行会被跳过。
+ * 娉ㄦ剰锛氬畬鍏ㄧ┖鐨勮浼氳璺宠繃銆?
  */
 const buildRowRecords = (ws: any, colCount: number, primaryKeyCol: number): RowRecord[] => {
   const rows: RowRecord[] = [];
   let index = 0;
-  // 遍历所有非空行
+  // 閬嶅巻鎵€鏈夐潪绌鸿
   ws.eachRow({ includeEmpty: false }, (row: any, rowNumber: number) => {
     const values: SimpleCellValue[] = [];
     const nonEmptyCols: number[] = [];
-    // 读取每一列的值
+    // 璇诲彇姣忎竴鍒楃殑鍊?
     for (let col = 1; col <= colCount; col += 1) {
       const cell = row.getCell(col);
       const value = getSimpleValueForMerge(cell?.value);
@@ -635,9 +637,9 @@ const buildRowRecords = (ws: any, colCount: number, primaryKeyCol: number): RowR
         nonEmptyCols.push(col);
       }
     }
-    // 跳过完全空的行
+    // 璺宠繃瀹屽叏绌虹殑琛?
     if (nonEmptyCols.length === 0) return;
-    // 提取主键值（如果有指定主键列）
+    // 鎻愬彇涓婚敭鍊硷紙濡傛灉鏈夋寚瀹氫富閿垪锛?
     const key =
       primaryKeyCol >= 1 && primaryKeyCol <= colCount
         ? normalizeKeyValue(values[primaryKeyCol - 1])
@@ -674,20 +676,20 @@ const buildHeaderRowRecord = (ws: any, rowNumber: number, colCount: number, prim
 };
 
 /**
- * 从工作表中提取行记录（列对齐版本）。
+ * 浠庡伐浣滆〃涓彁鍙栬璁板綍锛堝垪瀵归綈鐗堟湰锛夈€?
  * 
- * 与 buildRowRecords 的区别：
- * - 使用对齐后的列顺序
- * - 根据 side 参数从对应的物理列读取值
- * - 如果某一列在该 side 不存在，对应位置填 null
+ * 涓?buildRowRecords 鐨勫尯鍒細
+ * - 浣跨敤瀵归綈鍚庣殑鍒楅『搴?
+ * - 鏍规嵁 side 鍙傛暟浠庡搴旂殑鐗╃悊鍒楄鍙栧€?
+ * - 濡傛灉鏌愪竴鍒楀湪璇?side 涓嶅瓨鍦紝瀵瑰簲浣嶇疆濉?null
  * 
- * @param alignedColumns 对齐后的列元信息
- * @param primaryKeyColAligned 主键列在对齐后序列中的位置
- * @param side 当前处理的是 base/ours/theirs 哪一侧
+ * @param alignedColumns 瀵归綈鍚庣殑鍒楀厓淇℃伅
+ * @param primaryKeyColAligned 涓婚敭鍒楀湪瀵归綈鍚庡簭鍒椾腑鐨勪綅缃?
+ * @param side 褰撳墠澶勭悊鐨勬槸 base/ours/theirs 鍝竴渚?
  * 
- * 例如：
+ * 渚嬪锛?
  * - alignedColumns[2] = { baseCol: 3, oursCol: null, theirsCol: 2 }
- * - 对于 ours 侧，第3个对齐列的值会是 null（因为 ours 没有这一列）
+ * - 瀵逛簬 ours 渚э紝绗?涓榻愬垪鐨勫€间細鏄?null锛堝洜涓?ours 娌℃湁杩欎竴鍒楋級
  */
 const buildRowRecordsAligned = (
   ws: any,
@@ -700,14 +702,14 @@ const buildRowRecordsAligned = (
   ws.eachRow({ includeEmpty: false }, (row: any, rowNumber: number) => {
     const values: SimpleCellValue[] = [];
     const nonEmptyCols: number[] = [];
-    // 按照对齐后的列顺序读取值
+    // 鎸夌収瀵归綈鍚庣殑鍒楅『搴忚鍙栧€?
     for (let i = 0; i < alignedColumns.length; i += 1) {
       const colMeta = alignedColumns[i];
-      // 根据 side 获取对应的物理列号
+      // 鏍规嵁 side 鑾峰彇瀵瑰簲鐨勭墿鐞嗗垪鍙?
       const colNumber =
         side === 'base' ? colMeta.baseCol : side === 'ours' ? colMeta.oursCol : colMeta.theirsCol;
       let value: SimpleCellValue = null;
-      // 如果该 side 有这一列，则读取值；否则为 null
+      // 濡傛灉璇?side 鏈夎繖涓€鍒楋紝鍒欒鍙栧€硷紱鍚﹀垯涓?null
       if (colNumber) {
         const cell = row.getCell(colNumber);
         value = getSimpleValueForMerge(cell?.value);
@@ -762,17 +764,17 @@ const buildHeaderRowRecordAligned = (
 };
 
 /**
- * 判断两行是否完全相等。
+ * 鍒ゆ柇涓よ鏄惁瀹屽叏鐩哥瓑銆?
  * 
- * 相等的定义：所有非空列的值完全相同。
- * 只比较两行中至少有一行非空的列。
+ * 鐩哥瓑鐨勫畾涔夛細鎵€鏈夐潪绌哄垪鐨勫€煎畬鍏ㄧ浉鍚屻€?
+ * 鍙瘮杈冧袱琛屼腑鑷冲皯鏈変竴琛岄潪绌虹殑鍒椼€?
  */
 const rowsEqual = (a: RowRecord, b: RowRecord): boolean => {
-  // 收集两行的所有非空列
+  // 鏀堕泦涓よ鐨勬墍鏈夐潪绌哄垪
   const cols = new Set<number>();
   a.nonEmptyCols.forEach((c) => cols.add(c));
   b.nonEmptyCols.forEach((c) => cols.add(c));
-  // 逐列比较
+  // 閫愬垪姣旇緝
   for (const col of cols) {
     const av = normalizeCellValue(a.values[col - 1] ?? null);
     const bv = normalizeCellValue(b.values[col - 1] ?? null);
@@ -782,19 +784,19 @@ const rowsEqual = (a: RowRecord, b: RowRecord): boolean => {
 };
 
 /**
- * 计算两行的相似度。
+ * 璁＄畻涓よ鐨勭浉浼煎害銆?
  * 
- * @returns 0-1 之间的相似度，1 表示完全相同。
+ * @returns 0-1 涔嬮棿鐨勭浉浼煎害锛? 琛ㄧず瀹屽叏鐩稿悓銆?
  * 
- * 算法：
- * 1. 收集两行的所有非空列
- * 2. 计算相同值的列数 / 总列数
- * 3. 跳过两边都为空的列（不计入总数）
+ * 绠楁硶锛?
+ * 1. 鏀堕泦涓よ鐨勬墍鏈夐潪绌哄垪
+ * 2. 璁＄畻鐩稿悓鍊肩殑鍒楁暟 / 鎬诲垪鏁?
+ * 3. 璺宠繃涓よ竟閮戒负绌虹殑鍒楋紙涓嶈鍏ユ€绘暟锛?
  * 
- * 例如：
- * - A行: [1, "abc", null, "xyz"]
- * - B行: [1, "abc", "new", "xyz"]
- * - 相似度 = 3/4 = 0.75（第3列不同）
+ * 渚嬪锛?
+ * - A琛? [1, "abc", null, "xyz"]
+ * - B琛? [1, "abc", "new", "xyz"]
+ * - 鐩镐技搴?= 3/4 = 0.75锛堢3鍒椾笉鍚岋級
  */
 const rowSimilarity = (a: RowRecord, b: RowRecord): number => {
   const cols = new Set<number>();
@@ -806,7 +808,7 @@ const rowSimilarity = (a: RowRecord, b: RowRecord): number => {
   for (const col of cols) {
     const av = normalizeCellValue(a.values[col - 1] ?? null);
     const bv = normalizeCellValue(b.values[col - 1] ?? null);
-    // 跳过两边都为空的列
+    // 璺宠繃涓よ竟閮戒负绌虹殑鍒?
     if (av === '' && bv === '') continue;
     total += 1;
     if (av === bv) same += 1;
@@ -816,14 +818,14 @@ const rowSimilarity = (a: RowRecord, b: RowRecord): number => {
 };
 
 /**
- * 计算行的状态（基于三方对比）。
+ * 璁＄畻琛岀殑鐘舵€侊紙鍩轰簬涓夋柟瀵规瘮锛夈€?
  * 
- * @returns 行状态：
- *   - 'ambiguous': 匹配有歧义（多个候选行）
- *   - 'added': 新增行（base 没有，side 有）
- *   - 'deleted': 删除行（base 有，side 没有）
- *   - 'unchanged': 未变化（内容完全相同）
- *   - 'modified': 修改行（内容不同）
+ * @returns 琛岀姸鎬侊細
+ *   - 'ambiguous': 鍖归厤鏈夋涔夛紙澶氫釜鍊欓€夎锛?
+ *   - 'added': 鏂板琛岋紙base 娌℃湁锛宻ide 鏈夛級
+ *   - 'deleted': 鍒犻櫎琛岋紙base 鏈夛紝side 娌℃湁锛?
+ *   - 'unchanged': 鏈彉鍖栵紙鍐呭瀹屽叏鐩稿悓锛?
+ *   - 'modified': 淇敼琛岋紙鍐呭涓嶅悓锛?
  */
 const computeRowStatus = (
   baseRow: RowRecord | null | undefined,
@@ -870,53 +872,53 @@ type DiffOp =
   | { type: 'delete'; aIndex: number }
   | { type: 'insert'; bIndex: number };
 /**
- * 计算最长公共子序列（LCS）并返回匹配对。
+ * 璁＄畻鏈€闀垮叕鍏卞瓙搴忓垪锛圠CS锛夊苟杩斿洖鍖归厤瀵广€?
  * 
- * 用于列/行对齐的锁点匹配：找到两个序列中确定相同的元素作为“锁点”。
+ * 鐢ㄤ簬鍒?琛屽榻愮殑閿佺偣鍖归厤锛氭壘鍒颁袱涓簭鍒椾腑纭畾鐩稿悓鐨勫厓绱犱綔涓衡€滈攣鐐光€濄€?
  * 
- * @param a 第一个字符串数组
- * @param b 第二个字符串数组
- * @returns 匹配对数组，按照出现顺序排列
+ * @param a 绗竴涓瓧绗︿覆鏁扮粍
+ * @param b 绗簩涓瓧绗︿覆鏁扮粍
+ * @returns 鍖归厤瀵规暟缁勶紝鎸夌収鍑虹幇椤哄簭鎺掑垪
  * 
- * 例如：
+ * 渚嬪锛?
  * - a = ["A", "B", "C", "D"]
  * - b = ["A", "X", "B", "D"]
- * - 返回: [{ aIndex: 0, bIndex: 0 }, { aIndex: 1, bIndex: 2 }, { aIndex: 3, bIndex: 3 }]
- * - 即 A, B, D 三个元素是公共的
+ * - 杩斿洖: [{ aIndex: 0, bIndex: 0 }, { aIndex: 1, bIndex: 2 }, { aIndex: 3, bIndex: 3 }]
+ * - 鍗?A, B, D 涓変釜鍏冪礌鏄叕鍏辩殑
  * 
- * 算法：动态规划 + 回溯
- * - dp[i][j] = a[0..i-1] 和 b[0..j-1] 的 LCS 长度
- * - 回溯找到实际匹配的位置
+ * 绠楁硶锛氬姩鎬佽鍒?+ 鍥炴函
+ * - dp[i][j] = a[0..i-1] 鍜?b[0..j-1] 鐨?LCS 闀垮害
+ * - 鍥炴函鎵惧埌瀹為檯鍖归厤鐨勪綅缃?
  */
 const lcsMatchPairs = (a: string[], b: string[]): Array<{ aIndex: number; bIndex: number }> => {
   const n = a.length;
   const m = b.length;
-  // 动态规划表：dp[i][j] = LCS 长度
+  // 鍔ㄦ€佽鍒掕〃锛歞p[i][j] = LCS 闀垮害
   const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
-  // 填表：计算 LCS 长度
+  // 濉〃锛氳绠?LCS 闀垮害
   for (let i = 1; i <= n; i += 1) {
     for (let j = 1; j <= m; j += 1) {
-      if (a[i - 1] === b[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;  // 匹配，长度+1
-      else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);        // 不匹配，取最大值
+      if (a[i - 1] === b[j - 1]) dp[i][j] = dp[i - 1][j - 1] + 1;  // 鍖归厤锛岄暱搴?1
+      else dp[i][j] = Math.max(dp[i - 1][j], dp[i][j - 1]);        // 涓嶅尮閰嶏紝鍙栨渶澶у€?
     }
   }
-  // 回溯：从 dp 表中提取实际匹配对
+  // 鍥炴函锛氫粠 dp 琛ㄤ腑鎻愬彇瀹為檯鍖归厤瀵?
   const pairs: Array<{ aIndex: number; bIndex: number }> = [];
   let i = n;
   let j = m;
   while (i > 0 && j > 0) {
     if (a[i - 1] === b[j - 1]) {
-      // 当前元素匹配，记录并继续回溯
+      // 褰撳墠鍏冪礌鍖归厤锛岃褰曞苟缁х画鍥炴函
       pairs.push({ aIndex: i - 1, bIndex: j - 1 });
       i -= 1;
       j -= 1;
     } else if (dp[i - 1][j] >= dp[i][j - 1]) {
-      i -= 1;  // 向上回溯
+      i -= 1;  // 鍚戜笂鍥炴函
     } else {
-      j -= 1;  // 向左回溯
+      j -= 1;  // 鍚戝乏鍥炴函
     }
   }
-  // 回溯是从后往前，需要反转
+  // 鍥炴函鏄粠鍚庡線鍓嶏紝闇€瑕佸弽杞?
   return pairs.reverse();
 };
 
@@ -984,27 +986,27 @@ const myersDiff = (a: string[], b: string[]): DiffOp[] => {
 };
 
 /**
- * 基于主键列对齐行。
+ * 鍩轰簬涓婚敭鍒楀榻愯銆?
  * 
- * 这是行对齐的主要方法，适用于有唯一标识列（如 ID）的数据。
+ * 杩欐槸琛屽榻愮殑涓昏鏂规硶锛岄€傜敤浜庢湁鍞竴鏍囪瘑鍒楋紙濡?ID锛夌殑鏁版嵁銆?
  * 
- * @param baseRows base 的行记录
- * @param oursRows ours 的行记录
- * @param theirsRows theirs 的行记录
- * @param keyCol 主键列号（1-based）
- * @param rowSimilarityThreshold 相似度阈值（用于歧义检测）
- * @returns 对齐结果 + 歧义行集合
+ * @param baseRows base 鐨勮璁板綍
+ * @param oursRows ours 鐨勮璁板綍
+ * @param theirsRows theirs 鐨勮璁板綍
+ * @param keyCol 涓婚敭鍒楀彿锛?-based锛?
+ * @param rowSimilarityThreshold 鐩镐技搴﹂槇鍊硷紙鐢ㄤ簬姝т箟妫€娴嬶級
+ * @returns 瀵归綈缁撴灉 + 姝т箟琛岄泦鍚?
  * 
- * 算法步骤：
- * 1. 按主键值分组：Map<key, RowRecord[]>
- * 2. 对每个主键值：
- *    - 如果 base/ours/theirs 都有且每侧只有 1 条 → 直接匹配
- *    - 如果某侧有多条相同主键 → 检测歧义（相似度匹配）
- * 3. 返回对齐后的三元组：(base, ours, theirs)
+ * 绠楁硶姝ラ锛?
+ * 1. 鎸変富閿€煎垎缁勶細Map<key, RowRecord[]>
+ * 2. 瀵规瘡涓富閿€硷細
+ *    - 濡傛灉 base/ours/theirs 閮芥湁涓旀瘡渚у彧鏈?1 鏉?鈫?鐩存帴鍖归厤
+ *    - 濡傛灉鏌愪晶鏈夊鏉＄浉鍚屼富閿?鈫?妫€娴嬫涔夛紙鐩镐技搴﹀尮閰嶏級
+ * 3. 杩斿洖瀵归綈鍚庣殑涓夊厓缁勶細(base, ours, theirs)
  * 
- * 歧义场景：
- * - 主键值相同但其他列内容不同的多行
- * - 此时无法确定哪一行对应哪一行，标记为 ambiguous
+ * 姝т箟鍦烘櫙锛?
+ * - 涓婚敭鍊肩浉鍚屼絾鍏朵粬鍒楀唴瀹逛笉鍚岀殑澶氳
+ * - 姝ゆ椂鏃犳硶纭畾鍝竴琛屽搴斿摢涓€琛岋紝鏍囪涓?ambiguous
  */
 const alignRowsByKey = (
   baseRows: RowRecord[],
@@ -1269,7 +1271,7 @@ const alignRowsBySequence = (
     const unmatchedDeletes = new Set<number>(deletes);
     const unmatchedInserts = new Set<number>(inserts);
 
-    // 优先匹配“完全相同”的行（token 相同），避免重复行造成错配
+    // 浼樺厛鍖归厤鈥滃畬鍏ㄧ浉鍚屸€濈殑琛岋紙token 鐩稿悓锛夛紝閬垮厤閲嶅琛岄€犳垚閿欓厤
     const insertByToken = new Map<string, number[]>();
     for (const idx of unmatchedInserts) {
       const token = sideTokens[idx] ?? '';
@@ -1282,7 +1284,7 @@ const alignRowsBySequence = (
       const token = baseTokens[baseIndex] ?? '';
       const list = insertByToken.get(token);
       if (!list || list.length === 0) return null;
-      // 选择距离期望位置最近的插入点
+      // 閫夋嫨璺濈鏈熸湜浣嶇疆鏈€杩戠殑鎻掑叆鐐?
       const matchedPairs = Array.from(matched.entries()).map(([baseIndex, sideIndex]) => ({ baseIndex, sideIndex }));
       matchedPairs.sort((a, b) => a.baseIndex - b.baseIndex);
       const expected = estimateSideIndex(baseIndex, matchedPairs);
@@ -1583,7 +1585,7 @@ const buildMergeSheetWithRowAlign = (
         if (raw == null) continue;
         const text = String(raw).trim();
         if (!text) continue;
-        if (/id/i.test(text) || /编号|主键/.test(text)) {
+        if (/id/i.test(text) || /缂栧彿|涓婚敭/.test(text)) {
           return c;
         }
       }
@@ -1787,7 +1789,7 @@ const buildMergeSheetWithRowAlign = (
     }
   });
 
-  // 如果有差异列，为冻结行补齐这些列的内容（即使未变化），用于显示表头/冻结行上下文
+  // 濡傛灉鏈夊樊寮傚垪锛屼负鍐荤粨琛岃ˉ榻愯繖浜涘垪鐨勫唴瀹癸紙鍗充娇鏈彉鍖栵級锛岀敤浜庢樉绀鸿〃澶?鍐荤粨琛屼笂涓嬫枃
   if (headerCount > 0 && cells.length > 0) {
     const diffColumns = new Set<number>(cells.map((c) => c.col));
     if (diffColumns.size > 0) {
@@ -1837,6 +1839,29 @@ const buildMergeSheetWithRowAlign = (
   };
 };
 
+// 绠€鍗曠紦瀛橈細鍚屼竴娆″簲鐢ㄧ敓鍛藉懆鏈熷唴閲嶅璇诲彇鍚屼竴涓?xlsx 鏃跺鐢?workbook锛屽噺灏?IO
+const workbookCache = new Map<string, Workbook>();
+
+const loadWorkbookCached = async (filePath: string): Promise<Workbook> => {
+  const hit = workbookCache.get(filePath);
+  if (hit) return hit;
+  const wb = new Workbook();
+  await wb.xlsx.readFile(filePath);
+  workbookCache.set(filePath, wb);
+  return wb;
+};
+
+const getWorksheetSafe = (wb: Workbook, sheetName?: string, sheetIndex?: number): any => {
+  if (sheetName) {
+    const byName = wb.getWorksheet(sheetName);
+    if (byName) return byName;
+  }
+  if (typeof sheetIndex === 'number' && sheetIndex >= 0 && sheetIndex < wb.worksheets.length) {
+    return wb.worksheets[sheetIndex];
+  }
+  return wb.worksheets[0];
+};
+
 const buildMergeSheetsForWorkbooks = async (
   basePath: string,
   oursPath: string,
@@ -1845,13 +1870,12 @@ const buildMergeSheetsForWorkbooks = async (
   frozenRowCount: number,
   rowSimilarityThreshold: number,
 ) => {
-  const baseWb = new Workbook();
-  const oursWb = new Workbook();
-  const theirsWb = new Workbook();
-
-  await baseWb.xlsx.readFile(basePath);
-  await oursWb.xlsx.readFile(oursPath);
-  await theirsWb.xlsx.readFile(theirsPath);
+  // 澶嶇敤缂撳瓨锛岄伩鍏嶆瘡娆¤皟鍙?閲嶆柊 diff 鏃堕噸澶嶄粠纾佺洏璇诲彇
+  const [baseWb, oursWb, theirsWb] = await Promise.all([
+    loadWorkbookCached(basePath),
+    loadWorkbookCached(oursPath),
+    loadWorkbookCached(theirsPath),
+  ]);
 
   const baseList = baseWb.worksheets;
   const oursList = oursWb.worksheets;
@@ -1870,14 +1894,14 @@ const buildMergeSheetsForWorkbooks = async (
     if (!theirsByName.has(ws.name)) theirsByName.set(ws.name, { ws, idx });
   });
 
-  // 规则：优先按同名工作表对齐；对剩余未匹配的工作表，再按索引对齐（第 1 张对第 1 张……）。
+  // 瑙勫垯锛氫紭鍏堟寜鍚屽悕宸ヤ綔琛ㄥ榻愶紱瀵瑰墿浣欐湭鍖归厤鐨勫伐浣滆〃锛屽啀鎸夌储寮曞榻愶紙绗?1 寮犲绗?1 寮犫€︹€︼級銆?
   const usedBaseIdx = new Set<number>();
   const usedOursIdx = new Set<number>();
   const usedTheirsIdx = new Set<number>();
 
   const mergeSheets: MergeSheetData[] = [];
 
-  // 1) 同名匹配：以 base 的顺序为准
+  // 1) 鍚屽悕鍖归厤锛氫互 base 鐨勯『搴忎负鍑?
   for (let i = 0; i < baseList.length; i += 1) {
     const baseWs = baseList[i];
     const oursHit = oursByName.get(baseWs.name);
@@ -1893,7 +1917,7 @@ const buildMergeSheetsForWorkbooks = async (
     );
   }
 
-  // 2) 索引兜底：仅对“同一 idx 在三边都没被用过”的位置做对齐
+  // 2) 绱㈠紩鍏滃簳锛氫粎瀵光€滃悓涓€ idx 鍦ㄤ笁杈归兘娌¤鐢ㄨ繃鈥濈殑浣嶇疆鍋氬榻?
   const count = Math.min(baseList.length, oursList.length, theirsList.length);
   for (let idx = 0; idx < count; idx += 1) {
     if (usedBaseIdx.has(idx) || usedOursIdx.has(idx) || usedTheirsIdx.has(idx)) continue;
@@ -1935,18 +1959,18 @@ interface SheetCell {
 type RowStatus = 'unchanged' | 'added' | 'deleted' | 'modified' | 'ambiguous';
 
 interface MergeRowMeta {
-  /** 视觉行号（diff/merge 视图中的 1-based 行号） */
+  /** 瑙嗚琛屽彿锛坉iff/merge 瑙嗗浘涓殑 1-based 琛屽彿锛?*/
   visualRowNumber: number;
-  /** 如果启用了主键列，这里记录主键（normalize 后） */
+  /** 濡傛灉鍚敤浜嗕富閿垪锛岃繖閲岃褰曚富閿紙normalize 鍚庯級 */
   key?: string | null;
-  /** 三方文件中各自对应的原始行号（1-based）；不存在则为 null */
+  /** 涓夋柟鏂囦欢涓悇鑷搴旂殑鍘熷琛屽彿锛?-based锛夛紱涓嶅瓨鍦ㄥ垯涓?null */
   baseRowNumber: number | null;
   oursRowNumber: number | null;
   theirsRowNumber: number | null;
-  /** 行相似度（相对 base，范围 0-1） */
+  /** 琛岀浉浼煎害锛堢浉瀵?base锛岃寖鍥?0-1锛?*/
   oursSimilarity?: number | null;
   theirsSimilarity?: number | null;
-  /** 该视觉行在对应 side 相对 base 的状态 */
+  /** 璇ヨ瑙夎鍦ㄥ搴?side 鐩稿 base 鐨勭姸鎬?*/
   oursStatus: RowStatus;
   theirsStatus: RowStatus;
 }
@@ -2025,10 +2049,10 @@ interface SaveMergeResponse {
 let currentFilePath: string | null = null;
 
 /**
- * 处理渲染进程请求：选择并打开一个 Excel 文件。
+ * 澶勭悊娓叉煋杩涚▼璇锋眰锛氶€夋嫨骞舵墦寮€涓€涓?Excel 鏂囦欢銆?
  *
- * 返回：文件路径 + 所有工作表的二维单元格数据（仅包含“值”），
- * 用于单文件查看/编辑模式。
+ * 杩斿洖锛氭枃浠惰矾寰?+ 鎵€鏈夊伐浣滆〃鐨勪簩缁村崟鍏冩牸鏁版嵁锛堜粎鍖呭惈鈥滃€尖€濓級锛?
+ * 鐢ㄤ簬鍗曟枃浠舵煡鐪?缂栬緫妯″紡銆?
  */
 ipcMain.handle('excel:open', async () => {
   if (!mainWindow) return null;
@@ -2056,11 +2080,11 @@ ipcMain.handle('excel:open', async () => {
 
       // Date
       if (raw instanceof Date) {
-        // 保持可读性，避免显示为 [object Object]
+        // 淇濇寔鍙鎬э紝閬垮厤鏄剧ず涓?[object Object]
         return raw.toISOString();
       }
 
-      // 富文本：raw.richText 是一个包含 { text } 的数组
+      // 瀵屾枃鏈細raw.richText 鏄竴涓寘鍚?{ text } 鐨勬暟缁?
       if (typeof raw === 'object' && Array.isArray((raw as any).richText)) {
         const parts = (raw as any).richText
           .map((p: any) => (p && typeof p.text === 'string' ? p.text : ''))
@@ -2075,7 +2099,7 @@ ipcMain.handle('excel:open', async () => {
         return typeof t === 'string' || typeof t === 'number' ? (t as any) : String(t);
       }
 
-      // Formula / shared formula 等：优先显示 result
+      // Formula / shared formula 绛夛細浼樺厛鏄剧ず result
       if (typeof raw === 'object' && raw && 'result' in (raw as any)) {
         const r = (raw as any).result;
         if (r === null || r === undefined) return null;
@@ -2088,7 +2112,7 @@ ipcMain.handle('excel:open', async () => {
         return raw;
       }
 
-      // 兜底：尽量 JSON 序列化，避免 [object Object]
+      // 鍏滃簳锛氬敖閲?JSON 搴忓垪鍖栵紝閬垮厤 [object Object]
       if (typeof raw === 'object') {
         try {
           return JSON.stringify(raw);
@@ -2100,8 +2124,8 @@ ipcMain.handle('excel:open', async () => {
       return String(raw);
     };
 
-    // 重要：确保每一行的列数一致。
-    // 否则会出现“数据行列数 > 表头/冻结行列数”造成错位。
+    // 閲嶈锛氱‘淇濇瘡涓€琛岀殑鍒楁暟涓€鑷淬€?
+    // 鍚﹀垯浼氬嚭鐜扳€滄暟鎹鍒楁暟 > 琛ㄥご/鍐荤粨琛屽垪鏁扳€濋€犳垚閿欎綅銆?
     const maxRow =
       (worksheet as any).actualRowCount && (worksheet as any).actualRowCount > 0
         ? (worksheet as any).actualRowCount
@@ -2149,18 +2173,25 @@ interface GetSheetDataRequest {
 }
 
 /**
- * 将单文件编辑模式下用户修改过的单元格写回原始 Excel 文件。
+ * 灏嗗崟鏂囦欢缂栬緫妯″紡涓嬬敤鎴蜂慨鏀硅繃鐨勫崟鍏冩牸鍐欏洖鍘熷 Excel 鏂囦欢銆?
  *
- * 只修改单元格的 value，不动样式/公式等格式信息。
+ * 鍙慨鏀瑰崟鍏冩牸鐨?value锛屼笉鍔ㄦ牱寮?鍏紡绛夋牸寮忎俊鎭€?
  */
-ipcMain.handle('excel:saveChanges', async (_event, changes: CellChange[]) => {
+ipcMain.handle('excel:saveChanges', async (_event, req: CellChange[] | { changes: CellChange[]; sheetName?: string; sheetIndex?: number }) => {
   if (!currentFilePath) {
     throw new Error('No Excel file is currently loaded');
   }
+  const changes: CellChange[] = Array.isArray(req) ? req : (req?.changes ?? []);
+  const sheetName = !Array.isArray(req) ? req?.sheetName : undefined;
+  const sheetIndex = !Array.isArray(req) ? req?.sheetIndex : undefined;
 
   const workbook = new Workbook();
   await workbook.xlsx.readFile(currentFilePath);
-  const worksheet = workbook.worksheets[0];
+  let worksheet = sheetName ? workbook.getWorksheet(sheetName) ?? undefined : undefined;
+  if (!worksheet && typeof sheetIndex === 'number' && sheetIndex >= 0) {
+    worksheet = workbook.worksheets[sheetIndex];
+  }
+  if (!worksheet) worksheet = workbook.worksheets[0];
 
   for (const change of changes) {
     const cell = worksheet.getCell(change.address);
@@ -2168,11 +2199,15 @@ ipcMain.handle('excel:saveChanges', async (_event, changes: CellChange[]) => {
   }
 
   await workbook.xlsx.writeFile(currentFilePath);
+  // invalidate cache to avoid stale reads
+  if (workbookCache.has(currentFilePath)) {
+    workbookCache.delete(currentFilePath);
+  }
 
   return { success: true };
 });
 
-// 读取指定文件的指定工作表（用于 merge 模式下显示全表）
+// 璇诲彇鎸囧畾鏂囦欢鐨勬寚瀹氬伐浣滆〃锛堢敤浜?merge 妯″紡涓嬫樉绀哄叏琛級
 ipcMain.handle('excel:getSheetData', async (_event, req: GetSheetDataRequest): Promise<SheetData | null> => {
   if (!req || !req.path) return null;
   const wb = await loadWorkbookCached(req.path);
@@ -2194,7 +2229,7 @@ ipcMain.handle('excel:getSheetData', async (_event, req: GetSheetDataRequest): P
     const row = ws.getRow(rowNumber);
     for (let colNumber = 1; colNumber <= maxCol; colNumber += 1) {
       const cell = row.getCell(colNumber);
-      const value = getSimpleValueForThreeWay(cell?.value);
+      const value = getSimpleValueForMerge(cell?.value);
       rowCells.push({
         address: cell.address,
         row: rowNumber,
@@ -2208,15 +2243,15 @@ ipcMain.handle('excel:getSheetData', async (_event, req: GetSheetDataRequest): P
   return { sheetName: ws.name, rows };
 });
 
-// 保存三方 merge 结果到新的 Excel 文件，仅修改值，不改格式
+// 淇濆瓨涓夋柟 merge 缁撴灉鍒版柊鐨?Excel 鏂囦欢锛屼粎淇敼鍊硷紝涓嶆敼鏍煎紡
 //
-// 在 git/Fork merge 模式下：
-//   - 如果提供了 MERGED 参数，则结果写回 MERGED；
-//   - 否则回退到覆盖 ours；
-// 在 diff 模式下：
-//   - 直接覆盖 ours（LOCAL）。
-// 交互式模式下：
-//   - 弹出保存对话框，由用户选择目标路径。
+// 鍦?git/Fork merge 妯″紡涓嬶細
+//   - 濡傛灉鎻愪緵浜?MERGED 鍙傛暟锛屽垯缁撴灉鍐欏洖 MERGED锛?
+//   - 鍚﹀垯鍥為€€鍒拌鐩?ours锛?
+// 鍦?diff 妯″紡涓嬶細
+//   - 鐩存帴瑕嗙洊 ours锛圠OCAL锛夈€?
+// 浜や簰寮忔ā寮忎笅锛?
+//   - 寮瑰嚭淇濆瓨瀵硅瘽妗嗭紝鐢辩敤鎴烽€夋嫨鐩爣璺緞銆?
 ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): Promise<SaveMergeResponse> => {
   if (!mainWindow) {
     throw new Error('Main window is not available');
@@ -2232,7 +2267,7 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
     let targetPath: string | undefined;
 
     if (cliThreeWayArgs && cliThreeWayArgs.mode === 'merge') {
-      // git / Fork merge 模式：优先写入 MERGED（工作区对应文件），如果命令只传了 base/ours/theirs 三个参数，则回退覆盖 ours。
+      // git / Fork merge 妯″紡锛氫紭鍏堝啓鍏?MERGED锛堝伐浣滃尯瀵瑰簲鏂囦欢锛夛紝濡傛灉鍛戒护鍙紶浜?base/ours/theirs 涓変釜鍙傛暟锛屽垯鍥為€€瑕嗙洊 ours銆?
       const oursPath = cliThreeWayArgs.oursPath;
       const mergedPath = cliThreeWayArgs.mergedPath;
       targetPath = mergedPath || oursPath;
@@ -2240,7 +2275,7 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
       targetPath = cliThreeWayArgs.oursPath;
     } else {
       const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
-        title: '保存合并后的 Excel',
+        title: '淇濆瓨鍚堝苟鍚庣殑 Excel',
         defaultPath: templatePath,
         filters: [{ name: 'Excel Files', extensions: ['xlsx'] }],
       });
@@ -2254,19 +2289,20 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
     const workbook = new Workbook();
     await workbook.xlsx.readFile(templatePath);
 
-    for (const cellInfo of cells) {
-      const ws = workbook.getWorksheet(cellInfo.sheetName) ?? workbook.worksheets[0];
-      const cell = ws.getCell(cellInfo.address);
-      cell.value = cellInfo.value as any;
-    }
+    // IMPORTANT: 蹇呴』鍏堟墽琛屽垪/琛屾搷浣滐紝鍐嶄慨鏀瑰崟鍏冩牸
+    // 鍥犱负鍒?琛屾搷浣滀細鏀瑰彉绱㈠紩锛屽鏋滃厛淇敼鍗曞厓鏍硷紝鍦板潃浼氶敊涔?
+    
+    const colOpsBySheet = new Map<string, SaveMergeColOp[]>();
+    const rowOpsBySheet = new Map<string, SaveMergeRowOp[]>();
+
+    // 1. 鍏堟墽琛屽垪鎿嶄綔
     if (colOps && colOps.length > 0) {
-      const opsBySheet = new Map<string, SaveMergeColOp[]>();
       colOps.forEach((op) => {
         const key = op.sheetName || '';
-        if (!opsBySheet.has(key)) opsBySheet.set(key, []);
-        opsBySheet.get(key)!.push(op);
+        if (!colOpsBySheet.has(key)) colOpsBySheet.set(key, []);
+        colOpsBySheet.get(key)!.push(op);
       });
-      opsBySheet.forEach((ops, sheetName) => {
+      colOpsBySheet.forEach((ops, sheetName) => {
         const ws = workbook.getWorksheet(sheetName) ?? workbook.worksheets[0];
         const sorted = ops.slice().sort((a, b) => {
           const va = a.alignedColNumber ?? 0;
@@ -2299,7 +2335,12 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
         const inserts = sorted.filter(op => op.action === 'insert');
         let offset = 0;
         for (const op of inserts) {
-          const baseCol = Math.max(1, Math.floor(op.targetColNumber));
+          // 修正：targetColNumber 基于原始 ours 列号，需减去前面已执行的 delete 偏移
+          let baseCol = Math.max(1, Math.floor(op.targetColNumber));
+          for (const delOp of deletes) {
+            const delCol = Math.max(1, Math.floor(delOp.targetColNumber));
+            if (baseCol > delCol) baseCol -= 1;
+          }
           const colNumber = baseCol + offset;
           const maxRow = Math.max(
             ws?.actualRowCount ?? ws?.rowCount ?? 0,
@@ -2327,14 +2368,14 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
         }
       });
     }
+    // 2. 鍐嶆墽琛岃鎿嶄綔
     if (rowOps && rowOps.length > 0) {
-      const opsBySheet = new Map<string, SaveMergeRowOp[]>();
       rowOps.forEach((op) => {
         const key = op.sheetName || '';
-        if (!opsBySheet.has(key)) opsBySheet.set(key, []);
-        opsBySheet.get(key)!.push(op);
+        if (!rowOpsBySheet.has(key)) rowOpsBySheet.set(key, []);
+        rowOpsBySheet.get(key)!.push(op);
       });
-      opsBySheet.forEach((ops, sheetName) => {
+      rowOpsBySheet.forEach((ops, sheetName) => {
         const ws = workbook.getWorksheet(sheetName) ?? workbook.worksheets[0];
         const sorted = ops.slice().sort((a, b) => {
           const va = a.visualRowNumber ?? 0;
@@ -2365,10 +2406,123 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
       });
     }
 
+    const colLabelToNumber = (label: string): number => {
+      const s = label.toUpperCase();
+      let n = 0;
+      for (let i = 0; i < s.length; i += 1) {
+        const code = s.charCodeAt(i);
+        if (code < 65 || code > 90) return NaN;
+        n = n * 26 + (code - 64);
+      }
+      return n;
+    };
+    const parseAddress = (address: string): { col: number; row: number } | null => {
+      const m = /^([A-Z]+)(\d+)$/i.exec(address);
+      if (!m) return null;
+      const col = colLabelToNumber(m[1]);
+      const row = Number(m[2]);
+      if (!Number.isFinite(col) || !Number.isFinite(row)) return null;
+      return { col, row };
+    };
+    const buildRowMapper = (ops: SaveMergeRowOp[]) => {
+      const sorted = ops.slice().sort((a, b) => {
+        const va = a.visualRowNumber ?? 0;
+        const vb = b.visualRowNumber ?? 0;
+        if (va !== vb) return va - vb;
+        return a.targetRowNumber - b.targetRowNumber;
+      });
+      return (row: number): number | null => {
+        let r = row;
+        let offset = 0;
+        for (const op of sorted) {
+          const baseRow = Math.max(1, Math.floor(op.targetRowNumber));
+          const rowNumber = baseRow + offset;
+          if (op.action === 'insert') {
+            if (r >= rowNumber) r += 1;
+            offset += 1;
+          } else {
+            if (r === rowNumber) return null;
+            if (r > rowNumber) r -= 1;
+            offset -= 1;
+          }
+        }
+        return r;
+      };
+    };
+    const buildColMapper = (ops: SaveMergeColOp[]) => {
+      const sorted = ops.slice().sort((a, b) => {
+        const va = a.alignedColNumber ?? 0;
+        const vb = b.alignedColNumber ?? 0;
+        if (va !== vb) return va - vb;
+        return a.targetColNumber - b.targetColNumber;
+      });
+      const deletes = sorted
+        .filter((op) => op.action === 'delete')
+        .sort((a, b) => b.targetColNumber - a.targetColNumber);
+      const inserts = sorted.filter((op) => op.action === 'insert');
+      return (col: number): number | null => {
+        let c = col;
+        for (const op of deletes) {
+          const colNumber = Math.max(1, Math.floor(op.targetColNumber));
+          if (c === colNumber) return null;
+          if (c > colNumber) c -= 1;
+        }
+        let offset = 0;
+        for (const op of inserts) {
+          // 修正：insert 的 targetColNumber 需按已执行 delete 偏移修正
+          let adjustedBase = Math.max(1, Math.floor(op.targetColNumber));
+          for (const delOp of deletes) {
+            const delCol = Math.max(1, Math.floor(delOp.targetColNumber));
+            if (adjustedBase > delCol) adjustedBase -= 1;
+          }
+          const insertAt = adjustedBase + offset;
+          if (c >= insertAt) c += 1;
+          offset += 1;
+        }
+        return c;
+      };
+    };
+    const rowMapperCache = new Map<string, (row: number) => number | null>();
+    const colMapperCache = new Map<string, (col: number) => number | null>();
+    const getRowMapper = (sheetKey: string) => {
+      if (!rowMapperCache.has(sheetKey)) {
+        rowMapperCache.set(sheetKey, buildRowMapper(rowOpsBySheet.get(sheetKey) ?? []));
+      }
+      return rowMapperCache.get(sheetKey)!;
+    };
+    const getColMapper = (sheetKey: string) => {
+      if (!colMapperCache.has(sheetKey)) {
+        colMapperCache.set(sheetKey, buildColMapper(colOpsBySheet.get(sheetKey) ?? []));
+      }
+      return colMapperCache.get(sheetKey)!;
+    };
+
+    // 3. 鏈€鍚庝慨鏀瑰崟鍏冩牸鍊硷紙姝ゆ椂鍒?琛岀储寮曞凡缁忕ǔ瀹氾級
+    for (const cellInfo of cells) {
+      const sheetKey = cellInfo.sheetName || '';
+      const ws = workbook.getWorksheet(cellInfo.sheetName) ?? workbook.worksheets[0];
+      const parsed = parseAddress(cellInfo.address);
+      if (!parsed) continue;
+      const newCol = getColMapper(sheetKey)(parsed.col);
+      if (newCol == null) continue;
+      const newRow = getRowMapper(sheetKey)(parsed.row);
+      if (newRow == null) continue;
+      const newAddress = makeAddress(newCol, newRow);
+      const cell = ws.getCell(newAddress);
+      cell.value = cellInfo.value as any;
+    }
+
     normalizeSharedFormulas(workbook);
     await workbook.xlsx.writeFile(targetPath);
+    // invalidate cache to avoid stale reads
+    if (targetPath && workbookCache.has(targetPath)) {
+      workbookCache.delete(targetPath);
+    }
+    if (templatePath && templatePath !== targetPath && workbookCache.has(templatePath)) {
+      workbookCache.delete(templatePath);
+    }
 
-    // 如果是通过 git/Fork 的 merge 模式启动，并且有明确的目标文件，尝试自动执行一次 git add
+    // 濡傛灉鏄€氳繃 git/Fork 鐨?merge 妯″紡鍚姩锛屽苟涓旀湁鏄庣‘鐨勭洰鏍囨枃浠讹紝灏濊瘯鑷姩鎵ц涓€娆?git add
     if (cliThreeWayArgs && cliThreeWayArgs.mode === 'merge' && targetPath) {
       try {
         await gitAddFile(targetPath);
@@ -2384,11 +2538,11 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
   }
 });
 
-// 三方 diff：base / ours / theirs，只比较单元格值，忽略格式
+// 涓夋柟 diff锛歜ase / ours / theirs锛屽彧姣旇緝鍗曞厓鏍煎€硷紝蹇界暐鏍煎紡
 //
-// 返回给渲染进程的数据是：
-//   - base / ours / theirs 的文件路径；
-//   - 每个工作表的三方单元格值 + 差异状态（unchanged / conflict 等）。
+// 杩斿洖缁欐覆鏌撹繘绋嬬殑鏁版嵁鏄細
+//   - base / ours / theirs 鐨勬枃浠惰矾寰勶紱
+//   - 姣忎釜宸ヤ綔琛ㄧ殑涓夋柟鍗曞厓鏍煎€?+ 宸紓鐘舵€侊紙unchanged / conflict 绛夛級銆?
 ipcMain.handle('excel:openThreeWay', async () => {
   if (!mainWindow) return null;
   const primaryKeyCol = 1;
@@ -2408,7 +2562,7 @@ ipcMain.handle('excel:openThreeWay', async () => {
     return normalizeThreeWayResult(basePath, oursPath, theirsPath, mergeSheets);
   }
 
-  // 没有 CLI 参数时，回退到交互式选择文件的模式
+  // 娌℃湁 CLI 鍙傛暟鏃讹紝鍥為€€鍒颁氦浜掑紡閫夋嫨鏂囦欢鐨勬ā寮?
   const pickFile = async (title: string) => {
     const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow!, {
       title,
@@ -2419,11 +2573,11 @@ ipcMain.handle('excel:openThreeWay', async () => {
     return filePaths[0];
   };
 
-  const basePath = await pickFile('选择 base 版本 Excel');
+  const basePath = await pickFile('閫夋嫨 base 鐗堟湰 Excel');
   if (!basePath) return null;
-  const oursPath = await pickFile('选择 ours (当前分支) Excel');
+  const oursPath = await pickFile('閫夋嫨 ours (褰撳墠鍒嗘敮) Excel');
   if (!oursPath) return null;
-  const theirsPath = await pickFile('选择 theirs (合并分支) Excel');
+  const theirsPath = await pickFile('閫夋嫨 theirs (鍚堝苟鍒嗘敮) Excel');
   if (!theirsPath) return null;
 
   const { mergeSheets } = await buildMergeSheetsForWorkbooks(
@@ -2469,13 +2623,13 @@ ipcMain.handle('excel:computeThreeWayDiff', async (_event, req: ThreeWayDiffRequ
   return normalizeThreeWayResult(req.basePath, req.oursPath, req.theirsPath, mergeSheets);
 });
 
-// 将 CLI three-way 信息暴露给渲染进程，便于自动加载
+// 灏?CLI three-way 淇℃伅鏆撮湶缁欐覆鏌撹繘绋嬶紝渚夸簬鑷姩鍔犺浇
 ipcMain.handle('excel:getCliThreeWayInfo', async () => {
   if (!cliThreeWayArgs) return null;
   return cliThreeWayArgs;
 });
 
-// 读取三方文件的“某一行”数据，用于底部行级对比视图
+// 璇诲彇涓夋柟鏂囦欢鐨勨€滄煇涓€琛屸€濇暟鎹紝鐢ㄤ簬搴曢儴琛岀骇瀵规瘮瑙嗗浘
 interface ThreeWayRowRequest {
   basePath: string;
   oursPath: string;
@@ -2520,28 +2674,6 @@ interface ThreeWayRowsResult {
   rows: ThreeWayRowResult[];
 }
 
-// 简单缓存：同一次应用生命周期内重复读取同一个 xlsx 时复用 workbook，减少 IO
-const workbookCache = new Map<string, Workbook>();
-
-const loadWorkbookCached = async (filePath: string): Promise<Workbook> => {
-  const hit = workbookCache.get(filePath);
-  if (hit) return hit;
-  const wb = new Workbook();
-  await wb.xlsx.readFile(filePath);
-  workbookCache.set(filePath, wb);
-  return wb;
-};
-
-const getWorksheetSafe = (wb: Workbook, sheetName?: string, sheetIndex?: number): any => {
-  if (sheetName) {
-    const byName = wb.getWorksheet(sheetName);
-    if (byName) return byName;
-  }
-  if (typeof sheetIndex === 'number' && sheetIndex >= 0 && sheetIndex < wb.worksheets.length) {
-    return wb.worksheets[sheetIndex];
-  }
-  return wb.worksheets[0];
-};
 const normalizeSharedFormulas = (workbook: Workbook) => {
   workbook.worksheets.forEach((ws) => {
     ws.eachRow({ includeEmpty: true }, (row) => {
@@ -2567,19 +2699,6 @@ const normalizeSharedFormulas = (workbook: Workbook) => {
   });
 };
 
-const getSimpleValueForThreeWay = (v: any): string | number | null => {
-  if (v === null || v === undefined) return null;
-  if (typeof v === 'object' && Array.isArray((v as any).richText)) {
-    const parts = (v as any).richText
-      .map((p: any) => (p && typeof p.text === 'string' ? p.text : ''))
-      .join('');
-    return parts;
-  }
-  if (typeof v === 'object' && 'text' in v) return (v as any).text ?? null;
-  if (typeof v === 'object' && 'result' in v) return (v as any).result ?? null;
-  if (typeof v === 'string' || typeof v === 'number') return v;
-  return String(v);
-};
 
 ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): Promise<ThreeWayRowResult | null> => {
   if (!req || !req.basePath || !req.oursPath || !req.theirsPath) return null;
@@ -2639,7 +2758,7 @@ ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): 
         continue;
       }
       const cell = row.getCell(colNumber);
-      arr.push(getSimpleValueForThreeWay(cell?.value));
+      arr.push(getSimpleValueForMerge(cell?.value));
     }
     return arr;
   };
@@ -2698,7 +2817,7 @@ ipcMain.handle('excel:getThreeWayRows', async (_event, req: ThreeWayRowsRequest)
         continue;
       }
       const cell = row.getCell(colNumber);
-      arr.push(getSimpleValueForThreeWay(cell?.value));
+      arr.push(getSimpleValueForMerge(cell?.value));
     }
     return arr;
   };

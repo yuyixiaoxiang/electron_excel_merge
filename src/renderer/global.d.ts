@@ -3,6 +3,7 @@ import type {
   CliThreeWayInfo,
   GetSheetDataRequest,
   OpenResult,
+  SaveChangesRequest,
   SaveMergeRequest,
   SaveMergeResponse,
   ThreeWayDiffRequest,
@@ -21,7 +22,7 @@ declare global {
   interface Window {
     excelAPI: {
       openFile: () => Promise<OpenResult | null>;
-      saveChanges: (changes: CellChange[]) => Promise<void>;
+      saveChanges: (req: SaveChangesRequest | CellChange[]) => Promise<void>;
       openThreeWay: () => Promise<ThreeWayOpenResult | null>;
       getSheetData: (req: GetSheetDataRequest) => Promise<SheetData | null>;
       computeThreeWayDiff: (req: ThreeWayDiffRequest) => Promise<ThreeWayOpenResult | null>;

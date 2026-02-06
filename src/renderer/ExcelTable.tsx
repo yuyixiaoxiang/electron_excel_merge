@@ -130,7 +130,14 @@ const ExcelTableComponent: React.FC<ExcelTableProps> = ({
   };
 
   const renderHeaderCell = (colIndex: number) => {
-    return String.fromCharCode('A'.charCodeAt(0) + (colIndex % 26));
+    let n = colIndex + 1;
+    let s = '';
+    while (n > 0) {
+      n -= 1;
+      s = String.fromCharCode('A'.charCodeAt(0) + (n % 26)) + s;
+      n = Math.floor(n / 26);
+    }
+    return s;
   };
 
   return (

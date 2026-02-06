@@ -294,7 +294,11 @@ export const App: React.FC = () => {
     setSaving(true);
     try {
       const changeList = Array.from(changes.values());
-      await window.excelAPI.saveChanges(changeList);
+      await window.excelAPI.saveChanges({
+        changes: changeList,
+        sheetName: sheetName ?? undefined,
+        sheetIndex: selectedSheetIndex,
+      });
       setChanges(new Map());
       // 不需要刷新格式，只要值正确写回即可
     } catch (e) {
@@ -302,7 +306,7 @@ export const App: React.FC = () => {
     } finally {
       setSaving(false);
     }
-  }, [changes, filePath]);
+  }, [changes, filePath, sheetName, selectedSheetIndex]);
 
   const hasData = useMemo(() => rows.length > 0, [rows]);
   const hasMergeData = useMemo(() => mergeCells.length > 0, [mergeCells]);
@@ -352,13 +356,22 @@ export const App: React.FC = () => {
     selectedMergeSheetIndex,
   ]);
 
-  // 顶部“公式栏”当前要展示的单元格信息
+  const mergeCellsByRow = useMemo(() => {
+    const m = new Map<number, MergeCell[]>();
+    mergeCells.forEach((cell) => {
+      if (!m.has(cell.row)) m.set(cell.row, []);
+      m.get(cell.row)!.push(cell);
+    });
+    return m;
+  }, [mergeCells]);
+
+  // 顶部"公式栏"当前要展示的单元格信息
   const selectedMergeCellData = useMemo(() => {
     if (mode !== 'merge' || !selectedMergeCell) return null;
     const rowNumber = selectedMergeCell.rowIndex + 1;
     const colNumber = selectedMergeCell.colIndex + 1;
-    const key = `${rowNumber}:${colNumber}`;
-    const hit = mergeCells.find((c) => `${c.row}:${c.col}` === key);
+    const rowCells = mergeCellsByRow.get(rowNumber);
+    const hit = rowCells?.find((c) => c.col === colNumber) ?? null;
     if (hit) return hit;
     const keyCol =
       typeof displayPrimaryKeyCol === 'number' && displayPrimaryKeyCol >= 1
@@ -381,7 +394,7 @@ export const App: React.FC = () => {
       };
     }
     return null;
-  }, [mode, selectedMergeCell, mergeCells, displayPrimaryKeyCol, mergeRowsMeta]);
+  }, [mode, selectedMergeCell, mergeCellsByRow, displayPrimaryKeyCol, mergeRowsMeta]);
 
 
   const mergedPath = useMemo(() => {
@@ -394,14 +407,6 @@ export const App: React.FC = () => {
     }
     return null;
   }, [mergeInfo, cliInfo]);
-  const mergeCellsByRow = useMemo(() => {
-    const m = new Map<number, MergeCell[]>();
-    mergeCells.forEach((cell) => {
-      if (!m.has(cell.row)) m.set(cell.row, []);
-      m.get(cell.row)!.push(cell);
-    });
-    return m;
-  }, [mergeCells]);
   const currentRowOps = useMemo(
     () => mergeRowOpsBySheet.get(selectedMergeSheetIndex) ?? new Map<number, SaveMergeRowOp>(),
     [mergeRowOpsBySheet, selectedMergeSheetIndex],
@@ -460,6 +465,8 @@ export const App: React.FC = () => {
       }
       // Add inserted columns (theirs-only)
       insertedAlignedCols.sort((a, b) => a - b);
+      // IMPORTANT: 先收集所有插入位置，然后从后往前插入，避免索引错乱
+      const insertions: Array<{ idx: number; col: number }> = [];
       for (const ac of insertedAlignedCols) {
         const meta = mergeColumnsMeta.find((m) => m.col === ac);
         if (meta && !meta.oursCol && meta.theirsCol) {
@@ -471,8 +478,13 @@ export const App: React.FC = () => {
               break;
             }
           }
-          effectiveColMap.splice(insertIdx, 0, { alignedCol: ac, oursCol: null });
+          insertions.push({ idx: insertIdx, col: ac });
         }
+      }
+      // 从后往前插入，避免每次 splice 改变后续索引
+      insertions.sort((a, b) => b.idx - a.idx);
+      for (const ins of insertions) {
+        effectiveColMap.splice(ins.idx, 0, { alignedCol: ins.col, oursCol: null });
       }
       const colCount = effectiveColMap.length;
       const mergedRows: (string | number | null)[][] = [];
@@ -486,7 +498,8 @@ export const App: React.FC = () => {
         if (!oursMissing && op?.action === 'delete') return;
         // Build merged row based on effective columns
         const mergedRow: (string | number | null)[] = [];
-        for (const colInfo of effectiveColMap) {
+        for (let i = 0; i < effectiveColMap.length; i += 1) {
+          const colInfo = effectiveColMap[i];
           const alignedCol = colInfo.alignedCol;
           const colMeta = mergeColumnsMeta.find((m) => m.col === alignedCol);
           // Check if there's a diff cell override
@@ -497,8 +510,8 @@ export const App: React.FC = () => {
           }
           // Otherwise get from ours/theirs raw data
           if (op?.action === 'insert' && op.values) {
-            // For inserted rows, use op.values by aligned col index
-            mergedRow.push(op.values[alignedCol - 1] ?? null);
+            // IMPORTANT: 使用循环索引 i，因为 effectiveColMap 的长度可能与原始 aligned 列不同
+            mergedRow.push(op.values[i] ?? null);
           } else if (colMeta?.oursCol && rowRes.ours) {
             mergedRow.push(rowRes.ours[alignedCol - 1] ?? null);
           } else if (colMeta?.theirsCol && rowRes.theirs) {
@@ -839,16 +852,11 @@ export const App: React.FC = () => {
       if (!result || !result.rows) return [];
       
       // Extract column values from result
+      // IMPORTANT: 不要过滤任何行，必须收集所有行的值
+      // 因为保存时列操作在行操作之前，那些行还没被删除
       const columnValues: (string | number | null)[] = [];
       result.rows.forEach((rowRes: any) => {
-        // Check if this row should be included based on ops
         const visualRowNumber = rowRes.rowNumber ?? 0;
-        const rowMeta = metas.find((m) => m.visualRowNumber === visualRowNumber);
-        const rowOp = currentRowOps.get(visualRowNumber);
-        const oursMissing = !rowMeta?.oursRowNumber;
-        // Skip rows that won't be in final output
-        if (oursMissing && rowOp?.action !== 'insert') return;
-        if (!oursMissing && rowOp?.action === 'delete') return;
         
         // Get value from aligned column (colNumber is 1-based aligned col)
         const diffCell = (mergeCellsByRow.get(visualRowNumber) ?? []).find((c) => c.col === colNumber);

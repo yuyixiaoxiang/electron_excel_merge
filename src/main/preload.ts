@@ -33,6 +33,11 @@ interface CellChange {
   address: string;
   newValue: string | number | null;
 }
+interface SaveChangesRequest {
+  changes: CellChange[];
+  sheetName?: string;
+  sheetIndex?: number; // 0-based
+}
 
 // Merge diff types
 type RowStatus = 'unchanged' | 'added' | 'deleted' | 'modified' | 'ambiguous';
@@ -195,8 +200,8 @@ const excelAPI = {
     const result = await ipcRenderer.invoke('excel:open');
     return result as OpenResult | null;
   },
-  saveChanges: async (changes: CellChange[]): Promise<void> => {
-    await ipcRenderer.invoke('excel:saveChanges', changes);
+  saveChanges: async (req: SaveChangesRequest | CellChange[]): Promise<void> => {
+    await ipcRenderer.invoke('excel:saveChanges', req);
   },
   openThreeWay: async (): Promise<ThreeWayOpenResult | null> => {
     const result = await ipcRenderer.invoke('excel:openThreeWay');
@@ -236,6 +241,7 @@ export type {
   GetSheetDataRequest,
   OpenResult,
   CellChange,
+  SaveChangesRequest,
   MergeCell,
   MergeColumnMeta,
   MergeSheetData,

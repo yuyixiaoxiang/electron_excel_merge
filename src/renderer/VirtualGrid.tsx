@@ -247,7 +247,7 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
   };
 
   const getColLeft = (colIndex: number) => {
-    let left = showRowHeader ? 40 : 0;
+    let left = showRowHeader ? rowHeaderWidth : 0;
     for (let i = 0; i < colIndex; i += 1) {
       left += getColWidth(i);
     }
@@ -256,13 +256,13 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
 
   const frozenColOffsets: number[] = useMemo(() => {
     const offsets: number[] = [];
-    let acc = showRowHeader ? 40 : 0;
+    let acc = showRowHeader ? rowHeaderWidth : 0;
     for (let colIndex = 0; colIndex < safeFrozenColCount; colIndex += 1) {
       offsets[colIndex] = acc;
       acc += getColWidth(colIndex);
     }
     return offsets;
-  }, [safeFrozenColCount, columnWidths, showRowHeader]);
+  }, [safeFrozenColCount, columnWidths, showRowHeader, rowHeaderWidth]);
 
   // 当外部指定 scrollToCell 时，自动滚动让该单元格出现在视口中
   useEffect(() => {
@@ -444,7 +444,7 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
               )}
               {Array.from({ length: colCount }, (_, colIndex) => {
                 const isFrozenCol = colIndex < safeFrozenColCount;
-                const stickyLeft = isFrozenCol ? frozenColOffsets[colIndex] ?? (showRowHeader ? 40 : 0) : undefined;
+                const stickyLeft = isFrozenCol ? frozenColOffsets[colIndex] ?? (showRowHeader ? rowHeaderWidth : 0) : undefined;
                 return (
                   <th
                     key={colIndex}

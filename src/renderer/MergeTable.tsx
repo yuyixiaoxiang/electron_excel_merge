@@ -33,9 +33,16 @@ export const MergeTable: React.FC<MergeTableProps> = ({ rows, selected, onSelect
   if (rows.length === 0) return null;
 
   const colCount = rows[0].length;
-  const columnLabels = Array.from({ length: colCount }, (_, i) =>
-    String.fromCharCode('A'.charCodeAt(0) + (i % 26)),
-  );
+  const columnLabels = Array.from({ length: colCount }, (_, i) => {
+    let n = i + 1;
+    let s = '';
+    while (n > 0) {
+      n -= 1;
+      s = String.fromCharCode('A'.charCodeAt(0) + (n % 26)) + s;
+      n = Math.floor(n / 26);
+    }
+    return s;
+  });
 
   return (
     <div style={{ overflow: 'auto', maxHeight: '70vh', border: '1px solid #ccc' }}>
