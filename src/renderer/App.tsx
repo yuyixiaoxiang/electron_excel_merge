@@ -457,11 +457,15 @@ export const App: React.FC = () => {
         else if (op.action === 'insert') insertedAlignedCols.push(alignedCol);
       });
       // Map aligned col -> ours col for non-deleted columns
+      // IMPORTANT: 只包含 ours 模板中存在的列（oursCol 非空），
+      // theirs-only 列只有在用户显式选择"插入"后才通过下方 insert 逻辑加入，
+      // 否则 merged 预览中会出现重复列。
       const effectiveColMap: { alignedCol: number; oursCol: number | null }[] = [];
       for (let c = 1; c <= rawColCount; c += 1) {
         if (deletedAlignedCols.has(c)) continue;
         const meta = mergeColumnsMeta.find((m) => m.col === c);
-        effectiveColMap.push({ alignedCol: c, oursCol: meta?.oursCol ?? null });
+        if (!meta?.oursCol) continue;
+        effectiveColMap.push({ alignedCol: c, oursCol: meta.oursCol });
       }
       // Add inserted columns (theirs-only)
       insertedAlignedCols.sort((a, b) => a - b);
@@ -482,7 +486,8 @@ export const App: React.FC = () => {
         }
       }
       // 从后往前插入，避免每次 splice 改变后续索引
-      insertions.sort((a, b) => b.idx - a.idx);
+      // 同一位置的多个插入按 col 降序处理，确保最终顺序正确
+      insertions.sort((a, b) => b.idx - a.idx || b.col - a.col);
       for (const ins of insertions) {
         effectiveColMap.splice(ins.idx, 0, { alignedCol: ins.col, oursCol: null });
       }
@@ -510,8 +515,9 @@ export const App: React.FC = () => {
           }
           // Otherwise get from ours/theirs raw data
           if (op?.action === 'insert' && op.values) {
-            // IMPORTANT: 使用循环索引 i，因为 effectiveColMap 的长度可能与原始 aligned 列不同
-            mergedRow.push(op.values[i] ?? null);
+            // IMPORTANT: 用 alignedCol 索引而非循环索引 i——effectiveColMap 会跳过已删除的列和未插入的 theirs-only 列，
+            // 但 op.values 始终按原始 aligned 列顺序排列，所以必须用 alignedCol - 1 取值。
+            mergedRow.push(op.values[alignedCol - 1] ?? null);
           } else if (colMeta?.oursCol && rowRes.ours) {
             mergedRow.push(rowRes.ours[alignedCol - 1] ?? null);
           } else if (colMeta?.theirsCol && rowRes.theirs) {
@@ -1060,11 +1066,56 @@ export const App: React.FC = () => {
         })
         .filter(Boolean) as { sheetName: string; address: string; value: string | number | null }[];
     });
+    // 构建 aligned → physical 列映射：考虑列删除和列插入后，物理工作表的列布局
+    const buildPhysicalColMap = (
+      colsMeta: MergeColumnMeta[],
+      colOpsMap: Map<number, SaveMergeColOp>,
+    ): number[] => {
+      const rawColCount = colsMeta.reduce((m, c) => Math.max(m, c.col), 0);
+      const deletedCols = new Set<number>();
+      const insertedCols: number[] = [];
+      colOpsMap.forEach((op, ac) => {
+        if (op.action === 'delete') deletedCols.add(ac);
+        else if (op.action === 'insert') insertedCols.push(ac);
+      });
+      const map: number[] = [];
+      for (let c = 1; c <= rawColCount; c += 1) {
+        if (deletedCols.has(c)) continue;
+        const m = colsMeta.find((cm) => cm.col === c);
+        if (!m?.oursCol) continue;
+        map.push(c);
+      }
+      insertedCols.sort((a, b) => a - b);
+      const ins: Array<{ idx: number; col: number }> = [];
+      for (const ac of insertedCols) {
+        const m = colsMeta.find((cm) => cm.col === ac);
+        if (m && !m.oursCol && m.theirsCol) {
+          let insertIdx = map.length;
+          for (let k = 0; k < map.length; k += 1) {
+            if (map[k] > ac) { insertIdx = k; break; }
+          }
+          ins.push({ idx: insertIdx, col: ac });
+        }
+      }
+      ins.sort((a, b) => b.idx - a.idx || b.col - a.col);
+      for (const entry of ins) map.splice(entry.idx, 0, entry.col);
+      return map;
+    };
+
     const rowOps = Array.from(mergeRowOpsBySheet.entries()).flatMap(([sheetIndex, opsMap]) => {
-      const sheetName = mergeSheets[sheetIndex]?.sheetName ?? mergeInfo.sheetName;
+      const sheet = mergeSheets[sheetIndex];
+      const sheetName = sheet?.sheetName ?? mergeInfo.sheetName;
+      const colsMeta = sheet?.columnsMeta ?? [];
+      const colOpsForSheet = mergeColOpsBySheet.get(sheetIndex) ?? new Map<number, SaveMergeColOp>();
+      // 将 row op 的 values 从 aligned 列空间重映射到物理列空间，
+      // 跳过 theirs-only 列（除非用户选择了插入）和已删除的列。
+      const colMap = colsMeta.length > 0 ? buildPhysicalColMap(colsMeta, colOpsForSheet) : null;
       return Array.from(opsMap.values()).map((op) => ({
         ...op,
         sheetName: op.sheetName || sheetName,
+        values: op.values && colMap
+          ? colMap.map((ac) => op.values![ac - 1] ?? null)
+          : op.values,
       }));
     });
     const buildMergedColumnValues = (sheet: MergeSheetData, alignedColNumber: number) => {
