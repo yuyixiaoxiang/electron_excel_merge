@@ -10,6 +10,72 @@
 npm install
 ```
 
+## 打包发布（EXE：压缩 / 非压缩）
+本项目使用 `electron-builder`，输出目录为 `dist_electron/`。
+
+### 压缩版（发布用）
+压缩版通常体积更小，适合发给最终用户安装或直接运行。
+
+1. `NSIS 安装包（.exe）`
+```bash path=null start=null
+npm run pack:nsis
+```
+
+2. `Portable 单文件（.exe）`
+```bash path=null start=null
+npm run pack:win
+```
+
+3. 一次构建两种发布包（NSIS + Portable）
+```bash path=null start=null
+npm run dist
+```
+
+### 非压缩版（调试/排查用）
+非压缩目录版不打安装包，便于查看和定位打包产物内容。
+
+```bash path=null start=null
+npm run pack:unpacked
+```
+
+### 产物位置说明
+- 安装包（压缩）：`dist_electron/*.exe`
+- Portable（压缩）：`dist_electron/*-portable.exe`
+- Unpacked（非压缩）：`dist_electron/win-unpacked/`
+
+### 体积对比（记录模板）
+可在每次发布前后记录一次，便于持续优化包体积。
+
+| 构建方式 | 命令 | 典型产物 | 体积（MB） | 适用场景 |
+|---|---|---|---:|---|
+| NSIS 安装包（压缩） | `npm run pack:nsis` | `dist_electron/*.exe` | 待填写 | 正式安装发布 |
+| Portable 单文件（压缩） | `npm run pack:win` | `dist_electron/*-portable.exe` | 待填写 | 免安装分发、U盘携带 |
+| Unpacked 目录（非压缩） | `npm run pack:unpacked` | `dist_electron/win-unpacked/` | 待填写 | 调试排查、文件核查 |
+
+可用 PowerShell 快速查看体积：
+```powershell path=null start=null
+Get-ChildItem dist_electron -File *.exe | Select-Object Name,@{N='SizeMB';E={[math]::Round($_.Length/1MB,2)}}
+```
+
+### 发布策略（建议）
+1. 对外正式发布：优先 `NSIS`，同时提供 `Portable` 作为免安装备选。
+2. 内部测试联调：优先 `Portable`，安装负担小、回归快。
+3. 定位打包问题：使用 `Unpacked`，可直接检查 `win-unpacked` 内文件是否完整。
+4. 每次发版至少保留一份 `Unpacked` 构建结果，便于问题复现和比对。
+
+### 打包前检查清单
+1. 执行 `npm install`，依赖完整且无中断。
+2. 执行 `npm run build` 能成功通过（主进程 + 渲染进程）。
+3. 图标文件存在：`build/icon.ico`。
+4. 额外资源存在：`resources/portable-git`（打包后应进入 `resources/git`）。
+5. 清理历史产物：`dist_electron/` 内旧文件不用于本次发版。
+
+### 打包后验证清单
+1. 启动应用无白屏，主流程可用（打开文件、diff/merge、导出等关键路径）。
+2. 校验版本与名称（窗口标题、可执行文件名）符合发布预期。
+3. 校验资源目录：`resources/git` 已随包携带。
+4. 在未安装开发环境的干净机器上进行一次冒烟测试（推荐）。
+
 ## 开发启动（不调试）
 ```bash path=null start=null
 npm run dev
@@ -17,101 +83,64 @@ npm run dev
 - `dev:renderer` 会启动 webpack-dev-server，默认端口 `http://localhost:3000`
 - `dev:main` 会以 watch 模式编译主进程 TS 到 `build/`
 
-## WebStorm 调试 Electron 主进程（main process）
-本项目主进程入口为 TypeScript（`src/main/main.ts`），开发模式下主进程会加载 `http://localhost:3000`。
+## 调试与常见问题
+调试流程与常见问题已迁移到单独文档：
+- `docs/DEBUG_SETUP.md`
 
-由于在 Windows 上直接用 IDE 的 Debug 按钮“启动 Electron”可能不稳定，推荐使用：
-- **Run 启动 Electron（带 --inspect）**
-- **再使用 Attach 连接调试端口**
+## Fork 配置（Merge / Diff Tools）
+用于在 Fork 中配置 `eMerge` 作为外部合并/对比工具。
 
-### 1. 前置：确保 WebStorm 插件可用
-在 WebStorm 中打开：`File | Settings | Plugins`，确保启用：
-- Node.js
-- JavaScript Debugger（或与 JS 调试相关的插件）
+### 前置条件
+1. 已打包或可运行 `eMerge.exe`。
+2. 可执行文件路径可访问，例如：`E:\electron_excel\dist_electron\win-unpacked\eMerge.exe`。
 
-启用后重启 WebStorm。
+### Merge Tools 配置
+在 Fork 中打开 `Settings -> Integration -> External Merge Tools`，新增或编辑一项：
 
-### 2. 创建/检查 Run 配置：npm dev（启动 3000 + tsc watch）
-`Run | Edit Configurations...` → `+` → **npm**
-- **package.json**：`E:\electron_excel\package.json`
-- **Command**：`run`
-- **Scripts**：`dev`
+- Name: `eMerge`
+- Path: `E:\electron_excel\dist_electron\win-unpacked\eMerge.exe`
+- Arguments: `"$BASE" "$LOCAL" "$REMOTE" "$MERGED"`
 
-启动：右上角选择 `npm: dev` → **Run**。
+参数说明：
+- `"$BASE"`：共同基线文件
+- `"$LOCAL"`：当前分支文件
+- `"$REMOTE"`：目标分支文件
+- `"$MERGED"`：输出合并结果文件
 
-### 3. 创建/检查 Run 配置：Electron Main (inspect run)
-`Run | Edit Configurations...` → `+` → **Node.js**
-- **Node interpreter**：`E:\electron_excel\node_modules\electron\dist\electron.exe`
-- **Working directory**：`E:\electron_excel`
-- **Application parameters**：`.`
-- **Node parameters**：`--inspect=9229`
-- **Environment variables**：`NODE_ENV=development`
+### Diff Tools 配置
+在 Fork 中打开 `Settings -> Integration -> External Diff Tools`，新增或编辑一项：
 
-启动：选择 `Electron Main (inspect run)` → **Run**。
+- Name: `eMerge`
+- Path: `E:\electron_excel\dist_electron\win-unpacked\eMerge.exe`
+- Arguments: `"$LOCAL" "$REMOTE"`
 
-> 注意：
-> - `.` 必须放在 **Application parameters**，不要放到 Node parameters。
-> - `NODE_ENV=development` 会让主进程加载 `http://localhost:3000`。
+参数说明：
+- `"$LOCAL"`：当前版本文件
+- `"$REMOTE"`：对比版本文件
 
-### 4. 创建/检查 Debug 配置：Attach 9229
-`Run | Edit Configurations...` → `+` → **Attach to Node.js/Chrome**（名称可能略有差异）
-- **Host**：`127.0.0.1`
-- **Port**：`9229`
+### 在 Fork 中使用
+1. 在文件列表中右键目标文件。
+2. 点击 `External Diff`。
+3. 选择 `eMerge`。
 
-启动：选择 `Attach 9229` → **Debug**。
+### 配置截图
+![Fork 集成设置](docs/assets/fork-integration-settings.png)
 
-### 5. 推荐启动顺序（稳定）
-1. **Run**：`npm: dev`
-2. **Run**：`Electron Main (inspect run)`
-3. **Debug**：`Attach 9229`
+### 冲突处理
+![冲突处理占位图1](docs/assets/conflict-placeholder-1.png)
+说明：冲突处理流程截图 1（进入冲突文件后的操作入口）。
 
-此时在 `src/main/main.ts` 中下断点即可命中。
+![冲突处理占位图2](docs/assets/conflict-placeholder-2.png)
+说明：冲突处理流程截图 2（完成选择后保存/确认结果）。
 
-## 调试渲染进程（renderer process）
-渲染进程是 React + Webpack 的页面，开发模式下由 webpack-dev-server 提供：`http://localhost:3000`。
+### Diff
+![Diff 占位图1](docs/assets/diff-placeholder-1.png)
+说明：Diff 流程截图 1（在文件列表中触发 External Diff）。
 
-### 方式 A：用 Electron 内置 DevTools 调试（推荐）
-1. 按上面的流程启动 `npm: dev` + `Electron Main (inspect run)`。
-2. 在 Electron 窗口打开 DevTools：`Ctrl + Shift + I`。
-3. 打开 DevTools → `Sources`：
-   - 在左侧 `webpack://`（或类似项）中找到 `src/renderer/*.tsx`。
-   - 直接在 `.tsx` 源码行号处打断点即可。
-4. 也可以在代码里临时加入：
-```js path=null start=null
-debugger;
-```
-然后触发对应操作（点击/滚动等），会自动断住。
+![Diff 占位图2](docs/assets/diff-placeholder-2.png)
+说明：Diff 流程截图 2（eMerge 对比界面与结果查看）。
 
-> 如果只能看到 `bundle.js`，看不到 `src/renderer/*.tsx`：通常是 source map 没开。
-> 本项目开发模式建议保持 webpack 的 `devtool` 为 `source-map` / `eval-source-map` / `cheap-module-source-map` 之一。
-
-### 方式 B：用 IDE 断点调试渲染进程（可选）
-大多数情况下直接用 DevTools 就够了；如果你希望在 IDE 里调试 TSX：
-- 优先建议在 DevTools 里断点（方式 A）。
-- 如需 IDE 调试，通常要启用 Electron 的远程调试端口（例如启动参数加 `--remote-debugging-port=9222`），
-  再用 IDE 的 Chrome/JS 调试器 attach 到该端口。
-
-## 同时调试 main + renderer（推荐组合）
-1. `npm: dev`（启动 webpack-dev-server + tsc watch）
-2. `Electron Main (inspect run)`（启动 Electron 主进程）
-3. `Attach 9229`（IDE 调试 main）
-4. Electron 窗口 `Ctrl+Shift+I`（DevTools 调试 renderer）
-
-## 常见问题
-### 1) 3000 端口被占用
-webpack-dev-server 默认使用 3000。可用以下命令查看占用进程：
-```powershell path=null start=null
-netstat -ano | findstr ":3000"
-```
-然后用 PID 查进程：
-```powershell path=null start=null
-tasklist /FI "PID eq <PID>"
-```
-
-### 2) Electron 白屏
-开发模式下白屏通常是 `http://localhost:3000` 未启动或渲染进程报错。
-- 确认 `npm: dev` 正在运行且 `http://localhost:3000` 可访问
-- 在 Electron 窗口打开 DevTools（Ctrl+Shift+I）查看 Console 报错
+完整独立文档：`docs/FORK_SETUP.md`
 
 ## Excel Diff 原理（Myers + 行相似度）
 Excel diff 通常采用“先粗对齐，再细匹配”的思路：
