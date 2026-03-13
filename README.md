@@ -1,5 +1,13 @@
 # electron_excel
 
+## 冲突处理
+![冲突处理占位图1](docs/assets/merge.png)
+说明：冲突处理流程截图 1（进入冲突文件后的操作入口）。
+
+## Diff
+![Diff 占位图1](docs/assets/diff.png)
+说明：Diff 流程截图 1（在文件列表中触发 External Diff）。
+
 ## 开发环境
 - Windows
 - Node.js + npm
@@ -131,13 +139,7 @@ npm run dev
 ### 配置截图
 ![Fork 集成设置](docs/assets/fork-integration-settings.png)
 
-### 冲突处理
-![冲突处理占位图1](docs/assets/merge.png)
-说明：冲突处理流程截图 1（进入冲突文件后的操作入口）。
 
-### Diff
-![Diff 占位图1](docs/assets/diff.png)
-说明：Diff 流程截图 1（在文件列表中触发 External Diff）。
 
 
 
