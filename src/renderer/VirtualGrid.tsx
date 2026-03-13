@@ -35,6 +35,7 @@ export interface VirtualGridProps<Cell> {
   // 可选：外部受控横向滚动位置（用于共享一个横向滚动条）
   scrollLeft?: number | null;
   disableHorizontalScroll?: boolean;
+  forceScrollbars?: boolean;
   // 可选：暴露内部滚动容器，便于外部同步 scrollLeft/scrollTop
   containerRef?: React.RefObject<HTMLDivElement>;
   // 可选：每次水平滚动时通知外部当前 scrollLeft，用于左右表格联动
@@ -43,6 +44,7 @@ export interface VirtualGridProps<Cell> {
   onScrollYChange?: (scrollTop: number) => void;
   // 可选：滚动使指定单元格出现在视口中（rowIndex/colIndex 均为 0-based grid 索引）
   scrollToCell?: { rowIndex: number; colIndex: number } | null;
+  scrollToCellAlign?: 'nearest' | 'center';
 }
 
 const DEFAULT_ROW_HEIGHT = 24;
@@ -65,6 +67,7 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
     renderHeaderCell,
     onHeaderContextMenu,
     defaultColWidth = 120,
+    forceScrollbars = false,
   } = props;
 
   const [internalColumnWidths, setInternalColumnWidths] = useState<number[]>([]);
@@ -271,19 +274,25 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
     if (!target || !el) return;
 
     const { rowIndex, colIndex } = target;
+    const align = props.scrollToCellAlign ?? 'nearest';
 
     // 竖向：冻结行无需滚动
     if (rowIndex >= safeFrozenRowCount) {
       const scrollRowIndex = rowIndex - safeFrozenRowCount;
       const rowTop = scrollRowIndex * rowHeight;
       const rowBottom = rowTop + rowHeight;
-      const viewTop = el.scrollTop;
-      const viewBottom = viewTop + el.clientHeight;
-
-      if (rowTop < viewTop) {
-        el.scrollTop = rowTop;
-      } else if (rowBottom > viewBottom) {
-        el.scrollTop = Math.max(0, rowBottom - el.clientHeight);
+      if (align === 'center') {
+        const centeredTop = rowTop - Math.max(0, (el.clientHeight - rowHeight) / 2);
+        const maxScrollTop = Math.max(0, el.scrollHeight - el.clientHeight);
+        el.scrollTop = Math.max(0, Math.min(centeredTop, maxScrollTop));
+      } else {
+        const viewTop = el.scrollTop;
+        const viewBottom = viewTop + el.clientHeight;
+        if (rowTop < viewTop) {
+          el.scrollTop = rowTop;
+        } else if (rowBottom > viewBottom) {
+          el.scrollTop = Math.max(0, rowBottom - el.clientHeight);
+        }
       }
     }
 
@@ -292,19 +301,33 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
       const colLeft = getColLeft(colIndex);
       const colRight = colLeft + getColWidth(colIndex);
       const frozenW = getFrozenColsWidth();
-      const viewLeft = el.scrollLeft + frozenW;
-      const viewRight = el.scrollLeft + el.clientWidth;
-
-      if (colLeft < viewLeft) {
-        el.scrollLeft = Math.max(0, colLeft - frozenW);
-      } else if (colRight > viewRight) {
-        el.scrollLeft = Math.max(0, colRight - el.clientWidth);
+      const scrollAreaWidth = Math.max(0, el.clientWidth - frozenW);
+      if (align === 'center' && scrollAreaWidth > 0) {
+        const targetScrollLeft = colLeft - frozenW - Math.max(0, (scrollAreaWidth - getColWidth(colIndex)) / 2);
+        const maxScrollLeft = Math.max(0, el.scrollWidth - el.clientWidth);
+        el.scrollLeft = Math.max(0, Math.min(targetScrollLeft, maxScrollLeft));
+      } else {
+        const viewLeft = el.scrollLeft + frozenW;
+        const viewRight = el.scrollLeft + el.clientWidth;
+        if (colLeft < viewLeft) {
+          el.scrollLeft = Math.max(0, colLeft - frozenW);
+        } else if (colRight > viewRight) {
+          el.scrollLeft = Math.max(0, colRight - el.clientWidth);
+        }
       }
     }
     // 有些环境下 programmatic scroll 不一定触发 scroll 事件，这里显式通知外部同步
     if (props.onScrollXChange) props.onScrollXChange(el.scrollLeft);
     if (props.onScrollYChange) props.onScrollYChange(el.scrollTop);
-  }, [props.scrollToCell, safeFrozenRowCount, safeFrozenColCount, rowHeight, viewportHeight, columnWidths]);
+  }, [
+    props.scrollToCell,
+    props.scrollToCellAlign,
+    safeFrozenRowCount,
+    safeFrozenColCount,
+    rowHeight,
+    viewportHeight,
+    columnWidths,
+  ]);
 
   const renderRow = (row: Cell[], rowIndex: number) => {
     const isFrozenRow = rowIndex < safeFrozenRowCount;
@@ -501,8 +524,8 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
         style={{
           flex: 1,
           minHeight: 0,
-          overflowY: 'auto',
-          overflowX: props.disableHorizontalScroll ? 'hidden' : 'auto',
+          overflowY: forceScrollbars ? 'scroll' : 'auto',
+          overflowX: props.disableHorizontalScroll ? 'hidden' : forceScrollbars ? 'scroll' : 'auto',
         }}
       >
         <table style={{ borderCollapse: 'collapse', tableLayout: 'fixed', width: totalTableWidth }}>

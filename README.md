@@ -40,8 +40,13 @@ npm run pack:unpacked
 
 ### 产物位置说明
 - 安装包（压缩）：`dist_electron/*.exe`
-- Portable（压缩）：`dist_electron/*-portable.exe`
+- Portable（压缩）：`dist_electron/*.exe`（执行 `npm run pack:win` 生成）
 - Unpacked（非压缩）：`dist_electron/win-unpacked/`
+
+### Git 提交约定（打包产物）
+- 需要提交：`dist_electron/*.exe`（发布给他人的安装包/便携包）。
+- 不提交：`dist_electron/win-unpacked/` 以及临时打包目录（用于本地调试）。
+- 建议流程：每次执行打包命令后，只挑选新的 `.exe` 进入提交。
 
 ### 体积对比（记录模板）
 可在每次发布前后记录一次，便于持续优化包体积。
@@ -49,7 +54,7 @@ npm run pack:unpacked
 | 构建方式 | 命令 | 典型产物 | 体积（MB） | 适用场景 |
 |---|---|---|---:|---|
 | NSIS 安装包（压缩） | `npm run pack:nsis` | `dist_electron/*.exe` | 待填写 | 正式安装发布 |
-| Portable 单文件（压缩） | `npm run pack:win` | `dist_electron/*-portable.exe` | 待填写 | 免安装分发、U盘携带 |
+| Portable 单文件（压缩） | `npm run pack:win` | `dist_electron/*.exe` | 待填写 | 免安装分发、U盘携带 |
 | Unpacked 目录（非压缩） | `npm run pack:unpacked` | `dist_electron/win-unpacked/` | 待填写 | 调试排查、文件核查 |
 
 可用 PowerShell 快速查看体积：
@@ -142,9 +147,10 @@ npm run dev
 
 完整独立文档：`docs/FORK_SETUP.md`
 
-## Excel Diff 原理（Myers + 行相似度）
-Excel diff 通常采用“先粗对齐，再细匹配”的思路：
-1. **Myers 行级 diff（粗对齐）**：把每一行当作一个整体，快速找出完全相同的行，以及新增/删除的变动块。
+## Excel Diff 原理（jsdiff/Myers + 行相似度 + 三方分类）
+Excel diff / merge 采用“先粗对齐，再细匹配，最后做三方分类”的思路：
+1. **jsdiff 行级 diff（粗对齐）**：使用 `diff`（jsdiff）里的 Myers 序列算法，把每一行当作一个整体，先找出确定相同的行，以及新增/删除的变动块。
 2. **行相似度匹配（细对齐）**：在变动块内对“删除行”和“新增行”计算相似度（按单元格内容/相同列比例等），相似度高的行会被识别为“修改行”，而不是“删了又加”。
+3. **三方单元格分类**：在行已经对齐之后，再基于 `base / ours / theirs` 把单元格区分成 `ours-changed`、`theirs-changed`、`both-changed-same`、`conflict`，用于驱动 UI 颜色和默认 merged 值。
 
-这样既保留了 Myers 的速度与全局最短编辑优势，又能把改动行对齐到具体单元格，提升 diff 可读性。
+这样既保留了 Myers 的速度与全局最短编辑优势，又能把改动行对齐到具体单元格，并让三方 merge 的默认行为更接近真实语义。

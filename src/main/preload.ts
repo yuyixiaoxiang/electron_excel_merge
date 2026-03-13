@@ -37,6 +37,8 @@ interface SaveChangesRequest {
   changes: CellChange[];
   sheetName?: string;
   sheetIndex?: number; // 0-based
+  filePath?: string;
+  rowOps?: SaveMergeRowOp[];
 }
 
 // Merge diff types
@@ -74,6 +76,8 @@ interface MergeColumnMeta {
   theirsCol: number | null;
 }
 
+type PrimaryKeySource = 'manual' | 'auto-implicit' | 'auto-header' | 'auto-weak' | 'none';
+
 interface MergeSheetData {
   sheetName: string;
   // 性能优化：仅传输“可能产生差异”的单元格列表（稀疏结构），避免把整张表矩阵通过 IPC 传到渲染进程
@@ -81,6 +85,9 @@ interface MergeSheetData {
   rowsMeta?: MergeRowMeta[];
   hasExactDiff?: boolean;
   columnsMeta?: MergeColumnMeta[];
+  primaryKeyAlignedCol?: number | null;
+  primaryKeyOursCol?: number | null;
+  primaryKeySource?: PrimaryKeySource;
 }
 
 interface ThreeWayOpenResult {
@@ -91,13 +98,17 @@ interface ThreeWayOpenResult {
   sheets: MergeSheetData[];
 }
 
+type ThreeWayCompareMode = 'diff' | 'merge';
+
 interface ThreeWayDiffRequest {
   basePath: string;
   oursPath: string;
   theirsPath: string;
-  primaryKeyCol: number; // 1-based, -1 means no primary key
+  compareMode?: ThreeWayCompareMode;
+  primaryKeyCol: number; // 1-based manual key; -1 means auto-detect; 0 means force no primary key
   frozenRowCount?: number; // number of header rows to compare by coordinates
   rowSimilarityThreshold?: number; // 0-1
+  debugRequestId?: string;
 }
 
 interface SaveMergeCellInput {
@@ -145,11 +156,17 @@ interface CliThreeWayInfo {
   mergedPath?: string;
   mode: 'diff' | 'merge';
 }
+interface DebugLogEntry {
+  source: string;
+  event: string;
+  details?: unknown;
+}
 
 interface ThreeWayRowRequest {
   basePath: string;
   oursPath: string;
   theirsPath: string;
+  compareMode?: ThreeWayCompareMode;
   sheetName?: string;
   sheetIndex?: number; // 0-based
   frozenRowCount?: number;
@@ -157,6 +174,7 @@ interface ThreeWayRowRequest {
   baseRowNumber?: number | null;
   oursRowNumber?: number | null;
   theirsRowNumber?: number | null;
+  debugRequestId?: string;
 }
 
 interface ThreeWayRowResult {
@@ -174,9 +192,11 @@ interface ThreeWayRowsRequest {
   basePath: string;
   oursPath: string;
   theirsPath: string;
+  compareMode?: ThreeWayCompareMode;
   sheetName?: string;
   sheetIndex?: number; // 0-based
   frozenRowCount?: number;
+  debugRequestId?: string;
   rows: Array<{
     rowNumber?: number;
     baseRowNumber?: number | null;
@@ -198,6 +218,10 @@ interface ThreeWayRowsResult {
 const excelAPI = {
   openFile: async (): Promise<OpenResult | null> => {
     const result = await ipcRenderer.invoke('excel:open');
+    return result as OpenResult | null;
+  },
+  loadWorkbook: async (filePath: string): Promise<OpenResult | null> => {
+    const result = await ipcRenderer.invoke('excel:loadWorkbook', filePath);
     return result as OpenResult | null;
   },
   saveChanges: async (req: SaveChangesRequest | CellChange[]): Promise<void> => {
@@ -231,6 +255,13 @@ const excelAPI = {
     const result = await ipcRenderer.invoke('excel:getThreeWayRows', req);
     return result as ThreeWayRowsResult | null;
   },
+  debugLog: (entry: DebugLogEntry): void => {
+    ipcRenderer.send('excel:debugLog', entry);
+  },
+  getDebugLogPath: async (): Promise<string> => {
+    const result = await ipcRenderer.invoke('excel:getDebugLogPath');
+    return result as string;
+  },
 };
 
 contextBridge.exposeInMainWorld('excelAPI', excelAPI);
@@ -248,6 +279,7 @@ export type {
   MergeRowMeta,
   RowStatus,
   ThreeWayOpenResult,
+  ThreeWayCompareMode,
   ThreeWayDiffRequest,
   SaveMergeCellInput,
   SaveMergeRowOp,
@@ -255,6 +287,7 @@ export type {
   SaveMergeRequest,
   SaveMergeResponse,
   CliThreeWayInfo,
+  DebugLogEntry,
   ThreeWayRowRequest,
   ThreeWayRowResult,
   ThreeWayRowsRequest,

@@ -1,11 +1,13 @@
 import type {
   CellChange,
   CliThreeWayInfo,
+  DebugLogEntry,
   GetSheetDataRequest,
   OpenResult,
   SaveChangesRequest,
   SaveMergeRequest,
   SaveMergeResponse,
+  SheetData,
   ThreeWayDiffRequest,
   ThreeWayOpenResult,
   ThreeWayRowRequest,
@@ -22,6 +24,7 @@ declare global {
   interface Window {
     excelAPI: {
       openFile: () => Promise<OpenResult | null>;
+      loadWorkbook: (filePath: string) => Promise<OpenResult | null>;
       saveChanges: (req: SaveChangesRequest | CellChange[]) => Promise<void>;
       openThreeWay: () => Promise<ThreeWayOpenResult | null>;
       getSheetData: (req: GetSheetDataRequest) => Promise<SheetData | null>;
@@ -30,6 +33,8 @@ declare global {
       getCliThreeWayInfo: () => Promise<CliThreeWayInfo | null>;
       getThreeWayRow: (req: ThreeWayRowRequest) => Promise<ThreeWayRowResult | null>;
       getThreeWayRows: (req: ThreeWayRowsRequest) => Promise<ThreeWayRowsResult | null>;
+      debugLog: (entry: DebugLogEntry) => void;
+      getDebugLogPath: () => Promise<string>;
     };
   }
 }

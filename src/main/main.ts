@@ -7,14 +7,70 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
 import { Workbook, Worksheet, Row, Cell, CellValue } from 'exceljs';
+import { ThreeWayCompareMode, classifyThreeWayCell, diffArraysToOps, getThreeWayRuntimeConfig } from './threeWayDiffCore';
 
 // 保持对主窗口的引用，避免被GC 回收导致窗口被意外关闭
 let mainWindow: BrowserWindow | null = null;
 
 const isDev = process.env.NODE_ENV === 'development';
+const shouldBootstrapElectron = process.env.ELECTRON_EXCEL_MERGE_DISABLE_BOOTSTRAP !== '1';
 const DEFAULT_FROZEN_HEADER_ROWS = 3;
 const DEFAULT_ROW_SIMILARITY_THRESHOLD = 0.9;
-const IGNORE_BASE_IN_DIFF = true;
+const DEBUG_LOG_FILE_NAME = 'eMerge-debug.log';
+
+interface DebugLogEntry {
+  source: string;
+  event: string;
+  details?: unknown;
+}
+
+const getDebugLogPath = (): string => path.join(app.getPath('temp'), DEBUG_LOG_FILE_NAME);
+const debugFileLabel = (filePath: string | null | undefined): string | null =>
+  filePath ? path.basename(filePath) : null;
+const safeSerializeDebug = (value: unknown): string => {
+  try {
+    const seen = new WeakSet<object>();
+    return JSON.stringify(value, (_key, current) => {
+      if (current instanceof Error) {
+        return {
+          name: current.name,
+          message: current.message,
+          stack: current.stack,
+        };
+      }
+      if (typeof current === 'string' && current.length > 500) {
+        return `${current.slice(0, 500)}…(${current.length})`;
+      }
+      if (typeof current === 'object' && current !== null) {
+        if (seen.has(current)) return '[Circular]';
+        seen.add(current);
+      }
+      return current;
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    return JSON.stringify({ serializationError: message, fallback: String(value) });
+  }
+};
+const appendDebugLog = (source: string, event: string, details?: unknown) => {
+  try {
+    const line = `${new Date().toISOString()} [pid:${process.pid}] [${source}] ${event}${
+      details === undefined ? '' : ` ${safeSerializeDebug(details)}`
+    }\n`;
+    fs.appendFile(getDebugLogPath(), line, () => {});
+  } catch (error) {
+    console.error('debug log write failed', error);
+  }
+};
+
+process.on('uncaughtException', (error) => {
+  appendDebugLog('main', 'uncaughtException', error);
+  console.error(error);
+});
+process.on('unhandledRejection', (reason) => {
+  appendDebugLog('main', 'unhandledRejection', reason);
+  console.error(reason);
+});
 
 /**
  * CLI three-way merge arguments for git/Fork integration.
@@ -141,6 +197,7 @@ const gitAddFile = (filePath: string): Promise<void> => {
  * 生产模式下加载打包到 dist 中的 index.html。
  */
 function createWindow() {
+  appendDebugLog('main', 'createWindow:start', { isDev });
   mainWindow = new BrowserWindow({
     width: 1200,
     height: 800,
@@ -159,25 +216,34 @@ function createWindow() {
   }
 
   mainWindow.on('closed', () => {
+    appendDebugLog('main', 'createWindow:closed');
     mainWindow = null;
   });
 }
 
-app.whenReady().then(() => {
-  createWindow();
+if (shouldBootstrapElectron) {
+  app.whenReady().then(() => {
+    appendDebugLog('main', 'app:ready', {
+      isDev,
+      isPackaged: app.isPackaged,
+      cliMode: cliThreeWayArgs?.mode ?? null,
+      logPath: getDebugLogPath(),
+    });
+    createWindow();
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow();
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) {
+        createWindow();
+      }
+    });
+  });
+
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
+      app.quit();
     }
   });
-});
-
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit();
-  }
-});
+}
 type SimpleCellValue = string | number | null;
 
 interface RowRecord {
@@ -817,6 +883,8 @@ const rowSimilarity = (a: RowRecord, b: RowRecord): number => {
   return same / total;
 };
 
+const rowTokenOf = (row: RowRecord): string => row.values.map((v) => normalizeCellValue(v)).join('||');
+
 /**
  * 计算行的状态（基于三方对比）。
  * 
@@ -839,6 +907,7 @@ const computeRowStatus = (
   if (baseRow && sideRow && rowsEqual(baseRow, sideRow)) return 'unchanged';
   return 'modified';
 };
+
 
 const makeAddress = (col: number, row: number): string => {
   return `${colNumberToLabel(col)}${row}`;
@@ -867,10 +936,6 @@ const estimateSideIndex = (
   return baseIndex;
 };
 
-type DiffOp =
-  | { type: 'equal'; aIndex: number; bIndex: number }
-  | { type: 'delete'; aIndex: number }
-  | { type: 'insert'; bIndex: number };
 /**
  * 计算最长公共子序列（LCS）并返回匹配对。
  * 
@@ -922,68 +987,6 @@ const lcsMatchPairs = (a: string[], b: string[]): Array<{ aIndex: number; bIndex
   return pairs.reverse();
 };
 
-const myersDiff = (a: string[], b: string[]): DiffOp[] => {
-  const n = a.length;
-  const m = b.length;
-  const max = n + m;
-  let v = new Map<number, number>();
-  v.set(1, 0);
-  const trace: Map<number, number>[] = [];
-
-  for (let d = 0; d <= max; d += 1) {
-    const vSnap = new Map<number, number>();
-    for (let k = -d; k <= d; k += 2) {
-      let x: number;
-      if (k === -d || (k !== d && (v.get(k - 1) ?? 0) < (v.get(k + 1) ?? 0))) {
-        x = v.get(k + 1) ?? 0;
-      } else {
-        x = (v.get(k - 1) ?? 0) + 1;
-      }
-      let y = x - k;
-      while (x < n && y < m && a[x] === b[y]) {
-        x += 1;
-        y += 1;
-      }
-      vSnap.set(k, x);
-      if (x >= n && y >= m) {
-        trace.push(vSnap);
-        // backtrack
-        const ops: DiffOp[] = [];
-        let x2 = n;
-        let y2 = m;
-        for (let d2 = trace.length - 1; d2 >= 0; d2 -= 1) {
-          const v2 = trace[d2];
-          const k2 = x2 - y2;
-          let prevK: number;
-          if (k2 === -d2 || (k2 !== d2 && (v2.get(k2 - 1) ?? 0) < (v2.get(k2 + 1) ?? 0))) {
-            prevK = k2 + 1;
-          } else {
-            prevK = k2 - 1;
-          }
-          const prevX = v2.get(prevK) ?? 0;
-          const prevY = prevX - prevK;
-          while (x2 > prevX && y2 > prevY) {
-            ops.push({ type: 'equal', aIndex: x2 - 1, bIndex: y2 - 1 });
-            x2 -= 1;
-            y2 -= 1;
-          }
-          if (d2 === 0) break;
-          if (x2 === prevX) {
-            ops.push({ type: 'insert', bIndex: y2 - 1 });
-            y2 -= 1;
-          } else {
-            ops.push({ type: 'delete', aIndex: x2 - 1 });
-            x2 -= 1;
-          }
-        }
-        return ops.reverse();
-      }
-    }
-    trace.push(vSnap);
-    v = vSnap;
-  }
-  return [];
-};
 
 /**
  * 基于主键列对齐行。
@@ -1240,17 +1243,16 @@ const alignRowsBySequence = (
   oursRows: RowRecord[],
   theirsRows: RowRecord[],
 ): { aligned: AlignedRow[]; ambiguousOurs: Set<number>; ambiguousTheirs: Set<number> } => {
-  const buildTokens = (rows: RowRecord[]) =>
-    rows.map((r) => r.values.map((v) => normalizeCellValue(v)).join('||'));
+  const buildTokens = (rows: RowRecord[]) => rows.map((r) => rowTokenOf(r));
 
   const similarityThreshold = 0.7;
   const similarityDelta = 0.05;
-  const windowSize = 3;
+  const windowSize = 12;
 
   const alignOneSide = (sideRows: RowRecord[]) => {
     const baseTokens = buildTokens(baseRows);
     const sideTokens = buildTokens(sideRows);
-    const ops = myersDiff(baseTokens, sideTokens);
+    const ops = diffArraysToOps(baseTokens, sideTokens);
     const matched = new Map<number, number>();
     const deletes = new Set<number>();
     const inserts = new Set<number>();
@@ -1423,7 +1425,7 @@ const alignRowsByContent = (
     };
   }
 
-  const tokenOf = (r: RowRecord) => r.values.map((v) => normalizeCellValue(v)).join('||');
+  const tokenOf = (r: RowRecord) => rowTokenOf(r);
   const oursTokens = oursRows.map((r) => tokenOf(r));
   const theirsTokens = theirsRows.map((r) => tokenOf(r));
 
@@ -1520,7 +1522,9 @@ const buildMergeSheetWithRowAlign = (
   primaryKeyCol: number,
   frozenRowCount: number,
   rowSimilarityThreshold: number,
+  compareMode: ThreeWayCompareMode,
 ): MergeSheetData => {
+  const runtimeConfig = getThreeWayRuntimeConfig(compareMode);
   const sheetsEqualByCoordinate = (a: any, b: any) => {
     const maxRow = Math.max(getRowCount(a), getRowCount(b));
     const maxCol = Math.max(getColCount(a), getColCount(b));
@@ -1603,13 +1607,18 @@ const buildMergeSheetWithRowAlign = (
     theirsWs?.actualColumnCount ?? theirsWs?.columnCount ?? 0,
   );
   const headerCount = Math.max(0, Math.floor(frozenRowCount));
-  const baseWsForAlign = IGNORE_BASE_IN_DIFF ? oursWs : baseWs;
+  const baseWsForAlign = runtimeConfig.alignBaseSide === 'ours' ? oursWs : baseWs;
   const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, headerCount);
+  const columnsMeta: MergeColumnMeta[] = alignedColumns.map((c, idx) => ({
+    col: idx + 1,
+    baseCol: c.baseCol ?? null,
+    oursCol: c.oursCol ?? null,
+    theirsCol: c.theirsCol ?? null,
+  }));
   const colCount = Math.max(alignedColumns.length, 0);
   const useKey = primaryKeyCol >= 1 && primaryKeyCol <= rawColCount;
-  if (IGNORE_BASE_IN_DIFF && sheetsEqualByCoordinate(oursWs, theirsWs)) {
-    return { sheetName: baseWs.name, cells: [], rowsMeta: [], hasExactDiff: false };
-  }
+  const shouldAutoDetectKey = primaryKeyCol < 0;
+  const shouldShortCircuit = runtimeConfig.shortCircuitWhenOursEqualsTheirs && sheetsEqualByCoordinate(oursWs, theirsWs);
   const mapRawToAligned = (rawCol: number, side: 'base' | 'ours' | 'theirs'): number | null => {
     if (rawCol < 1) return null;
     const idx = alignedColumns.findIndex((c) =>
@@ -1628,13 +1637,38 @@ const buildMergeSheetWithRowAlign = (
   const theirsRows = buildRowRecordsAligned(theirsWs, alignedColumns, keyColAligned, 'theirs').filter(
     (r) => r.rowNumber > headerCount,
   );
-  const implicitKeyCol = useKey ? null : detectImplicitKeyCol(baseRows, colCount);
+  const implicitKeyCol = shouldAutoDetectKey ? detectImplicitKeyCol(baseRows, colCount) : null;
   const headerKeyColRaw =
-    !useKey && implicitKeyCol == null ? detectHeaderKeyCol(baseWsForAlign, rawColCount, headerCount) : null;
+    shouldAutoDetectKey && implicitKeyCol == null ? detectHeaderKeyCol(baseWsForAlign, rawColCount, headerCount) : null;
   const headerKeyCol = headerKeyColRaw ? mapRawToAligned(headerKeyColRaw, 'base') : null;
   const weakKeyCol =
-    !useKey && implicitKeyCol == null && headerKeyCol == null ? detectWeakKeyCol(baseRows, colCount) : null;
-  const alignKeyCol = useKey ? keyColAligned ?? -1 : implicitKeyCol ?? headerKeyCol ?? weakKeyCol ?? -1;
+    shouldAutoDetectKey && implicitKeyCol == null && headerKeyCol == null ? detectWeakKeyCol(baseRows, colCount) : null;
+  const alignKeyCol = useKey ? keyColAligned ?? -1 : shouldAutoDetectKey ? implicitKeyCol ?? headerKeyCol ?? weakKeyCol ?? -1 : -1;
+  const primaryKeySource: PrimaryKeySource = useKey
+    ? alignKeyCol >= 1
+      ? 'manual'
+      : 'none'
+    : implicitKeyCol != null
+      ? 'auto-implicit'
+      : headerKeyCol != null
+        ? 'auto-header'
+        : weakKeyCol != null
+          ? 'auto-weak'
+          : 'none';
+  const primaryKeyAlignedCol = alignKeyCol >= 1 ? alignKeyCol : null;
+  const primaryKeyOursCol = primaryKeyAlignedCol ? alignedColumns[primaryKeyAlignedCol - 1]?.oursCol ?? null : null;
+  if (shouldShortCircuit) {
+    return {
+      sheetName: baseWs.name,
+      cells: [],
+      rowsMeta: [],
+      hasExactDiff: false,
+      columnsMeta,
+      primaryKeyAlignedCol,
+      primaryKeyOursCol,
+      primaryKeySource,
+    };
+  }
   const alignedResult =
     alignKeyCol >= 1
       ? alignRowsByKey(
@@ -1644,7 +1678,7 @@ const buildMergeSheetWithRowAlign = (
           alignKeyCol,
           rowSimilarityThreshold,
         )
-      : IGNORE_BASE_IN_DIFF
+      : runtimeConfig.useTwoWayContentAlignment
         ? alignRowsByContent(oursRows, theirsRows)
         : alignRowsBySequence(baseRows, oursRows, theirsRows);
 
@@ -1689,11 +1723,10 @@ const buildMergeSheetWithRowAlign = (
     });
   });
 
-  const same = (a: SimpleCellValue, b: SimpleCellValue) => normalizeCellValue(a) === normalizeCellValue(b);
   const cells: MergeCell[] = [];
   let hasExactDiff = false;
 
-  // Header rows diff by fixed row number (compare ours vs theirs only)
+  // Header rows diff by fixed row number and classify with base / ours / theirs
   for (let r = 1; r <= headerCount; r += 1) {
     const baseRow = buildHeaderRowRecordAligned(baseWsForAlign, r, alignedColumns, metaKeyCol, 'base');
     const oursRow = buildHeaderRowRecordAligned(oursWs, r, alignedColumns, metaKeyCol, 'ours');
@@ -1706,19 +1739,7 @@ const buildMergeSheetWithRowAlign = (
       const baseValue = baseRow.values[col - 1] ?? null;
       const oursValue = oursRow.values[col - 1] ?? null;
       const theirsValue = theirsRow.values[col - 1] ?? null;
-
-      const equalOT = same(oursValue, theirsValue);
-
-      let status: MergeCell['status'];
-      let mergedValue: SimpleCellValue = oursValue;
-
-      if (equalOT) {
-        status = 'unchanged';
-        mergedValue = oursValue;
-      } else {
-        status = 'conflict';
-        mergedValue = oursValue;
-      }
+      const { status, mergedValue } = classifyThreeWayCell(baseValue, oursValue, theirsValue);
 
       if (status !== 'unchanged') {
         const colMeta = alignedColumns[col - 1];
@@ -1740,7 +1761,7 @@ const buildMergeSheetWithRowAlign = (
     }
   }
 
-  // Body rows diff via alignment (compare ours vs theirs only)
+  // Body rows diff via alignment and classify with base / ours / theirs
   aligned.forEach((row, visualIndex) => {
     const visualRowNumber = headerCount + visualIndex + 1;
     const cols = new Set<number>();
@@ -1753,19 +1774,7 @@ const buildMergeSheetWithRowAlign = (
       const baseValue = row.base?.values[col - 1] ?? null;
       const oursValue = row.ours?.values[col - 1] ?? null;
       const theirsValue = row.theirs?.values[col - 1] ?? null;
-
-      const equalOT = same(oursValue, theirsValue);
-
-      let status: MergeCell['status'];
-      let mergedValue: SimpleCellValue = oursValue;
-
-      if (equalOT) {
-        status = 'unchanged';
-        mergedValue = oursValue;
-      } else {
-        status = 'conflict';
-        mergedValue = oursValue;
-      }
+      const { status, mergedValue } = classifyThreeWayCell(baseValue, oursValue, theirsValue);
 
       if (status !== 'unchanged') {
         const addressRow =
@@ -1830,12 +1839,10 @@ const buildMergeSheetWithRowAlign = (
     cells,
     rowsMeta,
     hasExactDiff,
-    columnsMeta: alignedColumns.map((c, idx) => ({
-      col: idx + 1,
-      baseCol: c.baseCol ?? null,
-      oursCol: c.oursCol ?? null,
-      theirsCol: c.theirsCol ?? null,
-    })),
+    columnsMeta,
+    primaryKeyAlignedCol,
+    primaryKeyOursCol,
+    primaryKeySource,
   };
 };
 
@@ -1844,10 +1851,20 @@ const workbookCache = new Map<string, Workbook>();
 
 const loadWorkbookCached = async (filePath: string): Promise<Workbook> => {
   const hit = workbookCache.get(filePath);
-  if (hit) return hit;
+  if (hit) {
+    appendDebugLog('main', 'workbook-cache:hit', { filePath: debugFileLabel(filePath) });
+    return hit;
+  }
+  const startedAt = Date.now();
+  appendDebugLog('main', 'workbook-cache:miss', { filePath: debugFileLabel(filePath) });
   const wb = new Workbook();
   await wb.xlsx.readFile(filePath);
   workbookCache.set(filePath, wb);
+  appendDebugLog('main', 'workbook-cache:store', {
+    filePath: debugFileLabel(filePath),
+    durationMs: Date.now() - startedAt,
+    sheetCount: wb.worksheets.length,
+  });
   return wb;
 };
 
@@ -1869,7 +1886,18 @@ const buildMergeSheetsForWorkbooks = async (
   primaryKeyCol: number,
   frozenRowCount: number,
   rowSimilarityThreshold: number,
+  compareMode: ThreeWayCompareMode,
 ) => {
+  const startedAt = Date.now();
+  appendDebugLog('main', 'buildMergeSheetsForWorkbooks:start', {
+    compareMode,
+    primaryKeyCol,
+    frozenRowCount,
+    rowSimilarityThreshold,
+    basePath: debugFileLabel(basePath),
+    oursPath: debugFileLabel(oursPath),
+    theirsPath: debugFileLabel(theirsPath),
+  });
   // 复用缓存，避免每次调取重新 diff 时重复从磁盘读取
   const [baseWb, oursWb, theirsWb] = await Promise.all([
     loadWorkbookCached(basePath),
@@ -1913,7 +1941,15 @@ const buildMergeSheetsForWorkbooks = async (
     usedTheirsIdx.add(theirsHit.idx);
 
     mergeSheets.push(
-      buildMergeSheetWithRowAlign(baseWs, oursHit.ws, theirsHit.ws, primaryKeyCol, frozenRowCount, rowSimilarityThreshold),
+      buildMergeSheetWithRowAlign(
+        baseWs,
+        oursHit.ws,
+        theirsHit.ws,
+        primaryKeyCol,
+        frozenRowCount,
+        rowSimilarityThreshold,
+        compareMode,
+      ),
     );
   }
 
@@ -1925,10 +1961,24 @@ const buildMergeSheetsForWorkbooks = async (
     usedOursIdx.add(idx);
     usedTheirsIdx.add(idx);
     mergeSheets.push(
-      buildMergeSheetWithRowAlign(baseList[idx], oursList[idx], theirsList[idx], primaryKeyCol, frozenRowCount, rowSimilarityThreshold),
+      buildMergeSheetWithRowAlign(
+        baseList[idx],
+        oursList[idx],
+        theirsList[idx],
+        primaryKeyCol,
+        frozenRowCount,
+        rowSimilarityThreshold,
+        compareMode,
+      ),
     );
   }
 
+  appendDebugLog('main', 'buildMergeSheetsForWorkbooks:end', {
+    compareMode,
+    durationMs: Date.now() - startedAt,
+    sheetCount: mergeSheets.length,
+    diffCellCount: mergeSheets.reduce((sum, sheet) => sum + (sheet.cells?.length ?? 0), 0),
+  });
   return { basePath, oursPath, theirsPath, mergeSheets };
 };
 
@@ -2000,12 +2050,17 @@ interface MergeColumnMeta {
   theirsCol: number | null;
 }
 
+type PrimaryKeySource = 'manual' | 'auto-implicit' | 'auto-header' | 'auto-weak' | 'none';
+
 interface MergeSheetData {
   sheetName: string;
   cells: MergeCell[];
   rowsMeta?: MergeRowMeta[];
   hasExactDiff?: boolean;
   columnsMeta?: MergeColumnMeta[];
+  primaryKeyAlignedCol?: number | null;
+  primaryKeyOursCol?: number | null;
+  primaryKeySource?: PrimaryKeySource;
 }
 
 interface SaveMergeCellInput {
@@ -2048,27 +2103,7 @@ interface SaveMergeResponse {
 
 let currentFilePath: string | null = null;
 
-/**
- * 处理渲染进程请求：选择并打开一个Excel 文件。
- *
- * 返回：文件路径+ 所有工作表的二维单元格数据（仅包含“值”）：
- * 用于单文件查看编辑模式。
- */
-ipcMain.handle('excel:open', async () => {
-  if (!mainWindow) return null;
-
-  const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
-    filters: [{ name: 'Excel Files', extensions: ['xlsx'] }],
-    properties: ['openFile'],
-  });
-
-  if (canceled || filePaths.length === 0) {
-    return null;
-  }
-
-  const filePath = filePaths[0];
-  currentFilePath = filePath;
-
+const readWorkbookOpenResult = async (filePath: string) => {
   const workbook = new Workbook();
   await workbook.xlsx.readFile(filePath);
 
@@ -2078,13 +2113,10 @@ ipcMain.handle('excel:open', async () => {
     const getSimpleValue = (raw: CellValue): string | number | null => {
       if (raw === null || raw === undefined) return null;
 
-      // Date
       if (raw instanceof Date) {
-        // 保持可读性，避免显示为[object Object]
         return raw.toISOString();
       }
 
-      // 富文本：raw.richText 是一个包含{ text } 的数组
       if (typeof raw === 'object' && Array.isArray((raw as any).richText)) {
         const parts = (raw as any).richText
           .map((p: any) => (p && typeof p.text === 'string' ? p.text : ''))
@@ -2092,14 +2124,12 @@ ipcMain.handle('excel:open', async () => {
         return parts;
       }
 
-      // Hyperlink / text-like objects
       if (typeof raw === 'object' && raw && 'text' in (raw as any)) {
         const t = (raw as any).text;
         if (t === null || t === undefined) return null;
         return typeof t === 'string' || typeof t === 'number' ? (t as any) : String(t);
       }
 
-      // Formula / shared formula 等：优先显示 result
       if (typeof raw === 'object' && raw && 'result' in (raw as any)) {
         const r = (raw as any).result;
         if (r === null || r === undefined) return null;
@@ -2112,7 +2142,6 @@ ipcMain.handle('excel:open', async () => {
         return raw;
       }
 
-      // 兜底：尽量JSON 序列化，避免 [object Object]
       if (typeof raw === 'object') {
         try {
           return JSON.stringify(raw);
@@ -2124,8 +2153,6 @@ ipcMain.handle('excel:open', async () => {
       return String(raw);
     };
 
-    // 重要：确保每一行的列数一致。
-    // 否则会出现“数据行列数 > 表头/冻结行列数”造成错位。
     const maxRow =
       (worksheet as any).actualRowCount && (worksheet as any).actualRowCount > 0
         ? (worksheet as any).actualRowCount
@@ -2158,8 +2185,35 @@ ipcMain.handle('excel:open', async () => {
   };
 
   const sheets: SheetData[] = workbook.worksheets.map((ws) => buildSheetData(ws));
-
   return { filePath, sheet: sheets[0], sheets };
+};
+
+/**
+ * 处理渲染进程请求：选择并打开一个Excel 文件。
+ *
+ * 返回：文件路径+ 所有工作表的二维单元格数据（仅包含“值”）：
+ * 用于单文件查看编辑模式。
+ */
+ipcMain.handle('excel:open', async () => {
+  if (!mainWindow) return null;
+
+  const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+    filters: [{ name: 'Excel Files', extensions: ['xlsx'] }],
+    properties: ['openFile'],
+  });
+
+  if (canceled || filePaths.length === 0) {
+    return null;
+  }
+
+  const filePath = filePaths[0];
+  currentFilePath = filePath;
+  return readWorkbookOpenResult(filePath);
+});
+
+ipcMain.handle('excel:loadWorkbook', async (_event, filePath: string) => {
+  if (!filePath) return null;
+  return readWorkbookOpenResult(filePath);
 });
 
 interface CellChange {
@@ -2177,31 +2231,74 @@ interface GetSheetDataRequest {
  *
  * 只修改单元格的value，不动样式公式等格式信息。
  */
-ipcMain.handle('excel:saveChanges', async (_event, req: CellChange[] | { changes: CellChange[]; sheetName?: string; sheetIndex?: number }) => {
-  if (!currentFilePath) {
+ipcMain.handle('excel:saveChanges', async (_event, req: CellChange[] | { changes: CellChange[]; sheetName?: string; sheetIndex?: number; filePath?: string; rowOps?: SaveMergeRowOp[] }) => {
+  const targetFilePath = !Array.isArray(req) ? req?.filePath ?? currentFilePath : currentFilePath;
+  if (!targetFilePath) {
     throw new Error('No Excel file is currently loaded');
   }
   const changes: CellChange[] = Array.isArray(req) ? req : (req?.changes ?? []);
   const sheetName = !Array.isArray(req) ? req?.sheetName : undefined;
   const sheetIndex = !Array.isArray(req) ? req?.sheetIndex : undefined;
+  const rowOps = !Array.isArray(req) ? req?.rowOps ?? [] : [];
 
   const workbook = new Workbook();
-  await workbook.xlsx.readFile(currentFilePath);
+  await workbook.xlsx.readFile(targetFilePath);
   let worksheet = sheetName ? workbook.getWorksheet(sheetName) ?? undefined : undefined;
   if (!worksheet && typeof sheetIndex === 'number' && sheetIndex >= 0) {
     worksheet = workbook.worksheets[sheetIndex];
   }
   if (!worksheet) worksheet = workbook.worksheets[0];
 
+  if (rowOps.length > 0) {
+    const rowOpsBySheet = new Map<string, SaveMergeRowOp[]>();
+    rowOps.forEach((op) => {
+      const key = op.sheetName || sheetName || '';
+      if (!rowOpsBySheet.has(key)) rowOpsBySheet.set(key, []);
+      rowOpsBySheet.get(key)!.push(op);
+    });
+    rowOpsBySheet.forEach((ops, targetSheetName) => {
+      let ws = targetSheetName ? workbook.getWorksheet(targetSheetName) ?? undefined : undefined;
+      if (!ws && sheetName) ws = workbook.getWorksheet(sheetName) ?? undefined;
+      if (!ws && typeof sheetIndex === 'number' && sheetIndex >= 0) {
+        ws = workbook.worksheets[sheetIndex];
+      }
+      if (!ws) ws = workbook.worksheets[0];
+      const sorted = ops
+        .slice()
+        .sort((a, b) => a.targetRowNumber - b.targetRowNumber || (a.visualRowNumber ?? 0) - (b.visualRowNumber ?? 0));
+      for (const op of sorted) {
+        const rowNumber = Math.max(1, Math.floor(op.targetRowNumber));
+        if (op.action === 'insert') {
+          const maxCol = Math.max(
+            ws?.actualColumnCount ?? ws?.columnCount ?? 0,
+            op.values?.length ?? 0,
+          );
+          const values: (string | number | null)[] = [];
+          for (let i = 0; i < maxCol; i += 1) {
+            values.push(op.values && i < op.values.length ? op.values[i] ?? null : null);
+          }
+          ws.spliceRows(rowNumber, 0, values);
+        } else if (op.action === 'delete') {
+          ws.spliceRows(rowNumber, 1);
+        }
+      }
+    });
+    worksheet = sheetName ? workbook.getWorksheet(sheetName) ?? worksheet : worksheet;
+    if (!worksheet && typeof sheetIndex === 'number' && sheetIndex >= 0) {
+      worksheet = workbook.worksheets[sheetIndex];
+    }
+    if (!worksheet) worksheet = workbook.worksheets[0];
+  }
+
   for (const change of changes) {
     const cell = worksheet.getCell(change.address);
     cell.value = change.newValue as any; // only change value, keep formatting/styles
   }
 
-  await workbook.xlsx.writeFile(currentFilePath);
+  await workbook.xlsx.writeFile(targetFilePath);
   // invalidate cache to avoid stale reads
-  if (workbookCache.has(currentFilePath)) {
-    workbookCache.delete(currentFilePath);
+  if (workbookCache.has(targetFilePath)) {
+    workbookCache.delete(targetFilePath);
   }
 
   return { success: true };
@@ -2252,8 +2349,11 @@ ipcMain.handle('excel:getSheetData', async (_event, req: GetSheetDataRequest): P
 //   - 直接覆盖 ours（LOCAL）。
 // 交互式模式下：
 //   - 弹出保存对话框，由用户选择目标路径。
-ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): Promise<SaveMergeResponse> => {
-  if (!mainWindow) {
+const saveMergeResultInternal = async (
+  req: SaveMergeRequest,
+  options?: { targetPathOverride?: string; skipMainWindowRequirement?: boolean },
+): Promise<SaveMergeResponse> => {
+  if (!options?.skipMainWindowRequirement && !mainWindow) {
     throw new Error('Main window is not available');
   }
 
@@ -2264,17 +2364,21 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
       rowOps?: SaveMergeRowOp[];
       colOps?: SaveMergeColOp[];
     };
-    let targetPath: string | undefined;
+    let targetPath: string | undefined = options?.targetPathOverride;
 
-    if (cliThreeWayArgs && cliThreeWayArgs.mode === 'merge') {
+    if (!targetPath && cliThreeWayArgs && cliThreeWayArgs.mode === 'merge') {
       // git / Fork merge 模式：优先写入MERGED（工作区对应文件），如果命令只传了base/ours/theirs 三个参数，则回退覆盖 ours。
       const oursPath = cliThreeWayArgs.oursPath;
       const mergedPath = cliThreeWayArgs.mergedPath;
       targetPath = mergedPath || oursPath;
-    } else if (cliThreeWayArgs && cliThreeWayArgs.mode === 'diff') {
+    } else if (!targetPath && cliThreeWayArgs && cliThreeWayArgs.mode === 'diff') {
       targetPath = cliThreeWayArgs.oursPath;
-    } else {
-      const { canceled, filePath } = await dialog.showSaveDialog(mainWindow, {
+    } else if (!targetPath) {
+      const windowForSave = mainWindow;
+      if (!windowForSave) {
+        throw new Error('Main window is not available');
+      }
+      const { canceled, filePath } = await dialog.showSaveDialog(windowForSave, {
         title: '保存合并后的 Excel',
         defaultPath: templatePath,
         filters: [{ name: 'Excel Files', extensions: ['xlsx'] }],
@@ -2536,7 +2640,15 @@ ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): P
     console.error('excel:saveMergeResult failed', err);
     return { success: false, errorMessage: err?.message ?? String(err) };
   }
+};
+
+ipcMain.handle('excel:saveMergeResult', async (_event, req: SaveMergeRequest): Promise<SaveMergeResponse> => {
+  return saveMergeResultInternal(req);
 });
+ipcMain.on('excel:debugLog', (_event, entry: DebugLogEntry) => {
+  appendDebugLog(entry?.source ?? 'renderer', entry?.event ?? 'unknown', entry?.details);
+});
+ipcMain.handle('excel:getDebugLogPath', async () => getDebugLogPath());
 
 // 三方 diff：base / ours / theirs，只比较单元格值，忽略格式
 //
@@ -2550,7 +2662,7 @@ ipcMain.handle('excel:openThreeWay', async () => {
   const rowSimilarityThreshold = DEFAULT_ROW_SIMILARITY_THRESHOLD;
 
   if (cliThreeWayArgs) {
-    const { basePath, oursPath, theirsPath } = cliThreeWayArgs;
+    const { basePath, oursPath, theirsPath, mode } = cliThreeWayArgs;
     const { mergeSheets } = await buildMergeSheetsForWorkbooks(
       basePath,
       oursPath,
@@ -2558,6 +2670,7 @@ ipcMain.handle('excel:openThreeWay', async () => {
       primaryKeyCol,
       frozenRowCount,
       rowSimilarityThreshold,
+      mode,
     );
     return normalizeThreeWayResult(basePath, oursPath, theirsPath, mergeSheets);
   }
@@ -2587,6 +2700,7 @@ ipcMain.handle('excel:openThreeWay', async () => {
     primaryKeyCol,
     frozenRowCount,
     rowSimilarityThreshold,
+    'merge',
   );
 
   return normalizeThreeWayResult(basePath, oursPath, theirsPath, mergeSheets);
@@ -2595,13 +2709,17 @@ interface ThreeWayDiffRequest {
   basePath: string;
   oursPath: string;
   theirsPath: string;
-  primaryKeyCol: number; // 1-based, -1 means no primary key
+  compareMode?: ThreeWayCompareMode;
+  primaryKeyCol: number; // 1-based manual key; -1 means auto-detect; 0 means force no primary key
   frozenRowCount?: number; // header rows compared by coordinates
   rowSimilarityThreshold?: number; // 0-1
+  debugRequestId?: string;
 }
 
 ipcMain.handle('excel:computeThreeWayDiff', async (_event, req: ThreeWayDiffRequest) => {
   if (!req || !req.basePath || !req.oursPath || !req.theirsPath) return null;
+  const requestId = req.debugRequestId ?? `compute-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const startedAt = Date.now();
   const primaryKeyCol =
     typeof req.primaryKeyCol === 'number' && !Number.isNaN(req.primaryKeyCol) ? Math.floor(req.primaryKeyCol) : 1;
   const frozenRowCount =
@@ -2612,15 +2730,43 @@ ipcMain.handle('excel:computeThreeWayDiff', async (_event, req: ThreeWayDiffRequ
     typeof req.rowSimilarityThreshold === 'number' && !Number.isNaN(req.rowSimilarityThreshold)
       ? Math.min(1, Math.max(0, req.rowSimilarityThreshold))
       : DEFAULT_ROW_SIMILARITY_THRESHOLD;
-  const { mergeSheets } = await buildMergeSheetsForWorkbooks(
-    req.basePath,
-    req.oursPath,
-    req.theirsPath,
+  const compareMode: ThreeWayCompareMode = req.compareMode === 'diff' ? 'diff' : 'merge';
+  appendDebugLog('main', 'computeThreeWayDiff:start', {
+    requestId,
+    compareMode,
     primaryKeyCol,
     frozenRowCount,
     rowSimilarityThreshold,
-  );
-  return normalizeThreeWayResult(req.basePath, req.oursPath, req.theirsPath, mergeSheets);
+    basePath: debugFileLabel(req.basePath),
+    oursPath: debugFileLabel(req.oursPath),
+    theirsPath: debugFileLabel(req.theirsPath),
+  });
+  try {
+    const { mergeSheets } = await buildMergeSheetsForWorkbooks(
+      req.basePath,
+      req.oursPath,
+      req.theirsPath,
+      primaryKeyCol,
+      frozenRowCount,
+      rowSimilarityThreshold,
+      compareMode,
+    );
+    appendDebugLog('main', 'computeThreeWayDiff:end', {
+      requestId,
+      durationMs: Date.now() - startedAt,
+      sheetCount: mergeSheets.length,
+      diffCellCount: mergeSheets.reduce((sum, sheet) => sum + (sheet.cells?.length ?? 0), 0),
+    });
+    return normalizeThreeWayResult(req.basePath, req.oursPath, req.theirsPath, mergeSheets);
+  } catch (error: any) {
+    appendDebugLog('main', 'computeThreeWayDiff:error', {
+      requestId,
+      durationMs: Date.now() - startedAt,
+      message: error?.message ?? String(error),
+      stack: error?.stack,
+    });
+    throw error;
+  }
 });
 
 // 将CLI three-way 信息暴露给渲染进程，便于自动加载
@@ -2634,6 +2780,7 @@ interface ThreeWayRowRequest {
   basePath: string;
   oursPath: string;
   theirsPath: string;
+  compareMode?: ThreeWayCompareMode;
   sheetName?: string;
   sheetIndex?: number; // 0-based
   frozenRowCount?: number;
@@ -2641,6 +2788,7 @@ interface ThreeWayRowRequest {
   baseRowNumber?: number | null;
   oursRowNumber?: number | null;
   theirsRowNumber?: number | null;
+  debugRequestId?: string;
 }
 
 interface ThreeWayRowResult {
@@ -2658,9 +2806,11 @@ interface ThreeWayRowsRequest {
   basePath: string;
   oursPath: string;
   theirsPath: string;
+  compareMode?: ThreeWayCompareMode;
   sheetName?: string;
   sheetIndex?: number; // 0-based
   frozenRowCount?: number;
+  debugRequestId?: string;
   rows: Array<{
     rowNumber?: number;
     baseRowNumber?: number | null;
@@ -2702,6 +2852,8 @@ const normalizeSharedFormulas = (workbook: Workbook) => {
 
 ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): Promise<ThreeWayRowResult | null> => {
   if (!req || !req.basePath || !req.oursPath || !req.theirsPath) return null;
+  const requestId = req.debugRequestId ?? `row-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const startedAt = Date.now();
   const fallbackRow =
     typeof req.rowNumber === 'number' && !Number.isNaN(req.rowNumber)
       ? Math.max(1, Math.floor(req.rowNumber))
@@ -2734,9 +2886,21 @@ ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): 
     typeof req.frozenRowCount === 'number' && !Number.isNaN(req.frozenRowCount)
       ? Math.max(0, Math.floor(req.frozenRowCount))
       : DEFAULT_FROZEN_HEADER_ROWS;
-  const baseWsForAlign = IGNORE_BASE_IN_DIFF ? oursWs : baseWs;
+  const compareMode: ThreeWayCompareMode = req.compareMode === 'diff' ? 'diff' : 'merge';
+  const runtimeConfig = getThreeWayRuntimeConfig(compareMode);
+  const baseWsForAlign = runtimeConfig.alignBaseSide === 'ours' ? oursWs : baseWs;
   const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, headerCount);
   const colCount = alignedColumns.length;
+  appendDebugLog('main', 'getThreeWayRow:start', {
+    requestId,
+    compareMode,
+    sheetName: resolvedSheetName,
+    fallbackRow,
+    baseRowNumber,
+    oursRowNumber,
+    theirsRowNumber,
+    frozenRowCount: headerCount,
+  });
 
   const readRowAligned = (
     ws: any,
@@ -2763,7 +2927,7 @@ ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): 
     return arr;
   };
 
-  return {
+  const result = {
     sheetName: resolvedSheetName,
     rowNumber: fallbackRow ?? undefined,
     baseRowNumber: baseRowNumber ?? null,
@@ -2774,9 +2938,18 @@ ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): 
     ours: readRowAligned(oursWs, oursRowNumber ?? null, 'ours'),
     theirs: readRowAligned(theirsWs, theirsRowNumber ?? null, 'theirs'),
   };
+  appendDebugLog('main', 'getThreeWayRow:end', {
+    requestId,
+    durationMs: Date.now() - startedAt,
+    sheetName: resolvedSheetName,
+    colCount,
+  });
+  return result;
 });
 ipcMain.handle('excel:getThreeWayRows', async (_event, req: ThreeWayRowsRequest): Promise<ThreeWayRowsResult | null> => {
   if (!req || !req.basePath || !req.oursPath || !req.theirsPath || !Array.isArray(req.rows)) return null;
+  const requestId = req.debugRequestId ?? `rows-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const startedAt = Date.now();
 
   const [baseWb, oursWb, theirsWb] = await Promise.all([
     loadWorkbookCached(req.basePath),
@@ -2793,9 +2966,18 @@ ipcMain.handle('excel:getThreeWayRows', async (_event, req: ThreeWayRowsRequest)
     typeof req.frozenRowCount === 'number' && !Number.isNaN(req.frozenRowCount)
       ? Math.max(0, Math.floor(req.frozenRowCount))
       : DEFAULT_FROZEN_HEADER_ROWS;
-  const baseWsForAlign = IGNORE_BASE_IN_DIFF ? oursWs : baseWs;
+  const compareMode: ThreeWayCompareMode = req.compareMode === 'diff' ? 'diff' : 'merge';
+  const runtimeConfig = getThreeWayRuntimeConfig(compareMode);
+  const baseWsForAlign = runtimeConfig.alignBaseSide === 'ours' ? oursWs : baseWs;
   const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, headerCount);
   const colCount = alignedColumns.length;
+  appendDebugLog('main', 'getThreeWayRows:start', {
+    requestId,
+    compareMode,
+    sheetName: resolvedSheetName,
+    rowCount: req.rows.length,
+    frozenRowCount: headerCount,
+  });
 
   const readRowAligned = (
     ws: any,
@@ -2845,5 +3027,19 @@ ipcMain.handle('excel:getThreeWayRows', async (_event, req: ThreeWayRowsRequest)
     };
   });
 
+  appendDebugLog('main', 'getThreeWayRows:end', {
+    requestId,
+    durationMs: Date.now() - startedAt,
+    sheetName: resolvedSheetName,
+    rowCount: rows.length,
+    colCount,
+  });
   return { sheetName: resolvedSheetName, colCount, rows };
 });
+
+export const __testOnly = {
+  buildMergeSheetsForWorkbooks,
+  clearWorkbookCache: () => workbookCache.clear(),
+  saveMergeResultDirect: (req: SaveMergeRequest, targetPath: string) =>
+    saveMergeResultInternal(req, { targetPathOverride: targetPath, skipMainWindowRequirement: true }),
+};

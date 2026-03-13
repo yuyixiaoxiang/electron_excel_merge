@@ -7,6 +7,9 @@
     "build:main": "tsc",
     "build:renderer": "webpack --mode production",
     "build": "npm run clean && npm run build:main && npm run build:renderer",
+    "test:smoke:threeway": "npm run build:main && node build/main/test/threeWayDiffCore.smoke.js",
+    "test:regression:threeway": "npm run build:main && cross-env ELECTRON_EXCEL_MERGE_DISABLE_BOOTSTRAP=1 electron build/main/test/threeWayDiffRegression.js",
+    "test:threeway": "npm run test:smoke:threeway && npm run test:regression:threeway",
     "dev:renderer": "webpack serve --mode development",
     "dev:main": "cross-env NODE_ENV=development tsc -w",
     "dev": "concurrently \"npm run dev:main\" \"npm run dev:renderer\"",
@@ -23,6 +26,7 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "diff": "^8.0.3",
     "exceljs": "^4.4.0",
     "react": "^19.2.3",
     "react-dom": "^19.2.3"

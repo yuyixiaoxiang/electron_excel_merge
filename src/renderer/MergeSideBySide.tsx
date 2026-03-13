@@ -19,6 +19,7 @@ export interface MergeSideBySideProps {
   selected?: { rowIndex: number; colIndex: number } | null;
   onSelectCell?: (rowIndex: number, colIndex: number) => void;
   onApplyRowChoice?: (rowNumber: number, source: 'ours' | 'theirs') => void;
+  onDeleteRow?: (rowNumber: number) => void;
   onApplyCellChoice?: (rowNumber: number, colNumber: number, source: 'ours' | 'theirs') => void;
   onApplyCellsChoice?: (keys: { rowNumber: number; colNumber: number }[], source: 'ours' | 'theirs') => void;
   /** 已确认合并（resolved）的单元格 key 集合，key 格式为 "row:col"（1-based） */
@@ -76,6 +77,8 @@ const colNumberToLabel = (colNumber: number): string => {
   }
   return s;
 };
+const getOtherSide = (side: 'ours' | 'theirs'): 'ours' | 'theirs' =>
+  side === 'ours' ? 'theirs' : 'ours';
 
 const getColumnLabels = (cols: number[]): string[] => {
   return cols.map((c) => colNumberToLabel(c));
@@ -89,6 +92,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
   selected,
   onSelectCell,
   onApplyRowChoice,
+  onDeleteRow,
   onApplyCellChoice,
   onApplyCellsChoice,
   resolvedCellKeys,
@@ -657,6 +661,7 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
     if (gridRowIndex < 0 || gridColIndex < 0) return null;
     return { rowIndex: gridRowIndex, colIndex: gridColIndex };
   }, [selected, diffRowNumbers, displayColumns, useFullTables]);
+  const contextMenuOtherSource = contextMenu ? getOtherSide(contextMenu.source) : null;
 
   return (
     !useFullTables && !hasDiffData ? (
@@ -790,20 +795,36 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
                 : contextMenu.type === 'column'
                   ? `列 ${colNumberToLabel(contextMenu.colNumber)}`
                   : `单元格 ${colNumberToLabel(contextMenu.colNumber)}${contextMenu.rowNumber}`}
-              （来源：{contextMenu.source}）
+              （当前右键侧：{contextMenu.source}）
             </div>
 
             {contextMenu.type === 'row' && (
-              <button
-                type="button"
-                style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer' }}
-                onClick={() => {
-                  if (onApplyRowChoice) onApplyRowChoice(contextMenu.rowNumber, contextMenu.source);
-                  setContextMenu(null);
-                }}
-              >
-                使用整行单元格数据
-              </button>
+              <>
+                <button
+                  type="button"
+                  style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer' }}
+                  onClick={() => {
+                    if (onApplyRowChoice && contextMenuOtherSource) {
+                      onApplyRowChoice(contextMenu.rowNumber, contextMenuOtherSource);
+                    }
+                    setContextMenu(null);
+                  }}
+                >
+                  使用另一边整行
+                </button>
+                <button
+                  type="button"
+                  style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer', color: '#b00020' }}
+                  onClick={() => {
+                    if (onDeleteRow) {
+                      onDeleteRow(contextMenu.rowNumber);
+                    }
+                    setContextMenu(null);
+                  }}
+                >
+                  删除本行
+                </button>
+              </>
             )}
 
             {contextMenu.type === 'column' && (
@@ -811,27 +832,55 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
                 type="button"
                 style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer' }}
                 onClick={() => {
-                  if (onApplyColumnChoice) onApplyColumnChoice(contextMenu.colNumber, contextMenu.source);
-                  setContextMenu(null);
-                }}
-              >
-                使用本列数据
-              </button>
-            )}
-
-            {contextMenu.type === 'cell' && (
-              <button
-                type="button"
-                style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer' }}
-                onClick={() => {
-                  if (onApplyCellChoice) {
-                    onApplyCellChoice(contextMenu.rowNumber, contextMenu.colNumber, contextMenu.source);
+                  if (onApplyColumnChoice && contextMenuOtherSource) {
+                    onApplyColumnChoice(contextMenu.colNumber, contextMenuOtherSource);
                   }
                   setContextMenu(null);
                 }}
               >
-                使用本单元格的值
+                使用另一边整列
               </button>
+            )}
+
+            {contextMenu.type === 'cell' && (
+              <>
+                <button
+                  type="button"
+                  style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer' }}
+                  onClick={() => {
+                    if (onApplyCellChoice && contextMenuOtherSource) {
+                      onApplyCellChoice(contextMenu.rowNumber, contextMenu.colNumber, contextMenuOtherSource);
+                    }
+                    setContextMenu(null);
+                  }}
+                >
+                  使用另一边相同位置的单元格
+                </button>
+                <button
+                  type="button"
+                  style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer' }}
+                  onClick={() => {
+                    if (onApplyRowChoice && contextMenuOtherSource) {
+                      onApplyRowChoice(contextMenu.rowNumber, contextMenuOtherSource);
+                    }
+                    setContextMenu(null);
+                  }}
+                >
+                  使用另一边整行
+                </button>
+                <button
+                  type="button"
+                  style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer', color: '#b00020' }}
+                  onClick={() => {
+                    if (onDeleteRow) {
+                      onDeleteRow(contextMenu.rowNumber);
+                    }
+                    setContextMenu(null);
+                  }}
+                >
+                  删除本行
+                </button>
+              </>
             )}
 
             {contextMenu.type === 'cells' && (
@@ -839,17 +888,17 @@ const MergeSideBySideComponent: React.FC<MergeSideBySideProps> = ({
                 type="button"
                 style={{ width: '100%', textAlign: 'left', padding: '6px 10px', border: 'none', background: 'white', cursor: 'pointer' }}
                 onClick={() => {
-                  if (onApplyCellsChoice) {
+                  if (onApplyCellsChoice && contextMenuOtherSource) {
                     const keys = Array.from(selectedCellKeys.values()).map((k) => {
                       const [r, c] = k.split(':').map((x) => Number(x));
                       return { rowNumber: r, colNumber: c };
                     });
-                    onApplyCellsChoice(keys, contextMenu.source);
+                    onApplyCellsChoice(keys, contextMenuOtherSource);
                   }
                   setContextMenu(null);
                 }}
               >
-                使用选中单元格的数据
+                使用另一边选中单元格
               </button>
             )}
           </div>
