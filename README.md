@@ -132,18 +132,14 @@ npm run dev
 ![Fork 集成设置](docs/assets/fork-integration-settings.png)
 
 ### 冲突处理
-![冲突处理占位图1](docs/assets/conflict-placeholder-1.png)
+![冲突处理占位图1](docs/assets/merge.png)
 说明：冲突处理流程截图 1（进入冲突文件后的操作入口）。
 
-![冲突处理占位图2](docs/assets/conflict-placeholder-2.png)
-说明：冲突处理流程截图 2（完成选择后保存/确认结果）。
-
 ### Diff
-![Diff 占位图1](docs/assets/diff-placeholder-1.png)
+![Diff 占位图1](docs/assets/diff.png)
 说明：Diff 流程截图 1（在文件列表中触发 External Diff）。
 
-![Diff 占位图2](docs/assets/diff-placeholder-2.png)
-说明：Diff 流程截图 2（eMerge 对比界面与结果查看）。
+
 
 完整独立文档：`docs/FORK_SETUP.md`
 
