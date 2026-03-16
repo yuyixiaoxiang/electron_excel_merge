@@ -32,6 +32,7 @@ interface DiffSideBySideProps {
   rowsMeta?: MergeRowMeta[];
   columnsMeta?: MergeColumnMeta[];
   frozenRowCount?: number;
+  headerActions?: React.ReactNode;
   selected?: { rowIndex: number; colIndex: number } | null;
   onSelectCell?: (rowIndex: number, colIndex: number) => void;
   onCellChange?: (side: DiffSide, cell: DiffCellData, newValue: string) => void;
@@ -84,6 +85,7 @@ const DiffSideBySideComponent: React.FC<DiffSideBySideProps> = ({
   rowsMeta,
   columnsMeta,
   frozenRowCount = DEFAULT_FROZEN_HEADER_ROWS,
+  headerActions,
   selected,
   onSelectCell,
   onCellChange,
@@ -243,6 +245,25 @@ const DiffSideBySideComponent: React.FC<DiffSideBySideProps> = ({
       ),
     [displayRowsMeta, displayColumnsMeta, leftRows, rightRows],
   );
+  const { diffCellCount, diffRowCount } = useMemo(() => {
+    let cellCount = 0;
+    let rowCount = 0;
+    leftGridRows.forEach((row) => {
+      let rowHasDiff = false;
+      row.forEach((cell) => {
+        if (!cell.isDifferent) return;
+        cellCount += 1;
+        rowHasDiff = true;
+      });
+      if (rowHasDiff) {
+        rowCount += 1;
+      }
+    });
+    return {
+      diffCellCount: cellCount,
+      diffRowCount: rowCount,
+    };
+  }, [leftGridRows]);
 
   const handleSelect = (rowIndex: number, colIndex: number) => {
     if (onSelectCell) onSelectCell(rowIndex, colIndex);
@@ -458,13 +479,18 @@ const DiffSideBySideComponent: React.FC<DiffSideBySideProps> = ({
       <div
         style={{
           display: 'flex',
-          gap: 16,
+          gap: 10,
           fontSize: 12,
           color: '#444',
           alignItems: 'center',
           minHeight: 18,
         }}
       >
+        {headerActions && (
+          <div style={{ flexShrink: 0, display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+            {headerActions}
+          </div>
+        )}
         <div
           style={{
             flex: 1,
@@ -475,6 +501,9 @@ const DiffSideBySideComponent: React.FC<DiffSideBySideProps> = ({
           }}
         >
           left{leftPath ? `: ${leftPath}` : ''}
+        </div>
+        <div style={{ flexShrink: 0, whiteSpace: 'nowrap', color: '#4b5563' }}>
+          diff 数量: {diffCellCount} · 差异行: {diffRowCount}
         </div>
         <div
           style={{

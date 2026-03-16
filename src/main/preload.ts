@@ -28,6 +28,15 @@ interface OpenResult {
   sheet: SheetData; // 兼容旧字段：第一个 sheet
   sheets: SheetData[];
 }
+interface FolderExcelFileInfo {
+  relativePath: string;
+  absolutePath: string;
+  sizeBytes: number;
+  modifiedAtMs: number;
+}
+interface WorkspaceTabMenuEvent {
+  kind: 'folder' | 'diff' | 'merge';
+}
 
 interface CellChange {
   address: string;
@@ -216,6 +225,14 @@ interface ThreeWayRowsResult {
  * 注意：这里只包装了 ipcRenderer.invoke，真正的实现都在 main.ts 中。
  */
 const excelAPI = {
+  pickFolder: async (): Promise<string | null> => {
+    const result = await ipcRenderer.invoke('excel:pickFolder');
+    return (result as string | null) ?? null;
+  },
+  listExcelFilesInFolder: async (folderPath: string): Promise<FolderExcelFileInfo[]> => {
+    const result = await ipcRenderer.invoke('excel:listExcelFilesInFolder', folderPath);
+    return (result as FolderExcelFileInfo[]) ?? [];
+  },
   openFile: async (): Promise<OpenResult | null> => {
     const result = await ipcRenderer.invoke('excel:open');
     return result as OpenResult | null;
@@ -262,6 +279,15 @@ const excelAPI = {
     const result = await ipcRenderer.invoke('excel:getDebugLogPath');
     return result as string;
   },
+  onWorkspaceNewTab: (handler: (payload: WorkspaceTabMenuEvent) => void): (() => void) => {
+    const listener = (_event: unknown, payload: WorkspaceTabMenuEvent) => {
+      handler(payload);
+    };
+    ipcRenderer.on('workspace:newTab', listener);
+    return () => {
+      ipcRenderer.removeListener('workspace:newTab', listener);
+    };
+  },
 };
 
 contextBridge.exposeInMainWorld('excelAPI', excelAPI);
@@ -271,6 +297,8 @@ export type {
   SheetData,
   GetSheetDataRequest,
   OpenResult,
+  FolderExcelFileInfo,
+  WorkspaceTabMenuEvent,
   CellChange,
   SaveChangesRequest,
   MergeCell,

@@ -1,12 +1,22 @@
 # electron_excel
 
-## 冲突处理
-![冲突处理占位图1](docs/assets/merge.png)
-说明：冲突处理流程截图 1（进入冲突文件后的操作入口）。
+## 欢迎界面
+![冲欢迎界面1](docs/assets/welcome.png)
+说明：开始界面，提示用户比较文件夹或者文件。
+
+## 文件夹对比
+![文件夹对比](docs/assets/folder.png)
+说明：文件夹对比界面。
 
 ## Diff
 ![Diff 占位图1](docs/assets/diff.png)
 说明：Diff 流程截图 1（在文件列表中触发 External Diff）。
+
+## 冲突处理
+![冲突处理占位图1](docs/assets/merge.png)
+说明：冲突处理流程截图 1（进入冲突文件后的操作入口）。
+
+
 
 ## 开发环境
 - Windows

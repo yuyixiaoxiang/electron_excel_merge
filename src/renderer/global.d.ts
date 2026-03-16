@@ -2,6 +2,7 @@ import type {
   CellChange,
   CliThreeWayInfo,
   DebugLogEntry,
+  FolderExcelFileInfo,
   GetSheetDataRequest,
   OpenResult,
   SaveChangesRequest,
@@ -14,6 +15,7 @@ import type {
   ThreeWayRowResult,
   ThreeWayRowsRequest,
   ThreeWayRowsResult,
+  WorkspaceTabMenuEvent,
 } from '../main/preload';
 
 /**
@@ -23,6 +25,8 @@ import type {
 declare global {
   interface Window {
     excelAPI: {
+      pickFolder: () => Promise<string | null>;
+      listExcelFilesInFolder: (folderPath: string) => Promise<FolderExcelFileInfo[]>;
       openFile: () => Promise<OpenResult | null>;
       loadWorkbook: (filePath: string) => Promise<OpenResult | null>;
       saveChanges: (req: SaveChangesRequest | CellChange[]) => Promise<void>;
@@ -35,6 +39,7 @@ declare global {
       getThreeWayRows: (req: ThreeWayRowsRequest) => Promise<ThreeWayRowsResult | null>;
       debugLog: (entry: DebugLogEntry) => void;
       getDebugLogPath: () => Promise<string>;
+      onWorkspaceNewTab: (handler: (payload: WorkspaceTabMenuEvent) => void) => () => void;
     };
   }
 }

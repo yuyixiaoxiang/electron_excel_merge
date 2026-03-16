@@ -2,7 +2,7 @@
  * 主进程入口：负责创建 Electron 窗口、解析git/Fork 传入的三方合并参数，
  * 并通过 IPC 向渲染进程提供Excel 读写与三方diff / merge 的能力。
  */
-import { app, BrowserWindow, dialog, ipcMain } from 'electron';
+import { app, BrowserWindow, dialog, ipcMain, Menu, MenuItemConstructorOptions } from 'electron';
 import * as fs from 'fs';
 import * as path from 'path';
 import { spawn } from 'child_process';
@@ -229,6 +229,7 @@ if (shouldBootstrapElectron) {
       cliMode: cliThreeWayArgs?.mode ?? null,
       logPath: getDebugLogPath(),
     });
+    configureApplicationMenu();
     createWindow();
 
     app.on('activate', () => {
@@ -2209,6 +2210,99 @@ ipcMain.handle('excel:open', async () => {
   const filePath = filePaths[0];
   currentFilePath = filePath;
   return readWorkbookOpenResult(filePath);
+});
+
+interface FolderExcelFileInfo {
+  relativePath: string;
+  absolutePath: string;
+  sizeBytes: number;
+  modifiedAtMs: number;
+}
+const isExcelLikeFile = (fileName: string): boolean => {
+  const ext = path.extname(fileName).toLowerCase();
+  return ext === '.xlsx' || ext === '.xlsm' || ext === '.xls';
+};
+const walkExcelFiles = (rootDir: string, currentDir: string, bucket: FolderExcelFileInfo[]): void => {
+  const entries = fs.readdirSync(currentDir, { withFileTypes: true });
+  entries.forEach((entry) => {
+    const absolutePath = path.join(currentDir, entry.name);
+    if (entry.isDirectory()) {
+      walkExcelFiles(rootDir, absolutePath, bucket);
+      return;
+    }
+    if (!entry.isFile() || !isExcelLikeFile(entry.name)) return;
+    let stat: fs.Stats;
+    try {
+      stat = fs.statSync(absolutePath);
+    } catch {
+      return;
+    }
+    const relativePath = path.relative(rootDir, absolutePath).split(path.sep).join('/');
+    bucket.push({
+      relativePath,
+      absolutePath,
+      sizeBytes: stat.size,
+      modifiedAtMs: stat.mtimeMs,
+    });
+  });
+};
+
+type WorkspaceTabMenuKind = 'folder' | 'diff' | 'merge';
+const emitWorkspaceTabCommand = (kind: WorkspaceTabMenuKind) => {
+  const targetWindow = BrowserWindow.getFocusedWindow() ?? mainWindow;
+  targetWindow?.webContents.send('workspace:newTab', { kind });
+};
+const configureApplicationMenu = () => {
+  const fileSubmenu: MenuItemConstructorOptions[] = [
+    {
+      label: 'Excel 文件夹比较',
+      click: () => emitWorkspaceTabCommand('folder'),
+    },
+    {
+      label: 'Excel 比较',
+      click: () => emitWorkspaceTabCommand('diff'),
+    },
+    {
+      label: 'Merge 模式',
+      click: () => emitWorkspaceTabCommand('merge'),
+    },
+    { type: 'separator' },
+    process.platform === 'darwin' ? { role: 'close' } : { role: 'quit' },
+  ];
+  const template: MenuItemConstructorOptions[] = [
+    { label: 'File', submenu: fileSubmenu },
+    { role: 'editMenu' },
+    { role: 'viewMenu' },
+    { role: 'windowMenu' },
+    { role: 'help', submenu: [{ role: 'about' }] },
+  ];
+  if (process.platform === 'darwin') {
+    template.unshift({ role: 'appMenu' });
+  }
+  Menu.setApplicationMenu(Menu.buildFromTemplate(template));
+};
+ipcMain.handle('excel:pickFolder', async (): Promise<string | null> => {
+  if (!mainWindow) return null;
+  const { canceled, filePaths } = await dialog.showOpenDialog(mainWindow, {
+    title: '选择 Excel 文件夹',
+    properties: ['openDirectory'],
+  });
+  if (canceled || filePaths.length === 0) return null;
+  return filePaths[0];
+});
+ipcMain.handle('excel:listExcelFilesInFolder', async (_event, folderPath: string): Promise<FolderExcelFileInfo[]> => {
+  if (!folderPath) return [];
+  const normalized = path.resolve(folderPath);
+  let stat: fs.Stats;
+  try {
+    stat = fs.statSync(normalized);
+  } catch {
+    return [];
+  }
+  if (!stat.isDirectory()) return [];
+  const files: FolderExcelFileInfo[] = [];
+  walkExcelFiles(normalized, normalized, files);
+  return files.sort((a, b) => a.relativePath.localeCompare(b.relativePath));
 });
 
 ipcMain.handle('excel:loadWorkbook', async (_event, filePath: string) => {

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import type {
   CellChange,
   CliThreeWayInfo,
+  FolderExcelFileInfo,
   MergeCell,
   MergeColumnMeta,
   MergeRowMeta,
@@ -24,7 +25,30 @@ import { VirtualGrid } from './VirtualGrid';
  * - diff 模式：双文件对比、左右并排编辑；
  * - merge 模式：base / ours / theirs 三方合并与结果写回。
  */
-type ViewMode = 'diff' | 'merge';
+type ViewMode = 'diff' | 'merge' | 'folder';
+type WorkspaceTabKind = 'folder' | 'diff' | 'merge';
+type WorkspaceTab = {
+  id: string;
+  kind: WorkspaceTabKind;
+  title: string;
+  diffLeftPath?: string;
+  diffRightPath?: string;
+};
+type FolderCompareItemStatus =
+  | 'pending'
+  | 'comparing'
+  | 'done'
+  | 'missing-left'
+  | 'missing-right'
+  | 'error';
+type FolderCompareItem = {
+  relativePath: string;
+  leftFile: FolderExcelFileInfo | null;
+  rightFile: FolderExcelFileInfo | null;
+  status: FolderCompareItemStatus;
+  diffCount: number | null;
+  errorMessage?: string;
+};
 type DiffSide = 'left' | 'right';
 type PrimaryKeyMode = 'auto' | 'manual' | 'none';
 type DiffHistorySnapshot = {
@@ -72,6 +96,11 @@ const parseCellAddress = (address: string): { colNumber: number; rowNumber: numb
   const rowNumber = Number(rowLabel);
   if (!Number.isFinite(colNumber) || !Number.isFinite(rowNumber)) return null;
   return { colNumber, rowNumber };
+};
+const getPathLeafName = (filePath: string): string => {
+  const normalized = filePath.replace(/\\/g, '/');
+  const parts = normalized.split('/');
+  return parts[parts.length - 1] || filePath;
 };
 
 const normalizeComparableValue = (value: string | number | null): string => {
@@ -218,6 +247,17 @@ const CommitNumberInput: React.FC<CommitNumberInputProps> = React.memo(
 
 export const App: React.FC = () => {
   const [mode, setMode] = useState<ViewMode>('diff');
+  const [workspaceTabs, setWorkspaceTabs] = useState<WorkspaceTab[]>([]);
+  const [activeTabId, setActiveTabId] = useState<string | null>(null);
+  const [folderPathInputs, setFolderPathInputs] = useState<{ left: string; right: string }>({
+    left: '',
+    right: '',
+  });
+  const [folderCompareItems, setFolderCompareItems] = useState<FolderCompareItem[]>([]);
+  const [folderCompareInProgress, setFolderCompareInProgress] = useState<boolean>(false);
+  const [folderCompareProgress, setFolderCompareProgress] = useState<number>(0);
+  const tabSeqRef = useRef(1);
+  const folderCompareRunRef = useRef(0);
 
   // 单文件编辑状态
   const [filePath, setFilePath] = useState<string | null>(null);
@@ -348,11 +388,37 @@ export const App: React.FC = () => {
     if (primaryKeyMode === 'none') return 0;
     return -1;
   }, [primaryKeyMode, primaryKeyCol]);
+  const activeWorkspaceTab = useMemo(
+    () => workspaceTabs.find((tab) => tab.id === activeTabId) ?? null,
+    [workspaceTabs, activeTabId],
+  );
+  useEffect(() => {
+    if (workspaceTabs.length === 0) {
+      if (activeTabId !== null) {
+        setActiveTabId(null);
+      }
+      return;
+    }
+    if (!activeWorkspaceTab) {
+      setActiveTabId(workspaceTabs[0].id);
+      return;
+    }
+    const nextMode: ViewMode =
+      activeWorkspaceTab?.kind === 'folder'
+        ? 'folder'
+        : activeWorkspaceTab?.kind === 'merge'
+          ? 'merge'
+          : 'diff';
+    if (mode !== nextMode) {
+      setMode(nextMode);
+    }
+  }, [activeWorkspaceTab, activeTabId, mode, workspaceTabs]);
   const displayPrimaryKeyCol = useMemo(() => {
     const currentMergeSheet = mergeSheets[selectedMergeSheetIndex] ?? null;
     const alignedCol = currentMergeSheet?.primaryKeyAlignedCol;
     return typeof alignedCol === 'number' && alignedCol >= 1 ? alignedCol : undefined;
   }, [mergeSheets, selectedMergeSheetIndex]);
+  const hasActiveWorkspace = activeWorkspaceTab !== null;
   const compareMode = useMemo(() => (mode === 'diff' ? 'diff' : 'merge'), [mode]);
   const parsedMergeFrozenRowDraft = useMemo(() => {
     const trimmed = mergeFrozenRowDraft.trim();
@@ -907,6 +973,220 @@ export const App: React.FC = () => {
       }
     }
   }, [mergeAnalyzeInProgress, mergePathInputs, loadMergeComparison, mergeInfo?.sheetName]);
+  const openWorkspaceTab = useCallback((
+    kind: WorkspaceTabKind,
+    title?: string,
+    options?: {
+      diffLeftPath?: string;
+      diffRightPath?: string;
+    },
+  ): WorkspaceTab => {
+    tabSeqRef.current += 1;
+    const id = `tab-${kind}-${tabSeqRef.current}`;
+    const tab: WorkspaceTab = {
+      id,
+      kind,
+      title:
+        title ??
+        (kind === 'folder' ? 'Excel 文件夹比较' : kind === 'merge' ? 'Merge 模式' : 'Excel 比较'),
+      diffLeftPath: options?.diffLeftPath,
+      diffRightPath: options?.diffRightPath,
+    };
+    setWorkspaceTabs((prev) => [...prev, tab]);
+    setActiveTabId(id);
+    return tab;
+  }, []);
+  const closeWorkspaceTab = useCallback((tabId: string) => {
+    setWorkspaceTabs((prev) => {
+      const targetIndex = prev.findIndex((tab) => tab.id === tabId);
+      if (targetIndex < 0) return prev;
+      const next = prev.filter((tab) => tab.id !== tabId);
+      setActiveTabId((current) => {
+        if (current !== tabId) return current;
+        const fallback = next[targetIndex] ?? next[targetIndex - 1] ?? null;
+        return fallback?.id ?? null;
+      });
+      return next;
+    });
+  }, []);
+  const openExcelCompareFromPaths = useCallback(
+    (leftPath: string, rightPath: string, title?: string) => {
+      const tabTitle = title ?? `Excel 比较 · ${getPathLeafName(leftPath)}`;
+      openWorkspaceTab('diff', tabTitle, {
+        diffLeftPath: leftPath,
+        diffRightPath: rightPath,
+      });
+      setMode('diff');
+    },
+    [openWorkspaceTab],
+  );
+  const handlePickFolder = useCallback(async (side: 'left' | 'right') => {
+    const selectedPath = await window.excelAPI.pickFolder();
+    if (!selectedPath) return;
+    setFolderPathInputs((prev) => ({
+      ...prev,
+      [side]: selectedPath,
+    }));
+  }, []);
+  const handleRunFolderCompare = useCallback(async () => {
+    if (folderCompareInProgress) return;
+    const leftRoot = folderPathInputs.left.trim();
+    const rightRoot = folderPathInputs.right.trim();
+    if (!leftRoot || !rightRoot) {
+      alert('请先填写左右两个文件夹路径。');
+      return;
+    }
+    const runId = ++folderCompareRunRef.current;
+    setFolderCompareInProgress(true);
+    setFolderCompareProgress(0);
+    try {
+      const [leftFiles, rightFiles] = await Promise.all([
+        window.excelAPI.listExcelFilesInFolder(leftRoot),
+        window.excelAPI.listExcelFilesInFolder(rightRoot),
+      ]);
+      if (folderCompareRunRef.current !== runId) return;
+      const leftMap = new Map<string, FolderExcelFileInfo>();
+      const rightMap = new Map<string, FolderExcelFileInfo>();
+      leftFiles.forEach((file: FolderExcelFileInfo) => leftMap.set(file.relativePath, file));
+      rightFiles.forEach((file: FolderExcelFileInfo) => rightMap.set(file.relativePath, file));
+      const allRelativePaths = Array.from(new Set([...leftMap.keys(), ...rightMap.keys()])).sort((a, b) =>
+        a.localeCompare(b),
+      );
+      const initialItems: FolderCompareItem[] = allRelativePaths.map((relativePath) => ({
+        relativePath,
+        leftFile: leftMap.get(relativePath) ?? null,
+        rightFile: rightMap.get(relativePath) ?? null,
+        status: 'pending',
+        diffCount: null,
+      }));
+      setFolderCompareItems(initialItems);
+      if (initialItems.length === 0) {
+        setFolderCompareProgress(100);
+        return;
+      }
+      let completed = 0;
+      for (const item of initialItems) {
+        if (folderCompareRunRef.current !== runId) return;
+        if (!item.leftFile || !item.rightFile) {
+          const missingStatus: FolderCompareItemStatus = item.leftFile ? 'missing-right' : 'missing-left';
+          setFolderCompareItems((prev) =>
+            prev.map((entry) =>
+              entry.relativePath === item.relativePath ? { ...entry, status: missingStatus, diffCount: null } : entry,
+            ),
+          );
+          completed += 1;
+          setFolderCompareProgress(Math.round((completed / initialItems.length) * 100));
+          continue;
+        }
+        setFolderCompareItems((prev) =>
+          prev.map((entry) =>
+            entry.relativePath === item.relativePath ? { ...entry, status: 'comparing', errorMessage: undefined } : entry,
+          ),
+        );
+        try {
+          const result = await window.excelAPI.computeThreeWayDiff({
+            basePath: item.leftFile.absolutePath,
+            oursPath: item.leftFile.absolutePath,
+            theirsPath: item.rightFile.absolutePath,
+            compareMode: 'diff',
+            primaryKeyCol: requestedPrimaryKeyCol,
+            frozenRowCount: COMPARE_HEADER_ROW_COUNT,
+            rowSimilarityThreshold,
+          });
+          const sheets =
+            result?.sheets && result.sheets.length > 0 ? result.sheets : result?.sheet ? [result.sheet] : [];
+          const diffCount = sheets.reduce((sum, sheet) => sum + (sheet.cells?.length ?? 0), 0);
+          setFolderCompareItems((prev) =>
+            prev.map((entry) =>
+              entry.relativePath === item.relativePath
+                ? {
+                    ...entry,
+                    status: 'done',
+                    diffCount,
+                    errorMessage: undefined,
+                  }
+                : entry,
+            ),
+          );
+        } catch (error) {
+          setFolderCompareItems((prev) =>
+            prev.map((entry) =>
+              entry.relativePath === item.relativePath
+                ? {
+                    ...entry,
+                    status: 'error',
+                    diffCount: null,
+                    errorMessage: error instanceof Error ? error.message : String(error),
+                  }
+                : entry,
+            ),
+          );
+        }
+        completed += 1;
+        setFolderCompareProgress(Math.round((completed / initialItems.length) * 100));
+      }
+    } finally {
+      if (folderCompareRunRef.current === runId) {
+        setFolderCompareInProgress(false);
+      }
+    }
+  }, [folderCompareInProgress, folderPathInputs.left, folderPathInputs.right, requestedPrimaryKeyCol, rowSimilarityThreshold]);
+  useEffect(() => {
+    const unsubscribe = window.excelAPI.onWorkspaceNewTab((payload) => {
+      if (!payload || (payload.kind !== 'folder' && payload.kind !== 'diff' && payload.kind !== 'merge')) return;
+      const title =
+        payload.kind === 'folder'
+          ? 'Excel 文件夹比较'
+          : payload.kind === 'merge'
+            ? 'Merge 模式'
+            : 'Excel 比较';
+      openWorkspaceTab(payload.kind, title);
+    });
+    return () => {
+      unsubscribe();
+    };
+  }, [openWorkspaceTab]);
+  useEffect(() => {
+    if (!activeWorkspaceTab || activeWorkspaceTab.kind !== 'diff') return;
+    const targetLeftPath = activeWorkspaceTab.diffLeftPath?.trim();
+    const targetRightPath = activeWorkspaceTab.diffRightPath?.trim();
+    if (!targetLeftPath || !targetRightPath) return;
+    const sameAsCurrent =
+      diffLeftWorkbook?.filePath === targetLeftPath && diffRightWorkbook?.filePath === targetRightPath;
+    if (sameAsCurrent) return;
+    let cancelled = false;
+    setDiffAnalyzeInProgress(true);
+    setDiffAnalyzeProgress(8);
+    (async () => {
+      try {
+        const [leftWorkbook, rightWorkbook] = await Promise.all([
+          window.excelAPI.loadWorkbook(targetLeftPath),
+          window.excelAPI.loadWorkbook(targetRightPath),
+        ]);
+        if (cancelled) return;
+        if (!leftWorkbook || !rightWorkbook) {
+          setDiffAnalyzeProgress(0);
+          alert(`无法加载 Excel 对比文件：\nleft=${targetLeftPath}\nright=${targetRightPath}`);
+          return;
+        }
+        setDiffPathInputs({
+          left: leftWorkbook.filePath,
+          right: rightWorkbook.filePath,
+        });
+        setDiffAnalyzeProgress(60);
+        await loadDiffComparison(leftWorkbook, rightWorkbook);
+        if (cancelled) return;
+        setDiffAnalyzeProgress(100);
+      } finally {
+        if (!cancelled) {
+          setDiffAnalyzeInProgress(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [activeWorkspaceTab, diffLeftWorkbook?.filePath, diffRightWorkbook?.filePath, loadDiffComparison]);
 
   useEffect(() => {
     if (cliInfoInitializedRef.current) return;
@@ -917,6 +1197,7 @@ export const App: React.FC = () => {
         if (!info) return;
         setCliInfo(info);
         if (info.mode === 'merge') {
+          openWorkspaceTab('merge', 'Merge 模式 · CLI');
           await loadMergeComparison(
             {
               basePath: info.basePath,
@@ -926,6 +1207,7 @@ export const App: React.FC = () => {
           );
           return;
         }
+        openWorkspaceTab('diff', 'Excel 比较 · CLI');
         const [leftWorkbook, rightWorkbook] = await Promise.all([
           window.excelAPI.loadWorkbook(info.oursPath),
           window.excelAPI.loadWorkbook(info.theirsPath),
@@ -936,7 +1218,7 @@ export const App: React.FC = () => {
         // 忽略错误，保持交互式模式可用
       }
     })();
-  }, [loadDiffComparison, loadMergeComparison]);
+  }, [loadDiffComparison, loadMergeComparison, openWorkspaceTab]);
   useEffect(() => {
     if (mode !== 'diff') return;
     const handleWindowKeyDown = (e: KeyboardEvent) => {
@@ -3307,6 +3589,252 @@ export const App: React.FC = () => {
       </span>
     </div>
   );
+  const folderAggregateMap = useMemo(() => {
+    const map = new Map<
+      string,
+      {
+        hasLeft: boolean;
+        hasRight: boolean;
+        hasExtra: boolean;
+        hasDiff: boolean;
+      }
+    >();
+    folderCompareItems.forEach((item) => {
+      const parts = item.relativePath.split('/').filter(Boolean);
+      let current = '';
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        current = current ? `${current}/${parts[i]}` : parts[i];
+        const prev = map.get(current) ?? {
+          hasLeft: false,
+          hasRight: false,
+          hasExtra: false,
+          hasDiff: false,
+        };
+        const hasExtra = item.status === 'missing-left' || item.status === 'missing-right';
+        const hasDiff = (item.status === 'done' && (item.diffCount ?? 0) > 0) || item.status === 'error';
+        map.set(current, {
+          hasLeft: prev.hasLeft || !!item.leftFile,
+          hasRight: prev.hasRight || !!item.rightFile,
+          hasExtra: prev.hasExtra || hasExtra,
+          hasDiff: prev.hasDiff || hasDiff,
+        });
+      }
+    });
+    return map;
+  }, [folderCompareItems]);
+  const folderTreeRows = useMemo(() => {
+    const rows: Array<
+      | {
+          key: string;
+          depth: number;
+          type: 'folder';
+          label: string;
+          folderPath: string;
+        }
+      | {
+          key: string;
+          depth: number;
+          type: 'file';
+          label: string;
+          item: FolderCompareItem;
+        }
+    > = [];
+    const folderSeen = new Set<string>();
+    const sortedItems = [...folderCompareItems].sort((a, b) => a.relativePath.localeCompare(b.relativePath));
+    sortedItems.forEach((item) => {
+      const parts = item.relativePath.split('/').filter(Boolean);
+      let current = '';
+      for (let i = 0; i < parts.length - 1; i += 1) {
+        current = current ? `${current}/${parts[i]}` : parts[i];
+        if (folderSeen.has(current)) continue;
+        folderSeen.add(current);
+        rows.push({
+          key: `folder:${current}`,
+          depth: i,
+          type: 'folder',
+          label: parts[i],
+          folderPath: current,
+        });
+      }
+      rows.push({
+        key: `file:${item.relativePath}`,
+        depth: Math.max(0, parts.length - 1),
+        type: 'file',
+        label: parts[parts.length - 1] || item.relativePath,
+        item,
+      });
+    });
+    return rows;
+  }, [folderCompareItems]);
+  const formatFileSize = useCallback((bytes: number): string => {
+    if (!Number.isFinite(bytes) || bytes < 0) return '-';
+    if (bytes < 1024) return `${bytes} B`;
+    if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
+    return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+  }, []);
+  const formatModifiedDate = useCallback((modifiedAtMs: number): string => {
+    if (!Number.isFinite(modifiedAtMs) || modifiedAtMs <= 0) return '-';
+    return new Date(modifiedAtMs).toLocaleDateString('zh-CN');
+  }, []);
+  const getFolderMarkerColor = useCallback(
+    (folderPath: string): string => {
+      const meta = folderAggregateMap.get(folderPath);
+      if (!meta) return '#334155';
+      if (meta.hasExtra && meta.hasDiff) return '#db2777';
+      if (meta.hasExtra) return '#2563eb';
+      if (meta.hasDiff) return '#dc2626';
+      return '#334155';
+    },
+    [folderAggregateMap],
+  );
+  const getFileMarkerColor = useCallback(
+    (item: FolderCompareItem, side: 'left' | 'right'): string => {
+      const sideFile = side === 'left' ? item.leftFile : item.rightFile;
+      if (!sideFile) return '#94a3b8';
+      if (item.status === 'missing-left' || item.status === 'missing-right') return '#2563eb';
+      if (item.status === 'done' && (item.diffCount ?? 0) > 0) return '#dc2626';
+      if (item.status === 'error') return '#db2777';
+      if (item.status === 'comparing') return '#0284c7';
+      return '#111827';
+    },
+    [],
+  );
+  const renderFolderPane = useCallback(
+    (side: 'left' | 'right') => {
+      const sideLabel = side === 'left' ? '左侧' : '右侧';
+      return (
+        <div
+          style={{
+            flex: 1,
+            minWidth: 0,
+            minHeight: 0,
+            border: '1px solid #cbd5e1',
+            borderRadius: 10,
+            overflow: 'hidden',
+            display: 'flex',
+            flexDirection: 'column',
+            backgroundColor: '#fff',
+          }}
+        >
+          <div style={{ padding: '6px 10px', fontSize: 12, color: '#334155', backgroundColor: '#f8fafc', borderBottom: '1px solid #e2e8f0' }}>
+            {sideLabel}
+          </div>
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: '1fr 110px 120px',
+              gap: 8,
+              padding: '6px 10px',
+              fontSize: 12,
+              color: '#475569',
+              borderBottom: '1px solid #e2e8f0',
+              backgroundColor: '#f8fafc',
+              fontWeight: 600,
+            }}
+          >
+            <span>名称</span>
+            <span>大小</span>
+            <span>已修改</span>
+          </div>
+          <div style={{ flex: 1, minHeight: 0, overflow: 'auto' }}>
+            {folderTreeRows.map((row, rowIndex) => {
+              const isEven = rowIndex % 2 === 0;
+              if (row.type === 'folder') {
+                const meta = folderAggregateMap.get(row.folderPath);
+                const showFolder = side === 'left' ? !!meta?.hasLeft : !!meta?.hasRight;
+                return (
+                  <div
+                    key={`${row.key}:${side}`}
+                    style={{
+                      display: 'grid',
+                      gridTemplateColumns: '1fr 110px 120px',
+                      gap: 8,
+                      padding: '5px 10px',
+                      fontSize: 12,
+                      borderBottom: '1px solid #f1f5f9',
+                      backgroundColor: isEven ? '#ffffff' : '#f8fafc',
+                      color: showFolder ? getFolderMarkerColor(row.folderPath) : '#cbd5e1',
+                    }}
+                  >
+                    <span
+                      style={{
+                        minWidth: 0,
+                        overflow: 'hidden',
+                        textOverflow: 'ellipsis',
+                        whiteSpace: 'nowrap',
+                        paddingLeft: row.depth * 18,
+                      }}
+                    >
+                      {showFolder ? `[DIR] ${row.label}` : ''}
+                    </span>
+                    <span />
+                    <span />
+                  </div>
+                );
+              }
+              const file = side === 'left' ? row.item.leftFile : row.item.rightFile;
+              const canOpen = !!row.item.leftFile && !!row.item.rightFile;
+              const markerColor = getFileMarkerColor(row.item, side);
+              const nameText =
+                !file
+                  ? ''
+                  : (row.item.status === 'done' && (row.item.diffCount ?? 0) > 0)
+                    ? `${row.label}  [diff ${row.item.diffCount}]`
+                    : row.label;
+              return (
+                <div
+                  key={`${row.key}:${side}`}
+                  onDoubleClick={() => {
+                    if (!row.item.leftFile || !row.item.rightFile) return;
+                    void openExcelCompareFromPaths(
+                      row.item.leftFile.absolutePath,
+                      row.item.rightFile.absolutePath,
+                      `Excel 比较 · ${row.item.relativePath}`,
+                    );
+                  }}
+                  title={canOpen ? `双击打开对比：${row.item.relativePath}` : undefined}
+                  style={{
+                    display: 'grid',
+                    gridTemplateColumns: '1fr 110px 120px',
+                    gap: 8,
+                    padding: '5px 10px',
+                    fontSize: 12,
+                    borderBottom: '1px solid #f1f5f9',
+                    backgroundColor: isEven ? '#ffffff' : '#f8fafc',
+                    color: markerColor,
+                    cursor: canOpen ? 'pointer' : 'default',
+                  }}
+                >
+                  <span
+                    style={{
+                      minWidth: 0,
+                      overflow: 'hidden',
+                      textOverflow: 'ellipsis',
+                      whiteSpace: 'nowrap',
+                      paddingLeft: row.depth * 18,
+                    }}
+                  >
+                    {file ? `[FILE] ${nameText}` : ''}
+                  </span>
+                  <span>{file ? formatFileSize(file.sizeBytes) : ''}</span>
+                  <span>{file ? formatModifiedDate(file.modifiedAtMs) : ''}</span>
+                </div>
+              );
+            })}
+          </div>
+        </div>
+      );
+    },
+    [
+      folderTreeRows,
+      folderAggregateMap,
+      getFolderMarkerColor,
+      getFileMarkerColor,
+      formatFileSize,
+      formatModifiedDate,
+      openExcelCompareFromPaths,
+    ],
+  );
 
   return (
     <div
@@ -3320,49 +3848,197 @@ export const App: React.FC = () => {
         overflow: 'hidden',
       }}
     >
-      <div style={{ marginBottom: 12, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        <button onClick={() => setMode('diff')} disabled={mode === 'diff'}>
-          Diff 模式
-        </button>
-        <button onClick={() => setMode('merge')} disabled={mode === 'merge'}>
-          Merge 模式
-        </button>
-        {mode === 'diff' && (
-          <>
-            <button
-              onClick={() => handleSaveDiffSide('left')}
-              disabled={!diffLeftWorkbook || diffLeftPendingCount === 0 || diffSavingSide !== null}
-            >
-              {diffSavingSide === 'left' ? '保存左侧中…' : `保存左侧 (${diffLeftPendingCount})`}
-            </button>
-            <button
-              onClick={() => handleSaveDiffSide('right')}
-              disabled={!diffRightWorkbook || diffRightPendingCount === 0 || diffSavingSide !== null}
-            >
-              {diffSavingSide === 'right' ? '保存右侧中…' : `保存右侧 (${diffRightPendingCount})`}
-            </button>
-            <span style={{ fontSize: 12, color: '#666' }}>
-              默认主流程：选择左右两个 Excel，左右并排对比，双击单元格可直接编辑。
-            </span>
-          </>
-        )}
-        {mode === 'merge' && hasMergeData && mergeInfo && (
-          <>
-            <button onClick={handleSaveMergeToFile} style={{ marginLeft: 8 }}>
-              {cliInfo?.mode === 'merge'
-                ? '将合并结果写回 Git 合并文件（MERGED，解决冲突）'
-                : cliInfo?.mode === 'diff'
+      <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+        {hasActiveWorkspace && mode === 'merge' && hasMergeData && mergeInfo && (
+          <button onClick={handleSaveMergeToFile}>
+            {cliInfo?.mode === 'merge'
+              ? '将合并结果写回 Git 合并文件（MERGED，解决冲突）'
+              : cliInfo?.mode === 'diff'
                 ? '将合并结果覆盖 ours（当前分支）文件'
                 : '保存合并结果为新的 Excel 文件（以 ours 为格式模板）'}
-            </button>
-            <span style={{ marginLeft: 8, fontSize: 12, color: '#666' }}>
-              {cliInfo
-                ? '（本次操作会将所有工作表的合并结果写入 Git 传入的目标文件，保存后回到 Git 执行 git add 即可完成冲突解决）'
-                : '（注意：保存时会将所有工作表的合并结果一并写入目标文件）'}
-            </span>
-          </>
+          </button>
         )}
       </div>
+      {workspaceTabs.length > 0 && (
+        <div
+          style={{
+            marginBottom: 12,
+            display: 'flex',
+            alignItems: 'flex-end',
+            gap: 6,
+            borderBottom: '1px solid #d1d5db',
+            paddingBottom: 4,
+            overflowX: 'auto',
+            whiteSpace: 'nowrap',
+          }}
+        >
+          {workspaceTabs.map((tab) => {
+            const isActive = tab.id === activeTabId;
+            return (
+              <div
+                key={tab.id}
+                style={{
+                  display: 'inline-flex',
+                  alignItems: 'center',
+                  border: '1px solid #d1d5db',
+                  borderBottom: isActive ? '2px solid #fff' : '1px solid #d1d5db',
+                  borderRadius: '8px 8px 0 0',
+                  backgroundColor: isActive ? '#fff' : '#f8fafc',
+                }}
+              >
+                <button
+                  type="button"
+                  onClick={() => setActiveTabId(tab.id)}
+                  style={{
+                    border: 'none',
+                    background: 'transparent',
+                    padding: '6px 10px',
+                    cursor: 'pointer',
+                    fontSize: 12,
+                  }}
+                  title={tab.title}
+                >
+                  {tab.title}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => closeWorkspaceTab(tab.id)}
+                  style={{
+                    border: 'none',
+                    background: 'transparent',
+                    cursor: 'pointer',
+                    color: '#6b7280',
+                    padding: '4px 8px',
+                    fontSize: 12,
+                  }}
+                  title="关闭标签页"
+                >
+                  x
+                </button>
+              </div>
+            );
+          })}
+        </div>
+      )}
+
+      {!hasActiveWorkspace ? (
+        <div
+          style={{
+            flex: 1,
+            minHeight: 0,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'center',
+            padding: 24,
+          }}
+        >
+          <div
+            style={{
+              width: '100%',
+              maxWidth: 820,
+              minHeight: 180,
+              border: '1px solid #d1d5db',
+              borderRadius: 14,
+              backgroundColor: '#ffffff',
+              boxShadow: '0 12px 36px rgba(15, 23, 42, 0.08)',
+              padding: '28px 34px',
+              boxSizing: 'border-box',
+              display: 'flex',
+              flexDirection: 'column',
+              justifyContent: 'center',
+              gap: 10,
+            }}
+          >
+            <div style={{ fontSize: 24, fontWeight: 700, color: '#0f172a' }}>欢迎使用 eMerge</div>
+            <div style={{ fontSize: 14, color: '#334155', lineHeight: 1.7 }}>
+              先到左上角菜单 <strong>File</strong> 选择操作模式：
+              <span style={{ marginLeft: 6 }}>Excel 文件夹比较 / Excel 比较 / Merge 模式。</span>
+            </div>
+            <div style={{ fontSize: 12, color: '#64748b' }}>
+              选择后会自动打开对应标签页；你可以同时打开多个标签页并切换处理。
+            </div>
+          </div>
+        </div>
+      ) : (
+        <>
+      {mode === 'folder' && (
+        <div
+          style={{
+            marginBottom: 12,
+            padding: 12,
+            border: '1px solid #dcdcdc',
+            borderRadius: 10,
+            display: 'grid',
+            gap: 8,
+            flexShrink: 0,
+          }}
+        >
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span style={{ width: 86, fontSize: 12, color: '#555' }}>左侧文件夹</span>
+            <input
+              value={folderPathInputs.left}
+              placeholder="粘贴左侧文件夹路径"
+              onChange={(e) =>
+                setFolderPathInputs((prev) => ({
+                  ...prev,
+                  left: e.target.value,
+                }))
+              }
+              style={{ flex: 1, minWidth: 260, padding: '4px 6px', boxSizing: 'border-box' }}
+            />
+            <button type="button" onClick={() => void handlePickFolder('left')}>
+              选择左侧
+            </button>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+            <span style={{ width: 86, fontSize: 12, color: '#555' }}>右侧文件夹</span>
+            <input
+              value={folderPathInputs.right}
+              placeholder="粘贴右侧文件夹路径"
+              onChange={(e) =>
+                setFolderPathInputs((prev) => ({
+                  ...prev,
+                  right: e.target.value,
+                }))
+              }
+              style={{ flex: 1, minWidth: 260, padding: '4px 6px', boxSizing: 'border-box' }}
+            />
+            <button type="button" onClick={() => void handlePickFolder('right')}>
+              选择右侧
+            </button>
+          </div>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+            <button type="button" onClick={() => void handleRunFolderCompare()} disabled={folderCompareInProgress}>
+              {folderCompareInProgress ? '对比中...' : '开始对比'}
+            </button>
+            <div
+              style={{
+                width: 220,
+                height: 8,
+                borderRadius: 999,
+                border: '1px solid #cbd5e1',
+                backgroundColor: '#eef2f7',
+                overflow: 'hidden',
+              }}
+            >
+              <div
+                style={{
+                  width: `${Math.max(0, Math.min(100, folderCompareProgress))}%`,
+                  height: '100%',
+                  backgroundColor: folderCompareInProgress ? '#2563eb' : '#94a3b8',
+                  transition: 'width 140ms linear',
+                }}
+              />
+            </div>
+            <span style={{ fontSize: 12, color: '#4b5563' }}>
+              进度: {folderCompareInProgress ? `${Math.round(folderCompareProgress)}%` : `${Math.round(folderCompareProgress)}%`}
+            </span>
+            <span style={{ fontSize: 12, color: '#6b7280' }}>
+              文件数: {folderCompareItems.length}
+            </span>
+          </div>
+        </div>
+      )}
 
       {mode === 'diff' && (
         <div
@@ -3636,6 +4312,37 @@ export const App: React.FC = () => {
         }}
       >
 
+      {mode === 'folder' && (
+        <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
+          <div style={{ marginBottom: 8, fontSize: 12, color: '#6b7280', display: 'flex', gap: 12, flexWrap: 'wrap' }}>
+            <span>双击同名 Excel 可打开比较标签页。</span>
+            <span style={{ color: '#2563eb' }}>蓝色：仅单侧存在（多余文件）</span>
+            <span style={{ color: '#dc2626' }}>红色：同名但内容有 diff</span>
+            <span style={{ color: '#db2777' }}>粉色：该目录下同时存在“多余 + diff”</span>
+          </div>
+          {folderTreeRows.length === 0 ? (
+            <div
+              style={{
+                flex: 1,
+                minHeight: 0,
+                border: '1px solid #d1d5db',
+                borderRadius: 10,
+                backgroundColor: '#fff',
+                padding: 16,
+                color: '#6b7280',
+              }}
+            >
+              请先输入两个文件夹路径并点击“开始对比”。
+            </div>
+          ) : (
+            <div style={{ flex: 1, minHeight: 0, display: 'flex', gap: 12 }}>
+              {renderFolderPane('left')}
+              {renderFolderPane('right')}
+            </div>
+          )}
+        </div>
+      )}
+
       {mode === 'diff' && (
         <div style={{ flex: 1, minHeight: 0, display: 'flex', flexDirection: 'column' }}>
           <div style={{ marginBottom: 8 }}>
@@ -3692,6 +4399,26 @@ export const App: React.FC = () => {
                   rowsMeta={currentDiffRowsMeta}
                   columnsMeta={currentDiffColumnsMeta}
                   frozenRowCount={mergeFrozenRowCount}
+                  headerActions={
+                    <>
+                      <button
+                        type="button"
+                        onClick={() => handleSaveDiffSide('left')}
+                        disabled={!diffLeftWorkbook || diffLeftPendingCount === 0 || diffSavingSide !== null}
+                        style={{ padding: '2px 8px', fontSize: 12 }}
+                      >
+                        {diffSavingSide === 'left' ? '保存左侧中…' : `保存左侧 (${diffLeftPendingCount})`}
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => handleSaveDiffSide('right')}
+                        disabled={!diffRightWorkbook || diffRightPendingCount === 0 || diffSavingSide !== null}
+                        style={{ padding: '2px 8px', fontSize: 12 }}
+                      >
+                        {diffSavingSide === 'right' ? '保存右侧中…' : `保存右侧 (${diffRightPendingCount})`}
+                      </button>
+                    </>
+                  }
                   selected={diffSelectedCell}
                   onSelectCell={(rowIndex, colIndex) => setDiffSelectedCell({ rowIndex, colIndex })}
                   onCellChange={handleDiffCellChange}
@@ -3904,6 +4631,8 @@ export const App: React.FC = () => {
         </div>
       )}
       </div>
+        </>
+      )}
     </div>
   );
 };
