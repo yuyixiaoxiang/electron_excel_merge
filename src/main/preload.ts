@@ -163,6 +163,7 @@ interface CliThreeWayInfo {
   oursPath: string;
   theirsPath: string;
   mergedPath?: string;
+  mergedPathRaw?: string;
   mode: 'diff' | 'merge';
 }
 interface DebugLogEntry {

@@ -24,6 +24,20 @@ interface DebugLogEntry {
   details?: unknown;
 }
 
+type ExcelJsWorksheetXformCompat = {
+  prototype: {
+    __eMergeCompatPatched?: boolean;
+    reconcile: (model: any, options: any) => unknown;
+  };
+};
+type ExcelJsStylesXformCompat = {
+  prototype: {
+    __eMergeCompatPatched?: boolean;
+    getStyleModel: (id: number) => unknown;
+    getDxfStyle?: (id: number) => unknown;
+  };
+};
+
 const getDebugLogPath = (): string => path.join(app.getPath('temp'), DEBUG_LOG_FILE_NAME);
 const debugFileLabel = (filePath: string | null | undefined): string | null =>
   filePath ? path.basename(filePath) : null;
@@ -72,6 +86,75 @@ process.on('unhandledRejection', (reason) => {
   console.error(reason);
 });
 
+const patchExcelJsLegacyCommentCompat = () => {
+  const worksheetXform = require('exceljs/lib/xlsx/xform/sheet/worksheet-xform') as ExcelJsWorksheetXformCompat;
+  const stylesXform = require('exceljs/lib/xlsx/xform/style/styles-xform') as ExcelJsStylesXformCompat;
+  let installedAnyPatch = false;
+  if (!worksheetXform?.prototype?.__eMergeCompatPatched) {
+    const originalReconcile = worksheetXform?.prototype?.reconcile;
+    if (typeof originalReconcile !== 'function') {
+      appendDebugLog('main', 'exceljs:legacy-comment-compat-skipped', { reason: 'missing-reconcile' });
+      return;
+    }
+    worksheetXform.prototype.reconcile = function patchedWorksheetReconcile(model: any, options: any) {
+      const nextOptions = options ?? {};
+      const relationships = Array.isArray(model?.relationships) ? model.relationships : [];
+      const missingCommentTargets: string[] = [];
+      const missingVmlTargets: string[] = [];
+      if (!nextOptions.comments) nextOptions.comments = {};
+      if (!nextOptions.vmlDrawings) nextOptions.vmlDrawings = {};
+      relationships.forEach((rel: any) => {
+        const relType = String(rel?.Type ?? '');
+        const target = typeof rel?.Target === 'string' ? rel.Target : '';
+        if (!target) return;
+        if (relType.endsWith('/comments') && !nextOptions.comments[target]) {
+          nextOptions.comments[target] = { comments: [] };
+          missingCommentTargets.push(target);
+        }
+        if (relType.endsWith('/vmlDrawing') && !nextOptions.vmlDrawings[target]) {
+          nextOptions.vmlDrawings[target] = { comments: [] };
+          missingVmlTargets.push(target);
+        }
+      });
+      if (missingCommentTargets.length || missingVmlTargets.length) {
+        appendDebugLog('main', 'exceljs:legacy-comment-compat-applied', {
+          sheetName: model?.name ?? null,
+          missingCommentTargets,
+          missingVmlTargets,
+        });
+      }
+      return originalReconcile.call(this, model, nextOptions);
+    };
+    worksheetXform.prototype.__eMergeCompatPatched = true;
+    installedAnyPatch = true;
+  }
+  if (!stylesXform?.prototype?.__eMergeCompatPatched) {
+    const originalGetStyleModel = stylesXform?.prototype?.getStyleModel;
+    if (typeof originalGetStyleModel === 'function') {
+      stylesXform.prototype.getStyleModel = function patchedGetStyleModel(this: any, id: number) {
+        if (!this || !this.model || !Array.isArray(this.model.styles)) {
+          return {};
+        }
+        return originalGetStyleModel.call(this, id) ?? {};
+      };
+    }
+    const originalGetDxfStyle = stylesXform?.prototype?.getDxfStyle;
+    if (typeof originalGetDxfStyle === 'function') {
+      stylesXform.prototype.getDxfStyle = function patchedGetDxfStyle(this: any, id: number) {
+        if (!this || !this.model || !Array.isArray(this.model.dxfs)) {
+          return {};
+        }
+        return originalGetDxfStyle.call(this, id) ?? {};
+      };
+    }
+    stylesXform.prototype.__eMergeCompatPatched = true;
+    installedAnyPatch = true;
+  }
+  if (installedAnyPatch) {
+    appendDebugLog('main', 'exceljs:legacy-comment-compat-installed');
+  }
+};
+
 /**
  * CLI three-way merge arguments for git/Fork integration.
  *
@@ -87,8 +170,63 @@ interface CliThreeWayArgs {
   oursPath: string;
   theirsPath: string;
   mergedPath?: string;
+  mergedPathRaw?: string;
   mode: 'diff' | 'merge';
 }
+
+const stripOuterQuotes = (s: string) => s.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
+const normalizeCliPathText = (value: string): string => {
+  const raw = stripOuterQuotes(value).trim();
+  if (!raw) return raw;
+  const msysDrivePathMatch = /^\/([a-zA-Z])\/(.*)$/.exec(raw);
+  if (msysDrivePathMatch) {
+    return `${msysDrivePathMatch[1].toUpperCase()}:\\${msysDrivePathMatch[2].replace(/\//g, '\\')}`;
+  }
+  return raw;
+};
+const getCliRelativePathRoots = (): string[] => {
+  const roots: string[] = [];
+  const pushRoot = (value: string | null | undefined) => {
+    if (!value) return;
+    const normalized = normalizeCliPathText(value);
+    if (!normalized) return;
+    const absolute = path.isAbsolute(normalized) ? path.normalize(normalized) : path.resolve(normalized);
+    if (!roots.includes(absolute)) {
+      roots.push(absolute);
+    }
+  };
+  pushRoot(process.env.GIT_WORK_TREE);
+  pushRoot(process.env.PWD);
+  pushRoot(process.env.INIT_CWD);
+  pushRoot(process.env.OLDPWD);
+  pushRoot(process.cwd());
+  return roots;
+};
+const resolveCliInputPath = (value: string): string => {
+  const normalized = normalizeCliPathText(value);
+  if (!normalized) return normalized;
+  if (path.isAbsolute(normalized)) return path.normalize(normalized);
+  for (const root of getCliRelativePathRoots()) {
+    const candidate = path.resolve(root, normalized);
+    if (fs.existsSync(candidate)) {
+      return path.normalize(candidate);
+    }
+  }
+  return path.resolve(process.cwd(), normalized);
+};
+const resolveCliOutputPath = (value: string | null | undefined): string | undefined => {
+  if (!value) return undefined;
+  const normalized = normalizeCliPathText(value);
+  if (!normalized) return undefined;
+  if (path.isAbsolute(normalized)) return path.normalize(normalized);
+  for (const root of getCliRelativePathRoots()) {
+    const candidate = path.resolve(root, normalized);
+    if (fs.existsSync(candidate) || fs.existsSync(path.dirname(candidate))) {
+      return path.normalize(candidate);
+    }
+  }
+  return undefined;
+};
 
 /**
  * 从process.argv 中解析三方合并相关参数。
@@ -101,12 +239,6 @@ const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
   // 对于打包后的 exe: process.argv = [app.exe, ...args]
   const argStartIndex = app?.isPackaged ? 1 : 2;
   const rawArgs = process.argv.slice(argStartIndex);
-  const stripOuterQuotes = (s: string) => s.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
-  const normalizeCliPath = (p: string) => {
-    const raw = stripOuterQuotes(p);
-    if (!raw) return raw;
-    return path.isAbsolute(raw) ? raw : path.resolve(process.cwd(), raw);
-  };
   const userArgs = rawArgs
     .map((arg) => stripOuterQuotes(arg))
     .filter((arg) => !!arg && !arg.startsWith('--'));
@@ -129,7 +261,7 @@ const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
 
   // 2 个参数，认为是 diff 模式 -> base 与 ours 相同（仅用于计算差异）
   if (userArgs.length === 2) {
-    const [oursPath, theirsPath] = userArgs.map(normalizeCliPath);
+    const [oursPath, theirsPath] = userArgs.map(resolveCliInputPath);
     return { basePath: oursPath, oursPath, theirsPath, mode: 'diff' };
   }
 
@@ -137,12 +269,31 @@ const parseCliThreeWayArgs = (): CliThreeWayArgs | null => {
     return null;
   }
 
-  const [basePath, oursPath, theirsPath, mergedPath] = userArgs.map(normalizeCliPath);
-  return { basePath, oursPath, theirsPath, mergedPath, mode: 'merge' };
+  const [baseArg, oursArg, theirsArg, mergedArg] = userArgs.map(normalizeCliPathText);
+  const basePath = resolveCliInputPath(baseArg);
+  const oursPath = resolveCliInputPath(oursArg);
+  const theirsPath = resolveCliInputPath(theirsArg);
+  const mergedPathRaw = mergedArg || undefined;
+  const mergedPath = resolveCliOutputPath(mergedPathRaw);
+  return { basePath, oursPath, theirsPath, mergedPath, mergedPathRaw, mode: 'merge' };
 };
 
 // 解析启动参数得到的三方合并信息（若无参数则为 null，走交互式模式）
 const cliThreeWayArgs: CliThreeWayArgs | null = parseCliThreeWayArgs();
+if (cliThreeWayArgs) {
+  appendDebugLog('main', 'cli:parsed', {
+    mode: cliThreeWayArgs.mode,
+    cwd: process.cwd(),
+    pwd: process.env.PWD ?? null,
+    initCwd: process.env.INIT_CWD ?? null,
+    gitWorkTree: process.env.GIT_WORK_TREE ?? null,
+    basePath: debugFileLabel(cliThreeWayArgs.basePath),
+    oursPath: debugFileLabel(cliThreeWayArgs.oursPath),
+    theirsPath: debugFileLabel(cliThreeWayArgs.theirsPath),
+    mergedPathRaw: cliThreeWayArgs.mergedPathRaw ?? null,
+    mergedPath: cliThreeWayArgs.mergedPath ?? null,
+  });
+}
 const getBundledGitInfo = (): { gitPath: string; env: NodeJS.ProcessEnv } | null => {
   const basePath = app?.isPackaged
     ? path.join(process.resourcesPath, 'git')
@@ -314,6 +465,39 @@ const getSimpleValueForMerge = (v: any): SimpleCellValue => {
   if (typeof v === 'string' || typeof v === 'number') return v;
   // 其他类型转字符串
   return String(v);
+};
+
+const getFirstNonEmptyCellText = (ws: Worksheet | null | undefined, rowNumber: number, scanCols = 8): string | null => {
+  if (!ws || rowNumber < 1) return null;
+  const row = ws.getRow(rowNumber);
+  const upperBound = Math.max(scanCols, ws.actualColumnCount ?? ws.columnCount ?? 0);
+  for (let col = 1; col <= upperBound; col += 1) {
+    const raw = getSimpleValueForMerge(row.getCell(col)?.value);
+    if (raw == null) continue;
+    const text = String(raw).trim();
+    if (text) return text;
+  }
+  return null;
+};
+
+const resolveStructuredHeaderRowCount = (
+  worksheets: Array<Worksheet | null | undefined>,
+  requestedHeaderRowCount: number,
+): number => {
+  const requested = Math.max(0, Math.floor(requestedHeaderRowCount));
+  let detected = 0;
+  const scanLimit = Math.max(requested + 4, 8);
+  worksheets.forEach((ws) => {
+    if (!ws) return;
+    let sheetDetected = 0;
+    for (let rowNumber = 1; rowNumber <= scanLimit; rowNumber += 1) {
+      const marker = getFirstNonEmptyCellText(ws, rowNumber);
+      if (!marker || !marker.startsWith('##')) break;
+      sheetDetected = rowNumber;
+    }
+    detected = Math.max(detected, sheetDetected);
+  });
+  return Math.max(requested, detected);
 };
 
 /**
@@ -1607,7 +1791,7 @@ const buildMergeSheetWithRowAlign = (
     oursWs?.actualColumnCount ?? oursWs?.columnCount ?? 0,
     theirsWs?.actualColumnCount ?? theirsWs?.columnCount ?? 0,
   );
-  const headerCount = Math.max(0, Math.floor(frozenRowCount));
+  const headerCount = resolveStructuredHeaderRowCount([baseWs, oursWs, theirsWs], frozenRowCount);
   const baseWsForAlign = runtimeConfig.alignBaseSide === 'ours' ? oursWs : baseWs;
   const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, headerCount);
   const columnsMeta: MergeColumnMeta[] = alignedColumns.map((c, idx) => ({
@@ -1851,6 +2035,7 @@ const buildMergeSheetWithRowAlign = (
 const workbookCache = new Map<string, Workbook>();
 
 const loadWorkbookCached = async (filePath: string): Promise<Workbook> => {
+  patchExcelJsLegacyCommentCompat();
   const hit = workbookCache.get(filePath);
   if (hit) {
     appendDebugLog('main', 'workbook-cache:hit', { filePath: debugFileLabel(filePath) });
@@ -2459,22 +2644,37 @@ const saveMergeResultInternal = async (
       colOps?: SaveMergeColOp[];
     };
     let targetPath: string | undefined = options?.targetPathOverride;
+    const unresolvedCliMergedPath =
+      cliThreeWayArgs?.mode === 'merge' && cliThreeWayArgs.mergedPathRaw && !cliThreeWayArgs.mergedPath
+        ? cliThreeWayArgs.mergedPathRaw
+        : null;
 
     if (!targetPath && cliThreeWayArgs && cliThreeWayArgs.mode === 'merge') {
-      // git / Fork merge 模式：优先写入MERGED（工作区对应文件），如果命令只传了base/ours/theirs 三个参数，则回退覆盖 ours。
-      const oursPath = cliThreeWayArgs.oursPath;
-      const mergedPath = cliThreeWayArgs.mergedPath;
-      targetPath = mergedPath || oursPath;
+      // git / Fork merge 模式：
+      //   - 如果 MERGED 能解析成绝对路径，则优先写回 MERGED；
+      //   - 如果根本没传 MERGED，则回退覆盖 ours；
+      //   - 如果传了相对 MERGED 但无法可靠解析，则改为让用户确认保存位置，避免误写到便携版临时目录。
+      if (cliThreeWayArgs.mergedPath) {
+        targetPath = cliThreeWayArgs.mergedPath;
+      } else if (!cliThreeWayArgs.mergedPathRaw) {
+        targetPath = cliThreeWayArgs.oursPath;
+      }
     } else if (!targetPath && cliThreeWayArgs && cliThreeWayArgs.mode === 'diff') {
       targetPath = cliThreeWayArgs.oursPath;
-    } else if (!targetPath) {
+    }
+
+    if (!targetPath) {
       const windowForSave = mainWindow;
       if (!windowForSave) {
         throw new Error('Main window is not available');
       }
+      const unresolvedMergedLeaf =
+        unresolvedCliMergedPath && unresolvedCliMergedPath.trim()
+          ? path.basename(unresolvedCliMergedPath)
+          : '';
       const { canceled, filePath } = await dialog.showSaveDialog(windowForSave, {
-        title: '保存合并后的 Excel',
-        defaultPath: templatePath,
+        title: unresolvedCliMergedPath ? '无法自动定位 Git 的 MERGED 文件，请确认保存位置' : '保存合并后的 Excel',
+        defaultPath: unresolvedMergedLeaf || templatePath,
         filters: [{ name: 'Excel Files', extensions: ['xlsx'] }],
       });
 
@@ -2711,6 +2911,10 @@ const saveMergeResultInternal = async (
     }
 
     normalizeSharedFormulas(workbook);
+    const targetDir = path.dirname(targetPath);
+    if (targetDir && !fs.existsSync(targetDir)) {
+      fs.mkdirSync(targetDir, { recursive: true });
+    }
     await workbook.xlsx.writeFile(targetPath);
     // invalidate cache to avoid stale reads
     if (targetPath && workbookCache.has(targetPath)) {
@@ -2980,10 +3184,11 @@ ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): 
     typeof req.frozenRowCount === 'number' && !Number.isNaN(req.frozenRowCount)
       ? Math.max(0, Math.floor(req.frozenRowCount))
       : DEFAULT_FROZEN_HEADER_ROWS;
+  const resolvedHeaderCount = resolveStructuredHeaderRowCount([baseWs, oursWs, theirsWs], headerCount);
   const compareMode: ThreeWayCompareMode = req.compareMode === 'diff' ? 'diff' : 'merge';
   const runtimeConfig = getThreeWayRuntimeConfig(compareMode);
   const baseWsForAlign = runtimeConfig.alignBaseSide === 'ours' ? oursWs : baseWs;
-  const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, headerCount);
+  const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, resolvedHeaderCount);
   const colCount = alignedColumns.length;
   appendDebugLog('main', 'getThreeWayRow:start', {
     requestId,
@@ -2993,7 +3198,7 @@ ipcMain.handle('excel:getThreeWayRow', async (_event, req: ThreeWayRowRequest): 
     baseRowNumber,
     oursRowNumber,
     theirsRowNumber,
-    frozenRowCount: headerCount,
+    frozenRowCount: resolvedHeaderCount,
   });
 
   const readRowAligned = (
@@ -3060,17 +3265,18 @@ ipcMain.handle('excel:getThreeWayRows', async (_event, req: ThreeWayRowsRequest)
     typeof req.frozenRowCount === 'number' && !Number.isNaN(req.frozenRowCount)
       ? Math.max(0, Math.floor(req.frozenRowCount))
       : DEFAULT_FROZEN_HEADER_ROWS;
+  const resolvedHeaderCount = resolveStructuredHeaderRowCount([baseWs, oursWs, theirsWs], headerCount);
   const compareMode: ThreeWayCompareMode = req.compareMode === 'diff' ? 'diff' : 'merge';
   const runtimeConfig = getThreeWayRuntimeConfig(compareMode);
   const baseWsForAlign = runtimeConfig.alignBaseSide === 'ours' ? oursWs : baseWs;
-  const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, headerCount);
+  const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, resolvedHeaderCount);
   const colCount = alignedColumns.length;
   appendDebugLog('main', 'getThreeWayRows:start', {
     requestId,
     compareMode,
     sheetName: resolvedSheetName,
     rowCount: req.rows.length,
-    frozenRowCount: headerCount,
+    frozenRowCount: resolvedHeaderCount,
   });
 
   const readRowAligned = (

@@ -467,6 +467,116 @@ const runModeDifferenceLargeScenario = async (rootDir: string) => {
   assert.equal((diffSheet.rowsMeta ?? []).length, 0);
 };
 
+const runStructuredHeaderDetectionScenario = async (rootDir: string) => {
+  const sheetName = 'StructuredHeaderRows';
+  const headerRows: SheetRow[] = [
+    ['##comment', 'id', '#成就组备注', '成就'],
+    ['##var', 'id', '##mark', 'achievement'],
+    ['##type', 'int', 'string', '(list#sep=|),int'],
+    ['##group', null, null, null],
+  ];
+  const baseBody: SheetRow[] = [
+    [null, 1, null, '10001|10002|10003'],
+    [null, 2, null, '11001|11002|11003|41001'],
+  ];
+  const oursBody: SheetRow[] = [
+    [null, 1, null, '10001|1000aasdasd2|10003'],
+    [null, 2, null, '11001|11002|11003|41001'],
+  ];
+  const theirsBody: SheetRow[] = [
+    [null, 1, null, '10001|100xx|10003'],
+    [null, 2, null, '11001|11002|11003|41001'],
+  ];
+
+  const { basePath, oursPath, theirsPath } = await writeWorkbookTriplet(
+    rootDir,
+    'structured-header-rows',
+    [{ name: sheetName, rows: [...headerRows, ...baseBody] }],
+    [{ name: sheetName, rows: [...headerRows, ...oursBody] }],
+    [{ name: sheetName, rows: [...headerRows, ...theirsBody] }],
+  );
+
+  const { mergeSheets } = await __testOnly.buildMergeSheetsForWorkbooks(
+    basePath,
+    oursPath,
+    theirsPath,
+    -1,
+    HEADER_ROW_COUNT,
+    LARGE_ROW_SIMILARITY_THRESHOLD,
+    'merge',
+  );
+  const sheet = getSheetOrThrow(mergeSheets, sheetName);
+  const rowsMeta = sheet.rowsMeta ?? [];
+  assert.ok(rowsMeta.length >= 6, 'Structured header scenario should preserve all header and body rows');
+  assert.deepStrictEqual(
+    rowsMeta.slice(0, 6).map((row) => ({
+      visualRowNumber: row.visualRowNumber,
+      baseRowNumber: row.baseRowNumber,
+      oursRowNumber: row.oursRowNumber,
+      theirsRowNumber: row.theirsRowNumber,
+    })),
+    [
+      { visualRowNumber: 1, baseRowNumber: 1, oursRowNumber: 1, theirsRowNumber: 1 },
+      { visualRowNumber: 2, baseRowNumber: 2, oursRowNumber: 2, theirsRowNumber: 2 },
+      { visualRowNumber: 3, baseRowNumber: 3, oursRowNumber: 3, theirsRowNumber: 3 },
+      { visualRowNumber: 4, baseRowNumber: 4, oursRowNumber: 4, theirsRowNumber: 4 },
+      { visualRowNumber: 5, baseRowNumber: 5, oursRowNumber: 5, theirsRowNumber: 5 },
+      { visualRowNumber: 6, baseRowNumber: 6, oursRowNumber: 6, theirsRowNumber: 6 },
+    ],
+    'Structured Luban headers should not shift body row mapping',
+  );
+  const diffCells = (sheet.cells ?? []).map((cell) => ({
+    row: cell.row,
+    col: cell.col,
+    status: cell.status,
+    baseValue: cell.baseValue,
+    oursValue: cell.oursValue,
+    theirsValue: cell.theirsValue,
+  }));
+  assert.deepStrictEqual(diffCells, [
+    {
+      row: 1,
+      col: 4,
+      status: 'unchanged',
+      baseValue: '成就',
+      oursValue: '成就',
+      theirsValue: '成就',
+    },
+    {
+      row: 2,
+      col: 4,
+      status: 'unchanged',
+      baseValue: 'achievement',
+      oursValue: 'achievement',
+      theirsValue: 'achievement',
+    },
+    {
+      row: 3,
+      col: 4,
+      status: 'unchanged',
+      baseValue: '(list#sep=|),int',
+      oursValue: '(list#sep=|),int',
+      theirsValue: '(list#sep=|),int',
+    },
+    {
+      row: 4,
+      col: 4,
+      status: 'unchanged',
+      baseValue: null,
+      oursValue: null,
+      theirsValue: null,
+    },
+    {
+      row: 5,
+      col: 4,
+      status: 'conflict',
+      baseValue: '10001|10002|10003',
+      oursValue: '10001|1000aasdasd2|10003',
+      theirsValue: '10001|100xx|10003',
+    },
+  ]);
+};
+
 const runStructuralRowsLargeScenario = async (rootDir: string) => {
   const sheetName = 'StructuralRowsLarge';
   const headers = makeHeaderRows(['id', 'value', 'qty', 'owner']);
@@ -1123,6 +1233,8 @@ const main = async () => {
     await runCellStatusLargeScenario(rootDir);
     __testOnly.clearWorkbookCache();
     await runModeDifferenceLargeScenario(rootDir);
+    __testOnly.clearWorkbookCache();
+    await runStructuredHeaderDetectionScenario(rootDir);
     __testOnly.clearWorkbookCache();
     await runStructuralRowsLargeScenario(rootDir);
     __testOnly.clearWorkbookCache();

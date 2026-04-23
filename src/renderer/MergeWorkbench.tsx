@@ -44,6 +44,8 @@ export interface MergeWorkbenchProps {
   remainingCount: number;
   canUndo?: boolean;
   onUndo?: () => void;
+  canJumpToNextConflict?: boolean;
+  onJumpToNextConflict?: () => void;
 }
 
 const DEFAULT_FROZEN_HEADER_ROWS = 3;
@@ -215,6 +217,8 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
   remainingCount,
   canUndo = false,
   onUndo,
+  canJumpToNextConflict,
+  onJumpToNextConflict,
 }) => {
   const baseScrollRef = useRef<HTMLDivElement | null>(null);
   const oursScrollRef = useRef<HTMLDivElement | null>(null);
@@ -433,6 +437,8 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
     if (!nextCell) return;
     onSelectCell(nextCell.row - 1, nextCell.col - 1);
   };
+  const effectiveCanJumpToNextConflict = canJumpToNextConflict ?? (unresolvedConflicts.length > 0);
+  const effectiveJumpToNextConflict = onJumpToNextConflict ?? jumpToNextConflict;
 
   const applyAllConflictsChoice = (source: 'base' | 'ours' | 'theirs') => {
     if (!onApplyCellsChoice || unresolvedConflicts.length === 0) return;
@@ -597,7 +603,7 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
             />
             仅未解决行
           </label>
-          <button type="button" onClick={jumpToNextConflict} disabled={unresolvedConflicts.length === 0}>
+          <button type="button" onClick={effectiveJumpToNextConflict} disabled={!effectiveCanJumpToNextConflict}>
             下一个冲突
           </button>
           <button type="button" onClick={onUndo} disabled={!canUndo}>

@@ -372,6 +372,11 @@ export const App: React.FC = () => {
   const cliInfoInitializedRef = useRef(false);
   const lastMergeCompareSignatureRef = useRef<string | null>(null);
   const lastDiffCompareSignatureRef = useRef<string | null>(null);
+  const lastMergeConflictNavRef = useRef<{
+    sheetIndex: number;
+    row: number;
+    col: number;
+  } | null>(null);
   const nextDebugRequestId = useCallback(
     (prefix: string) => `${prefix}-${Date.now()}-${++debugSeqRef.current}`,
     [],
@@ -1192,8 +1197,9 @@ export const App: React.FC = () => {
     if (cliInfoInitializedRef.current) return;
     cliInfoInitializedRef.current = true;
     (async () => {
+      let info: CliThreeWayInfo | null = null;
       try {
-        const info = await window.excelAPI.getCliThreeWayInfo();
+        info = await window.excelAPI.getCliThreeWayInfo();
         if (!info) return;
         setCliInfo(info);
         if (info.mode === 'merge') {
@@ -1214,11 +1220,30 @@ export const App: React.FC = () => {
         ]);
         if (!leftWorkbook || !rightWorkbook) return;
         await loadDiffComparison(leftWorkbook, rightWorkbook);
-      } catch {
-        // 忽略错误，保持交互式模式可用
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        logRendererDebug('cli-bootstrap:error', {
+          cliMode: info?.mode ?? null,
+          message,
+          stack: error instanceof Error ? error.stack : null,
+        });
+        console.error('CLI bootstrap failed', error);
+        if (info) {
+          let logPath = '';
+          try {
+            logPath = await window.excelAPI.getDebugLogPath();
+          } catch {
+            logPath = '';
+          }
+          const detailLines = [`CLI 启动加载失败：${message}`];
+          if (logPath) {
+            detailLines.push(`调试日志：${logPath}`);
+          }
+          alert(detailLines.join('\n'));
+        }
       }
     })();
-  }, [loadDiffComparison, loadMergeComparison, openWorkspaceTab]);
+  }, [loadDiffComparison, loadMergeComparison, logRendererDebug, openWorkspaceTab]);
   useEffect(() => {
     if (mode !== 'diff') return;
     const handleWindowKeyDown = (e: KeyboardEvent) => {
@@ -2454,6 +2479,60 @@ export const App: React.FC = () => {
       return resolvedSet.has(`${cell.row}:${cell.col}`) ? count : count + 1;
     }, 0);
   }, [mergeCells, resolvedBySheet, selectedMergeSheetIndex]);
+  const activateMergeSheet = useCallback(
+    (
+      sheetIndex: number,
+      nextSelectedCell: {
+        rowIndex: number;
+        colIndex: number;
+      } | null = null,
+    ) => {
+      const safeSheetIndex = Math.min(Math.max(0, sheetIndex), Math.max(0, mergeSheets.length - 1));
+      const sheet = mergeSheets[safeSheetIndex];
+      setSelectedMergeSheetIndex(safeSheetIndex);
+      setMergeInfo((prev) =>
+        prev
+          ? {
+              ...prev,
+              sheetName: sheet?.sheetName ?? prev.sheetName,
+            }
+          : prev,
+      );
+      setMergeCells(sheet?.cells ?? []);
+      setMergeRowsMeta(sheet?.rowsMeta ?? []);
+      setMergeColumnsMeta(sheet?.columnsMeta ?? []);
+      setResolvedBySheet((prev) => {
+        if (prev.has(safeSheetIndex)) return prev;
+        const next = new Map(prev);
+        const resolved = new Set<string>();
+        (sheet?.cells ?? []).forEach((cell) => {
+          if (cell.status !== 'conflict') {
+            resolved.add(`${cell.row}:${cell.col}`);
+          }
+        });
+        next.set(safeSheetIndex, resolved);
+        return next;
+      });
+      setSelectedMergeCell(nextSelectedCell);
+    },
+    [mergeSheets],
+  );
+  const mergeUnresolvedConflicts = useMemo(
+    () =>
+      mergeSheets
+        .flatMap((sheet, sheetIndex) => {
+          const resolvedSet = resolvedBySheet.get(sheetIndex) ?? new Set<string>();
+          return (sheet.cells ?? [])
+            .filter((cell) => cell.status === 'conflict' && !resolvedSet.has(`${cell.row}:${cell.col}`))
+            .map((cell) => ({
+              sheetIndex,
+              row: cell.row,
+              col: cell.col,
+            }));
+        })
+        .sort((a, b) => a.sheetIndex - b.sheetIndex || a.row - b.row || a.col - b.col),
+    [mergeSheets, resolvedBySheet],
+  );
   const mergeCellKeySet = useMemo(
     () => new Set(mergeCells.map((c) => `${c.row}:${c.col}`)),
     [mergeCells],
@@ -2547,13 +2626,41 @@ export const App: React.FC = () => {
   const mergedPath = useMemo(() => {
     if (!mergeInfo) return null;
     if (cliInfo?.mode === 'merge') {
-      return cliInfo.mergedPath ?? mergeInfo.oursPath;
+      if (cliInfo.mergedPath) return cliInfo.mergedPath;
+      if (!cliInfo.mergedPathRaw) return mergeInfo.oursPath;
+      return null;
     }
     if (cliInfo?.mode === 'diff') {
       return mergeInfo.oursPath;
     }
     return null;
   }, [mergeInfo, cliInfo]);
+  const mergeConflictSummary = useMemo(() => {
+    let resolved = 0;
+    let unresolved = 0;
+    mergeSheets.forEach((sheet, sheetIndex) => {
+      const resolvedSet = resolvedBySheet.get(sheetIndex) ?? new Set<string>();
+      (sheet.cells ?? []).forEach((cell) => {
+        if (cell.status !== 'conflict') return;
+        if (resolvedSet.has(`${cell.row}:${cell.col}`)) {
+          resolved += 1;
+          return;
+        }
+        unresolved += 1;
+      });
+    });
+    return {
+      resolved,
+      unresolved,
+    };
+  }, [mergeSheets, resolvedBySheet]);
+  const mergeSaveTargetLabel = useMemo(() => {
+    if (mergedPath) return mergedPath;
+    if (cliInfo?.mode === 'merge' && cliInfo.mergedPathRaw) {
+      return `${cliInfo.mergedPathRaw}（Git 传入相对路径，保存时确认）`;
+    }
+    return '保存时会弹出选择目标文件';
+  }, [mergedPath, cliInfo]);
   const currentRowOps = useMemo(
     () => mergeRowOpsBySheet.get(selectedMergeSheetIndex) ?? EMPTY_MERGE_ROW_OPS,
     [mergeRowOpsBySheet, selectedMergeSheetIndex],
@@ -2782,7 +2889,51 @@ export const App: React.FC = () => {
 
   const handleSelectMergeCell = useCallback((rowIndex: number, colIndex: number) => {
     setSelectedMergeCell({ rowIndex, colIndex });
-  }, []);
+    const row = rowIndex + 1;
+    const col = colIndex + 1;
+    const resolvedSet = resolvedBySheet.get(selectedMergeSheetIndex) ?? new Set<string>();
+    const isUnresolvedMergeConflict = mergeCells.some(
+      (cell) => cell.row === row && cell.col === col && cell.status === 'conflict' && !resolvedSet.has(`${row}:${col}`),
+    );
+    if (isUnresolvedMergeConflict) {
+      lastMergeConflictNavRef.current = {
+        sheetIndex: selectedMergeSheetIndex,
+        row,
+        col,
+      };
+    }
+  }, [mergeCells, resolvedBySheet, selectedMergeSheetIndex]);
+  const handleJumpToNextMergeConflict = useCallback(() => {
+    if (mergeUnresolvedConflicts.length === 0) return;
+    const cursor = lastMergeConflictNavRef.current;
+    const nextConflict =
+      (cursor
+        ? mergeUnresolvedConflicts.find(
+            (cell) =>
+              cell.sheetIndex > cursor.sheetIndex ||
+              (cell.sheetIndex === cursor.sheetIndex &&
+                (cell.row > cursor.row || (cell.row === cursor.row && cell.col > cursor.col))),
+          )
+        : undefined) ??
+      mergeUnresolvedConflicts.find((cell) => cell.sheetIndex === selectedMergeSheetIndex) ??
+      mergeUnresolvedConflicts.find((cell) => cell.sheetIndex > selectedMergeSheetIndex) ??
+      mergeUnresolvedConflicts[0];
+
+    if (!nextConflict) return;
+    lastMergeConflictNavRef.current = {
+      sheetIndex: nextConflict.sheetIndex,
+      row: nextConflict.row,
+      col: nextConflict.col,
+    };
+    activateMergeSheet(nextConflict.sheetIndex, {
+      rowIndex: nextConflict.row - 1,
+      colIndex: nextConflict.col - 1,
+    });
+  }, [
+    activateMergeSheet,
+    mergeUnresolvedConflicts,
+    selectedMergeSheetIndex,
+  ]);
   const updateRowOpForSheet = useCallback(
     (sheetIndex: number, visualRowNumber: number, op: SaveMergeRowOp | null) => {
       setMergeRowOpsBySheet((prev) => {
@@ -3255,63 +3406,21 @@ export const App: React.FC = () => {
   /**
    * merge 模式下，将所有工作表的 mergedValue 写回一个目标 Excel 文件。
    *
-   * 为了避免误操作，这里会先统计所有发生变化的单元格，
-   * 构造一个预览字符串通过 window.confirm 让用户二次确认。
+   * 保存前只展示目标路径和冲突处理进度，避免把底层写回的单元格数量误解成手工修改量。
    */
   const handleSaveMergeToFile = useCallback(async () => {
     if (!mergeInfo || mergeSheets.length === 0) return;
-
-    // 生成本次合并的概要信息：mergeSheets.cells 本身就是差异单元格列表
-    const changedCells: { sheetName: string; address: string; ours: any; theirs: any; merged: any }[] = [];
-    let skippedCells = 0;
-    mergeSheets.forEach((sheet) => {
-      const rowMetaMap = new Map<number, MergeRowMeta>();
-      (sheet.rowsMeta ?? []).forEach((m) => rowMetaMap.set(m.visualRowNumber, m));
-      const hasRowMeta = (sheet.rowsMeta ?? []).length > 0;
-      sheet.cells.forEach((cell: MergeCell) => {
-        const meta = rowMetaMap.get(cell.row);
-        const targetRowNumber = meta?.oursRowNumber ?? null;
-        const targetColNumber = cell.oursCol ?? null;
-        if (hasRowMeta && !targetRowNumber) {
-          skippedCells += 1;
-          return;
-        }
-        if (!targetColNumber) {
-          skippedCells += 1;
-          return;
-        }
-        const address = targetRowNumber ? makeAddress(targetColNumber, targetRowNumber) : makeAddress(targetColNumber, cell.row);
-        changedCells.push({
-          sheetName: sheet.sheetName,
-          address,
-          ours: cell.oursValue,
-          theirs: cell.theirsValue,
-          merged: cell.mergedValue,
-        });
-      });
-    });
-
-    const formatVal = (v: any) => (v === null || v === undefined ? '' : String(v));
-
-    const maxLines = 100;
-    const lines = changedCells.slice(0, maxLines).map((c) =>
-      `[${c.sheetName}] 单元格 ${c.address}: ours="${formatVal(c.ours)}"  |  theirs="${formatVal(
-        c.theirs,
-      )}"  |  合并="${formatVal(c.merged)}"`,
-    );
-
-    if (changedCells.length > maxLines) {
-      lines.push(`…… 还有 ${changedCells.length - maxLines} 个单元格未展示`);
-    }
-    if (skippedCells > 0) {
-      lines.push(`（提示：有 ${skippedCells} 个单元格因 ours 侧缺少对应行/列而未写入）`);
-    }
-
-    const preview =
-      `本次合并将影响 ${changedCells.length} 个单元格（覆盖所有工作表）：` +
-      (lines.length ? `\n\n${lines.join('\n')}` : '\n(无差异单元格——仅写回了当前值)') +
-      '\n\n注意：保存时会将所有工作表的合并结果一并写入目标 Excel 文件。' +
-      '\n\n确认要将以上结果写入 Excel 文件吗？';
+    const preview = [
+      '确认保存合并结果？',
+      '',
+      `目标文件: ${mergeSaveTargetLabel}`,
+      `已处理冲突: ${mergeConflictSummary.resolved}`,
+      `未处理冲突: ${mergeConflictSummary.unresolved}`,
+      '',
+      '保存会写入全部工作表的当前 merge 结果。',
+      '',
+      mergeConflictSummary.unresolved > 0 ? '仍有未处理冲突，确认继续保存吗？' : '确认继续保存吗？',
+    ].join('\n');
 
     const confirmed = window.confirm(preview);
     if (!confirmed) return;
@@ -3434,7 +3543,14 @@ export const App: React.FC = () => {
     } catch (e) {
       alert(`保存合并结果失败：${String(e)}`);
     }
-  }, [mergeInfo, mergeSheets, mergeRowOpsBySheet, mergeColOpsBySheet]);
+  }, [
+    mergeInfo,
+    mergeSheets,
+    mergeRowOpsBySheet,
+    mergeColOpsBySheet,
+    mergeConflictSummary,
+    mergeSaveTargetLabel,
+  ]);
   const mergedPreviewScrollToCell = useMemo(() => {
     if (!selectedMergeCell) return null;
     const visualRowNumber = selectedMergeCell.rowIndex + 1;
@@ -3850,13 +3966,44 @@ export const App: React.FC = () => {
     >
       <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
         {hasActiveWorkspace && mode === 'merge' && hasMergeData && mergeInfo && (
-          <button onClick={handleSaveMergeToFile}>
-            {cliInfo?.mode === 'merge'
-              ? '将合并结果写回 Git 合并文件（MERGED，解决冲突）'
-              : cliInfo?.mode === 'diff'
-                ? '将合并结果覆盖 ours（当前分支）文件'
-                : '保存合并结果为新的 Excel 文件（以 ours 为格式模板）'}
-          </button>
+          <>
+            <button onClick={handleSaveMergeToFile}>
+              {cliInfo?.mode === 'merge'
+                ? '将合并结果写回 Git 合并文件（MERGED，解决冲突）'
+                : cliInfo?.mode === 'diff'
+                  ? '将合并结果覆盖 ours（当前分支）文件'
+                  : '保存合并结果为新的 Excel 文件（以 ours 为格式模板）'}
+            </button>
+            <div
+              style={{
+                minWidth: 280,
+                maxWidth: '100%',
+                display: 'grid',
+                gap: 2,
+                flex: '1 1 420px',
+              }}
+            >
+              <span style={{ fontSize: 12, color: '#555' }}>
+                {mergedPath
+                  ? '目标文件'
+                  : cliInfo?.mode === 'merge' && cliInfo?.mergedPathRaw
+                    ? '目标文件（Git 相对路径）'
+                    : '目标文件（保存时选择）'}
+              </span>
+              <span
+                title={mergeSaveTargetLabel}
+                style={{
+                  fontSize: 12,
+                  color: '#111827',
+                  whiteSpace: 'nowrap',
+                  overflow: 'hidden',
+                  textOverflow: 'ellipsis',
+                }}
+              >
+                {mergeSaveTargetLabel}
+              </span>
+            </div>
+          </>
         )}
       </div>
       {workspaceTabs.length > 0 && (
@@ -4508,6 +4655,8 @@ export const App: React.FC = () => {
                     remainingCount={mergeRemainingCount}
                     canUndo={mergeUndoStack.length > 0}
                     onUndo={handleUndoMergeAction}
+                    canJumpToNextConflict={mergeUnresolvedConflicts.length > 0}
+                    onJumpToNextConflict={handleJumpToNextMergeConflict}
                   />
                 </div>
                 <div style={{ marginTop: 8, fontSize: 12, color: '#666', flexShrink: 0 }}>
@@ -4536,34 +4685,7 @@ export const App: React.FC = () => {
                           <button
                             key={s.sheetName || idx}
                             type="button"
-                            onClick={() => {
-                              setSelectedMergeSheetIndex(idx);
-                              const sheet = mergeSheets[idx];
-                              setMergeInfo((prev) =>
-                                prev
-                                  ? {
-                                      ...prev,
-                                      sheetName: sheet?.sheetName ?? prev.sheetName,
-                                    }
-                                  : prev,
-                              );
-                              setMergeCells(sheet?.cells ?? []);
-                              setMergeRowsMeta(sheet?.rowsMeta ?? []);
-                              setMergeColumnsMeta(sheet?.columnsMeta ?? []);
-                              setResolvedBySheet((prev) => {
-                                if (prev.has(idx)) return prev;
-                                const next = new Map(prev);
-                                const resolved = new Set<string>();
-                                (sheet?.cells ?? []).forEach((cell) => {
-                                  if (cell.status !== 'conflict') {
-                                    resolved.add(`${cell.row}:${cell.col}`);
-                                  }
-                                });
-                                next.set(idx, resolved);
-                                return next;
-                              });
-                              setSelectedMergeCell(null);
-                            }}
+                            onClick={() => activateMergeSheet(idx)}
                             style={{
                               padding: '2px 8px',
                               fontSize: 12,
@@ -4622,6 +4744,8 @@ export const App: React.FC = () => {
                   remainingCount={mergeRemainingCount}
                   canUndo={mergeUndoStack.length > 0}
                   onUndo={handleUndoMergeAction}
+                  canJumpToNextConflict={mergeUnresolvedConflicts.length > 0}
+                  onJumpToNextConflict={handleJumpToNextMergeConflict}
                 />
               </div>
             </div>
