@@ -4,7 +4,7 @@
 
 ## 界面截图
 
-![eMerge merge screenshot](imgs/img_merge.jpg)
+![eMerge merge screenshot](imgs/img_merge.png)
 
 ## 主要功能
 
