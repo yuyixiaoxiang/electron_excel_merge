@@ -1,103 +1,40 @@
 {
-  "name": "e-merge",
+  "name": "excel-merge-tauri",
+  "private": true,
   "version": "1.0.0",
-  "main": "build/main/main.js",
+  "type": "module",
   "scripts": {
-    "clean": "rimraf dist_electron dist_pkg",
-    "build:main": "tsc",
-    "build:renderer": "webpack --mode production",
-    "build": "npm run clean && npm run build:main && npm run build:renderer",
-    "test:smoke:threeway": "npm run build:main && node build/main/test/threeWayDiffCore.smoke.js",
-    "test:regression:threeway": "npm run build:main && cross-env ELECTRON_EXCEL_MERGE_DISABLE_BOOTSTRAP=1 electron build/main/test/threeWayDiffRegression.js",
-    "test:threeway": "npm run test:smoke:threeway && npm run test:regression:threeway",
-    "dev:renderer": "webpack serve --mode development",
-    "dev:main": "cross-env NODE_ENV=development tsc -w",
-    "dev": "concurrently \"npm run dev:main\" \"npm run dev:renderer\"",
-    "start": "npm run build && electron .",
-    "dist": "npm run build && electron-builder --win",
-    "pack:win": "npm run build && electron-builder --win portable --x64",
-    "pack:unpacked": "npm run build && electron-builder --win dir --x64",
-    "pack:nsis": "npm run build && electron-builder --win nsis --x64",
-    "clean-cache": "rimraf %LOCALAPPDATA%/electron/Cache/* %LOCALAPPDATA%/electron-builder/Cache/*",
-    "fix-build": "npm run clean-cache && npm install"
+    "dev": "vite --host 0.0.0.0 --port 1420",
+    "build": "tsc && vite build",
+    "preview": "vite preview --host 0.0.0.0 --port 1420",
+    "tauri:dev": "tauri dev",
+    "tauri:build": "tauri build",
+    "tauri:build:nobundle": "tauri build --no-bundle",
+    "build:portable": "npm run tauri:build:nobundle && powershell -ExecutionPolicy Bypass -File tools/build-portable-exe.ps1"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "description": "",
   "dependencies": {
+    "@tauri-apps/api": "^2.10.1",
+    "@tauri-apps/plugin-dialog": "^2.4.2",
+    "@tauri-apps/plugin-fs": "^2.4.3",
+    "@tauri-apps/plugin-opener": "^2.5.0",
+    "@tauri-apps/plugin-shell": "^2.3.1",
+    "buffer": "^6.0.3",
     "diff": "^8.0.3",
+    "events": "^3.3.0",
     "exceljs": "^4.4.0",
+    "path-browserify": "^1.0.1",
+    "process": "^0.11.10",
     "react": "^19.2.3",
     "react-dom": "^19.2.3"
   },
   "devDependencies": {
+    "@tauri-apps/cli": "^2.10.1",
     "@types/node": "^25.0.8",
     "@types/react": "^19.2.8",
     "@types/react-dom": "^19.2.3",
-    "buffer": "^6.0.3",
-    "concurrently": "^9.2.1",
-    "cross-env": "^10.1.0",
-    "electron": "34.0.0",
-    "electron-builder": "^25.1.8",
-    "electron-packager": "^17.1.2",
-    "events": "^3.3.0",
-    "html-webpack-plugin": "^5.6.5",
-    "process": "^0.11.10",
-    "ts-loader": "^9.5.4",
+    "@vitejs/plugin-react": "4.7.0",
     "typescript": "^5.9.3",
-    "webpack": "^5.104.1",
-    "webpack-cli": "^6.0.1",
-    "webpack-dev-server": "^5.2.3"
-  },
-  "build": {
-    "appId": "com.example.emerge",
-    "productName": "eMerge",
-    "asar": true,
-    "electronLanguages": [
-      "en-US"
-    ],
-    "directories": {
-      "output": "dist_electron"
-    },
-    "files": [
-      "build/main/**/*",
-      "dist/**/*",
-      "package.json"
-    ],
-    "extraResources": [
-      {
-        "from": "resources/portable-git",
-        "to": "git"
-      }
-    ],
-    "nsis": {
-      "oneClick": false,
-      "allowToChangeInstallationDirectory": true
-    },
-    "win": {
-      "icon": "build/icon.ico",
-      "signAndEditExecutable": false,
-      "target": [
-        {
-          "target": "nsis",
-          "arch": [
-            "x64"
-          ]
-        },
-        {
-          "target": "portable",
-          "arch": [
-            "x64"
-          ]
-        },
-        {
-          "target": "dir",
-          "arch": [
-            "x64"
-          ]
-        }
-      ]
-    }
+    "vite": "^6.4.1",
+    "vite-plugin-node-polyfills": "^0.26.0"
   }
 }

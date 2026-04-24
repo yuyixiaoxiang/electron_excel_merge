@@ -15,6 +15,10 @@ type MergeWorkbenchCell = {
   status: MergeCell['status'] | 'unchanged';
   resolved: boolean;
   isDiffCell: boolean;
+  formulaControlled?: boolean;
+  sharedControlled?: boolean;
+  sharedControlMasterSheetName?: string | null;
+  sharedControlIsMaster?: boolean;
 };
 
 export interface MergeWorkbenchProps {
@@ -44,6 +48,8 @@ export interface MergeWorkbenchProps {
   remainingCount: number;
   canUndo?: boolean;
   onUndo?: () => void;
+  canJumpToPreviousConflict?: boolean;
+  onJumpToPreviousConflict?: () => void;
   canJumpToNextConflict?: boolean;
   onJumpToNextConflict?: () => void;
 }
@@ -55,8 +61,12 @@ const FROZEN_BG = '#f2f4f7';
 const BASE_BG = '#fff9e8';
 const OURS_BG = '#ecf8ec';
 const THEIRS_BG = '#fff0f0';
+const MERGED_BG = '#e8efff';
 const RESOLVED_BG = '#f5f5f5';
 const CONFLICT_OUTLINE = '#ff8a00';
+const FORMULA_BG = '#e5e7eb';
+const FORMULA_BORDER = '#9ca3af';
+const FORMULA_TEXT = '#4b5563';
 
 const colNumberToLabel = (colNumber: number): string => {
   let n = Math.max(1, Math.floor(colNumber));
@@ -101,6 +111,13 @@ const getCellStatusLabel = (status: MergeCell['status'] | 'unchanged'): string =
   }
 };
 
+const getDisplayedCellStatusLabel = (cell: MergeWorkbenchCell | null | undefined): string => {
+  const mode = getProtectedCellMode(cell);
+  if (mode === 'formula') return '公式控制';
+  if (mode === 'shared') return '共享控制';
+  return getCellStatusLabel(cell?.status ?? 'unchanged');
+};
+
 const truncatePath = (value?: string | null): string => {
   if (!value) return '';
   if (value.length <= 48) return value;
@@ -136,6 +153,18 @@ const getPanelBackground = (status: MergeWorkbenchCell['status'], side: SourceSi
   return side === 'ours' ? '#d4f8d4' : side === 'theirs' ? '#ffc8c8' : BASE_BG;
 };
 
+const getProtectedCellHint = (cell: MergeWorkbenchCell | null | undefined): string | null => {
+  const mode = getProtectedCellMode(cell);
+  if (mode === 'formula') return '公式控制位：这个位置不能直接编辑，保存时会保留模板里的公式。';
+  if (mode === 'shared') {
+    const masterSheetName = getSharedControlMasterSheetName(cell);
+    return masterSheetName
+      ? `共享控制位：这个位置由 ${masterSheetName} sheet 统一控制，不能单独编辑。`
+      : '共享控制位：这个位置在多个工作表里同步变化，不能单独编辑。';
+  }
+  return null;
+};
+
 const getDefaultMergedValue = (cell: MergeCell | undefined, row: ThreeWayRowResult | undefined, colNumber: number) => {
   if (cell) return cell.mergedValue ?? null;
   if (!row) return null;
@@ -152,6 +181,17 @@ const describeCellDecision = (cell: MergeWorkbenchCell, rowMeta?: MergeRowMeta) 
     rowMeta && (rowMeta.oursStatus === 'ambiguous' || rowMeta.theirsStatus === 'ambiguous')
       ? '该行对齐存在歧义，先看清三侧原始值再决定。'
       : '';
+  if (isFormulaControlledCell(cell)) {
+    return `${prefix}这个位置由模板公式控制，不能直接采用 base / ours / theirs 的文本结果；保存时会保留 ours 模板里的公式。`.trim();
+  }
+  if (isSharedControlledCell(cell)) {
+    const masterSheetName = getSharedControlMasterSheetName(cell);
+    return `${
+      prefix
+    }这个位置属于共享控制位，不能单独采用 base / ours / theirs；${
+      masterSheetName ? `请去 ${masterSheetName} sheet 的主位修改。` : '需要跟随共享主位一起变化。'
+    }`.trim();
+  }
   switch (cell.status) {
     case 'ours-changed':
       return `${prefix}ours 相对 base 发生变化，theirs 保持与 base 一致；如果你认可当前分支改动，直接采用当前 merged 结果即可。`.trim();
@@ -193,6 +233,100 @@ const describeRowDecision = (rowMeta?: MergeRowMeta) => {
 
 const makeValueText = (value: string | number | null) => (value == null ? '∅' : String(value));
 
+const isFormulaControlledCell = (
+  cell: Pick<MergeCell, 'formulaControlled'> | Pick<MergeWorkbenchCell, 'formulaControlled'> | null | undefined,
+): boolean => cell?.formulaControlled === true;
+
+const isSharedControlledCell = (
+  cell: Pick<MergeCell, 'sharedControlled'> | Pick<MergeWorkbenchCell, 'sharedControlled'> | null | undefined,
+): boolean => cell?.sharedControlled === true;
+
+const getSharedControlMasterSheetName = (
+  cell:
+    | Pick<MergeCell, 'sharedControlMasterSheetName'>
+    | Pick<MergeWorkbenchCell, 'sharedControlMasterSheetName'>
+    | null
+    | undefined,
+): string | null => {
+  const value = cell?.sharedControlMasterSheetName;
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+};
+
+const getProtectedCellMode = (
+  cell:
+    | Pick<MergeCell, 'formulaControlled' | 'sharedControlled'>
+    | Pick<MergeWorkbenchCell, 'formulaControlled' | 'sharedControlled'>
+    | null
+    | undefined,
+): 'formula' | 'shared' | null => {
+  if (isFormulaControlledCell(cell)) return 'formula';
+  if (isSharedControlledCell(cell)) return 'shared';
+  return null;
+};
+
+const isProtectedCell = (
+  cell:
+    | Pick<MergeCell, 'formulaControlled' | 'sharedControlled'>
+    | Pick<MergeWorkbenchCell, 'formulaControlled' | 'sharedControlled'>
+    | null
+    | undefined,
+): boolean => getProtectedCellMode(cell) !== null;
+
+const getTonePalette = (
+  tone: 'base' | 'ours' | 'theirs' | 'merged' | 'danger' | 'neutral',
+): { backgroundColor: string; borderColor: string; color: string } =>
+  tone === 'base'
+    ? { backgroundColor: BASE_BG, borderColor: '#d6b25e', color: '#8a5a00' }
+    : tone === 'ours'
+      ? { backgroundColor: OURS_BG, borderColor: '#7bbf85', color: '#166534' }
+      : tone === 'theirs'
+        ? { backgroundColor: THEIRS_BG, borderColor: '#f1a5a5', color: '#b91c1c' }
+        : tone === 'merged'
+          ? { backgroundColor: MERGED_BG, borderColor: '#93c5fd', color: '#1d4ed8' }
+          : tone === 'danger'
+            ? { backgroundColor: '#fff1f2', borderColor: '#fda4af', color: '#b42318' }
+            : { backgroundColor: '#f8fafc', borderColor: '#cbd5e1', color: '#334155' };
+
+const getQuickActionButtonStyle = (
+  tone: 'base' | 'ours' | 'theirs' | 'merged' | 'danger' | 'neutral',
+  disabled?: boolean,
+): React.CSSProperties => {
+  const palette = getTonePalette(tone);
+
+  return {
+    border: `1px solid ${palette.borderColor}`,
+    backgroundColor: disabled ? '#f8fafc' : palette.backgroundColor,
+    color: disabled ? '#94a3b8' : palette.color,
+    borderRadius: 8,
+    padding: '7px 10px',
+    fontSize: 12,
+    fontWeight: 600,
+    cursor: disabled ? 'not-allowed' : 'pointer',
+    opacity: disabled ? 0.7 : 1,
+  };
+};
+
+const getCurrentValueCardPalette = (
+  side: SourceSide,
+  cell: MergeWorkbenchCell | null | undefined,
+): { backgroundColor: string; borderColor: string; color: string; valueColor: string } => {
+  if (isProtectedCell(cell)) {
+    return {
+      backgroundColor: FORMULA_BG,
+      borderColor: FORMULA_BORDER,
+      color: FORMULA_TEXT,
+      valueColor: FORMULA_TEXT,
+    };
+  }
+  const palette = getTonePalette(side);
+  return {
+    backgroundColor: palette.backgroundColor,
+    borderColor: palette.borderColor,
+    color: palette.color,
+    valueColor: '#111827',
+  };
+};
+
 const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
   cells,
   rowsMeta,
@@ -217,6 +351,8 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
   remainingCount,
   canUndo = false,
   onUndo,
+  canJumpToPreviousConflict,
+  onJumpToPreviousConflict,
   canJumpToNextConflict,
   onJumpToNextConflict,
 }) => {
@@ -357,7 +493,11 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
     if (!showUnresolvedRowsOnly) return allRowNumbers;
     const unresolvedRows = new Set<number>();
     cells.forEach((cell) => {
-      if (cell.status === 'conflict' && !resolvedKeySet.has(`${cell.row}:${cell.col}`)) {
+      if (
+        cell.status === 'conflict' &&
+        !isProtectedCell(cell) &&
+        !resolvedKeySet.has(`${cell.row}:${cell.col}`)
+      ) {
         unresolvedRows.add(cell.row);
       }
     });
@@ -393,6 +533,10 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
             status: mergeCell?.status ?? 'unchanged',
             resolved: mergeCell ? resolvedKeySet.has(key) : true,
             isDiffCell: !!mergeCell,
+            formulaControlled: mergeCell?.formulaControlled === true,
+            sharedControlled: mergeCell?.sharedControlled === true,
+            sharedControlMasterSheetName: mergeCell?.sharedControlMasterSheetName ?? null,
+            sharedControlIsMaster: mergeCell?.sharedControlIsMaster === true,
           };
         });
       }),
@@ -402,7 +546,12 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
   const unresolvedConflicts = useMemo(
     () =>
       cells
-        .filter((cell) => cell.status === 'conflict' && !resolvedKeySet.has(`${cell.row}:${cell.col}`))
+        .filter(
+          (cell) =>
+            cell.status === 'conflict' &&
+            !isProtectedCell(cell) &&
+            !resolvedKeySet.has(`${cell.row}:${cell.col}`),
+        )
         .sort((a, b) => a.row - b.row || a.col - b.col),
     [cells, resolvedKeySet],
   );
@@ -423,6 +572,8 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
       : null;
   const selectedRowMeta = selectedCell ? rowsMetaMap.get(selectedCell.rowNumber) : undefined;
   const selectedIsDiffCell = selectedCell ? mergeCellMap.has(selectedCell.key) : false;
+  const selectedCanApplyCellChoice =
+    !!selectedCell && selectedIsDiffCell && !isProtectedCell(selectedCell);
   const selectedRowConflictCount = selectedCell ? unresolvedConflictCountByRow.get(selectedCell.rowNumber) ?? 0 : 0;
 
   const jumpToNextConflict = () => {
@@ -437,6 +588,26 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
     if (!nextCell) return;
     onSelectCell(nextCell.row - 1, nextCell.col - 1);
   };
+  const jumpToPreviousConflict = () => {
+    if (!onSelectCell || unresolvedConflicts.length === 0) return;
+    const currentIndex = selectedCell
+      ? unresolvedConflicts.findIndex(
+          (cell) => cell.row === selectedCell.rowNumber && cell.col === selectedCell.colNumber,
+        )
+      : -1;
+    const previousCell =
+      unresolvedConflicts[
+        currentIndex >= 0
+          ? (currentIndex - 1 + unresolvedConflicts.length) % unresolvedConflicts.length
+          : unresolvedConflicts.length - 1
+      ];
+    if (!previousCell) return;
+    onSelectCell(previousCell.row - 1, previousCell.col - 1);
+  };
+  const effectiveCanJumpToPreviousConflict =
+    canJumpToPreviousConflict ?? (unresolvedConflicts.length > 0);
+  const effectiveJumpToPreviousConflict =
+    onJumpToPreviousConflict ?? jumpToPreviousConflict;
   const effectiveCanJumpToNextConflict = canJumpToNextConflict ?? (unresolvedConflicts.length > 0);
   const effectiveJumpToNextConflict = onJumpToNextConflict ?? jumpToNextConflict;
 
@@ -486,7 +657,13 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
         <div
           onMouseDown={() => onSelectCell?.(cell.rowNumber - 1, cell.colNumber - 1)}
           onClick={() => onSelectCell?.(cell.rowNumber - 1, cell.colNumber - 1)}
-          title={`${side}: ${makeValueText(value)}\n状态: ${getCellStatusLabel(cell.status)}`}
+          title={[
+            `${side}: ${makeValueText(value)}`,
+            `状态: ${getDisplayedCellStatusLabel(cell)}`,
+            getProtectedCellHint(cell),
+          ]
+            .filter(Boolean)
+            .join('\n')}
           style={{
             width: '100%',
             height: '100%',
@@ -497,6 +674,7 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
             cursor: 'pointer',
             userSelect: 'none',
             fontWeight: side === 'merged' && cell.isDiffCell ? 600 : 400,
+            color: isProtectedCell(cell) ? FORMULA_TEXT : '#111827',
           }}
         >
           {value == null ? '' : String(value)}
@@ -512,13 +690,19 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
         style.backgroundColor = FROZEN_BG;
       }
       if (cell) {
-        style.backgroundColor = getPanelBackground(cell.status, side, cell.resolved);
-        if (cell.status === 'conflict' && !cell.resolved) {
-          style.boxShadow = `inset 0 0 0 2px ${CONFLICT_OUTLINE}`;
-        } else if (cell.status !== 'unchanged' && !cell.resolved) {
-          style.borderLeft = `3px solid ${getPanelAccent(side)}`;
-        } else if (side === 'merged' && cell.isDiffCell) {
-          style.borderLeft = `3px solid ${getPanelAccent(side)}`;
+        if (isProtectedCell(cell)) {
+          style.backgroundColor = FORMULA_BG;
+          style.borderLeft = `3px solid ${FORMULA_BORDER}`;
+          style.boxShadow = `inset 0 0 0 1px ${FORMULA_BORDER}`;
+        } else {
+          style.backgroundColor = getPanelBackground(cell.status, side, cell.resolved);
+          if (cell.status === 'conflict' && !cell.resolved) {
+            style.boxShadow = `inset 0 0 0 2px ${CONFLICT_OUTLINE}`;
+          } else if (cell.status !== 'unchanged' && !cell.resolved) {
+            style.borderLeft = `3px solid ${getPanelAccent(side)}`;
+          } else if (side === 'merged' && cell.isDiffCell) {
+            style.borderLeft = `3px solid ${getPanelAccent(side)}`;
+          }
         }
         if (selected && selected.rowIndex === cell.rowNumber - 1 && selected.colIndex === cell.colNumber - 1) {
           style.outline = '2px solid #2563eb';
@@ -543,7 +727,9 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
   ];
 
   const statusTone =
-    selectedCell?.status === 'conflict'
+    isProtectedCell(selectedCell)
+      ? FORMULA_TEXT
+      : selectedCell?.status === 'conflict'
       ? '#b45309'
       : selectedCell?.status === 'both-changed-same'
         ? '#334155'
@@ -603,6 +789,9 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
             />
             仅未解决行
           </label>
+          <button type="button" onClick={effectiveJumpToPreviousConflict} disabled={!effectiveCanJumpToPreviousConflict}>
+            上一个冲突
+          </button>
           <button type="button" onClick={effectiveJumpToNextConflict} disabled={!effectiveCanJumpToNextConflict}>
             下一个冲突
           </button>
@@ -887,13 +1076,28 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
                 <div style={{ display: 'grid', gap: 6 }}>
                   <div style={{ fontSize: 11, color: '#7c2d12' }}>全部冲突</div>
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 6 }}>
-                    <button type="button" disabled={unresolvedConflicts.length === 0} onClick={() => applyAllConflictsChoice('base')}>
+                    <button
+                      type="button"
+                      disabled={unresolvedConflicts.length === 0}
+                      onClick={() => applyAllConflictsChoice('base')}
+                      style={getQuickActionButtonStyle('base', unresolvedConflicts.length === 0)}
+                    >
                       全部用 base
                     </button>
-                    <button type="button" disabled={unresolvedConflicts.length === 0} onClick={() => applyAllConflictsChoice('ours')}>
+                    <button
+                      type="button"
+                      disabled={unresolvedConflicts.length === 0}
+                      onClick={() => applyAllConflictsChoice('ours')}
+                      style={getQuickActionButtonStyle('ours', unresolvedConflicts.length === 0)}
+                    >
                       全部用 ours
                     </button>
-                    <button type="button" disabled={unresolvedConflicts.length === 0} onClick={() => applyAllConflictsChoice('theirs')}>
+                    <button
+                      type="button"
+                      disabled={unresolvedConflicts.length === 0}
+                      onClick={() => applyAllConflictsChoice('theirs')}
+                      style={getQuickActionButtonStyle('theirs', unresolvedConflicts.length === 0)}
+                    >
                       全部用 theirs
                     </button>
                   </div>
@@ -903,21 +1107,37 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
                     <button
                       type="button"
-                      disabled={!selectedCell || !selectedIsDiffCell}
+                      disabled={!selectedCanApplyCellChoice}
                       onClick={() => {
                         if (!selectedCell) return;
                         onResolveCell?.(selectedCell.rowNumber, selectedCell.colNumber);
                       }}
+                      style={getQuickActionButtonStyle('merged', !selectedCanApplyCellChoice)}
                     >
                       接受当前结果
                     </button>
-                    <button type="button" disabled={!selectedCell || !selectedIsDiffCell} onClick={() => onApplySelectedCellChoice?.('base')}>
+                    <button
+                      type="button"
+                      disabled={!selectedCanApplyCellChoice}
+                      onClick={() => onApplySelectedCellChoice?.('base')}
+                      style={getQuickActionButtonStyle('base', !selectedCanApplyCellChoice)}
+                    >
                       用 base
                     </button>
-                    <button type="button" disabled={!selectedCell || !selectedIsDiffCell} onClick={() => onApplySelectedCellChoice?.('ours')}>
+                    <button
+                      type="button"
+                      disabled={!selectedCanApplyCellChoice}
+                      onClick={() => onApplySelectedCellChoice?.('ours')}
+                      style={getQuickActionButtonStyle('ours', !selectedCanApplyCellChoice)}
+                    >
                       用 ours
                     </button>
-                    <button type="button" disabled={!selectedCell || !selectedIsDiffCell} onClick={() => onApplySelectedCellChoice?.('theirs')}>
+                    <button
+                      type="button"
+                      disabled={!selectedCanApplyCellChoice}
+                      onClick={() => onApplySelectedCellChoice?.('theirs')}
+                      style={getQuickActionButtonStyle('theirs', !selectedCanApplyCellChoice)}
+                    >
                       用 theirs
                     </button>
                   </div>
@@ -932,6 +1152,7 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
                         if (!selectedCell) return;
                         onApplyRowChoice?.(selectedCell.rowNumber, 'ours');
                       }}
+                      style={getQuickActionButtonStyle('ours', !selectedCell || !selectedRowMeta)}
                     >
                       采用 ours 整行
                     </button>
@@ -942,6 +1163,7 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
                         if (!selectedCell) return;
                         onApplyRowChoice?.(selectedCell.rowNumber, 'theirs');
                       }}
+                      style={getQuickActionButtonStyle('theirs', !selectedCell || !selectedRowMeta)}
                     >
                       采用 theirs 整行
                     </button>
@@ -952,7 +1174,13 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
                         if (!selectedCell) return;
                         onDeleteRow?.(selectedCell.rowNumber);
                       }}
-                      style={{ gridColumn: '1 / -1', color: '#b42318' }}
+                      style={{
+                        ...getQuickActionButtonStyle(
+                          'danger',
+                          !selectedCell || !selectedRowMeta || !selectedRowMeta.oursRowNumber,
+                        ),
+                        gridColumn: '1 / -1',
+                      }}
                     >
                       删除结果中的这行
                     </button>
@@ -982,12 +1210,30 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
                             whiteSpace: 'nowrap',
                           }}
                         >
-                          {getCellStatusLabel(selectedCell.status)}
+                          {getDisplayedCellStatusLabel(selectedCell)}
                         </span>
                       </div>
                       <div style={{ fontSize: 12, color: '#475569', lineHeight: 1.55 }}>
                         {describeCellDecision(selectedCell, selectedRowMeta)}
                       </div>
+                      {isProtectedCell(selectedCell) && (
+                        <div
+                          style={{
+                            fontSize: 12,
+                            color: '#92400e',
+                            backgroundColor: '#fffbeb',
+                            border: '1px solid #fed7aa',
+                            borderRadius: 8,
+                            padding: '6px 8px',
+                          }}
+                        >
+                          {getProtectedCellMode(selectedCell) === 'formula'
+                            ? '公式控制位：结果会保留模板公式，不会把当前显示值写回成文本。'
+                            : getSharedControlMasterSheetName(selectedCell)
+                              ? `共享控制位：这个位置跟随 ${getSharedControlMasterSheetName(selectedCell)} sheet 的主位同步，不支持单独写回。`
+                              : '共享控制位：这个位置会跟随共享组结果一起变化，不支持单独写回。'}
+                        </div>
+                      )}
                       <div style={{ fontSize: 12, color: '#6b7280' }}>
                         行映射：base={selectedRowMeta?.baseRowNumber ?? '-'} / ours={selectedRowMeta?.oursRowNumber ?? '-'} / theirs={selectedRowMeta?.theirsRowNumber ?? '-'}
                       </div>
@@ -997,12 +1243,32 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
                           ['ours', selectedCell.oursValue],
                           ['theirs', selectedCell.theirsValue],
                           ['merged', selectedCell.mergedValue],
-                        ] as const).map(([label, value]) => (
-                          <div key={label} style={{ border: '1px solid #edf0f5', borderRadius: 10, padding: 6 }}>
-                            <div style={{ fontSize: 11, color: '#6b7280' }}>{label}</div>
-                            <div style={{ marginTop: 3, fontSize: 12, color: '#111827', wordBreak: 'break-word' }}>{makeValueText(value)}</div>
-                          </div>
-                        ))}
+                        ] as const).map(([label, value]) => {
+                          const palette = getCurrentValueCardPalette(label, selectedCell);
+                          return (
+                            <div
+                              key={label}
+                              style={{
+                                border: `1px solid ${palette.borderColor}`,
+                                borderRadius: 10,
+                                padding: 6,
+                                backgroundColor: palette.backgroundColor,
+                              }}
+                            >
+                              <div style={{ fontSize: 11, color: palette.color, fontWeight: 700 }}>{label}</div>
+                              <div
+                                style={{
+                                  marginTop: 3,
+                                  fontSize: 12,
+                                  color: palette.valueColor,
+                                  wordBreak: 'break-word',
+                                }}
+                              >
+                                {makeValueText(value)}
+                              </div>
+                            </div>
+                          );
+                        })}
                       </div>
                     </div>
                     <div style={{ border: '1px solid #dbe3ef', borderRadius: 12, padding: 10, backgroundColor: '#fff', display: 'grid', gap: 8 }}>

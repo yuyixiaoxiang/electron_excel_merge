@@ -1,16 +1,40 @@
-﻿node_modules/
-
-build/
+# Node / frontend
+node_modules/
 dist/
-dist_pkg/
-dist_electron/**
-!dist_electron/
-!dist_electron/*.exe
-dist_electron_*/
+dist-ssr/
+*.local
 
-generated/
+# Tauri / Rust
+src-tauri/target/
+src-tauri/gen/schemas/
 
-.idea/
-.vscode/
+# Local build outputs
+build/
+dist-portable/
 
+# Temp analysis / scratch files
+.analysis/
+.mcp_data/
+tmp-*.xlsx
+_tmp_*
+
+# Logs
+logs/
 *.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# OS / editors
+.vscode/*
+!.vscode/extensions.json
+.idea/
+.DS_Store
+Thumbs.db
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?

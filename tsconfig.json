@@ -1,19 +1,21 @@
 {
   "compilerOptions": {
-    "target": "ES2020",
-    "module": "commonjs",
-    "strict": true,
-    "jsx": "react-jsx",
-    "moduleResolution": "node",
-    "esModuleInterop": true,
+    "target": "ES2022",
+    "useDefineForClassFields": true,
+    "lib": ["DOM", "DOM.Iterable", "ES2022"],
+    "module": "ESNext",
     "skipLibCheck": true,
-    "forceConsistentCasingInFileNames": true,
-    "outDir": "build",
-    "rootDir": "src",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
     "resolveJsonModule": true,
-    "types": ["node"],
-    "sourceMap": true
+    "isolatedModules": true,
+    "noEmit": true,
+    "jsx": "react-jsx",
+    "allowSyntheticDefaultImports": true,
+    "esModuleInterop": true,
+    "types": ["vite/client"],
+    "strict": false
   },
-  "include": ["src/main/**/*", "src/renderer/global.d.ts"],
-  "exclude": ["node_modules", "src/renderer/**/*"]
+  "include": ["src", "vite.config.ts"],
+  "exclude": ["src/main/electronMain.ts", "__scaffold"]
 }

@@ -1,0 +1,14 @@
+{
+  "rules": [
+    {
+      "workbookNameIncludes": [
+        "achievement"
+      ],
+      "sheetNames": [
+        "achievementGroup",
+        "achievement"
+      ],
+      "masterSheet": "achievementGroup"
+    }
+  ]
+}

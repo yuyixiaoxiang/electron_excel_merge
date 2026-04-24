@@ -111,6 +111,67 @@ const normalizeComparableValue = (value: string | number | null): string => {
 
 const sameComparableValue = (a: string | number | null, b: string | number | null): boolean =>
   normalizeComparableValue(a) === normalizeComparableValue(b);
+
+const parseCliInfoLike = (value: unknown): CliThreeWayInfo | null => {
+  if (!value || typeof value !== 'object') return null;
+  const maybeInfo = value as Partial<CliThreeWayInfo>;
+  if (maybeInfo.mode !== 'diff' && maybeInfo.mode !== 'merge') return null;
+  if (
+    typeof maybeInfo.basePath !== 'string' ||
+    typeof maybeInfo.oursPath !== 'string' ||
+    typeof maybeInfo.theirsPath !== 'string'
+  ) {
+    return null;
+  }
+  return {
+    basePath: maybeInfo.basePath,
+    oursPath: maybeInfo.oursPath,
+    theirsPath: maybeInfo.theirsPath,
+    mergedPath: typeof maybeInfo.mergedPath === 'string' ? maybeInfo.mergedPath : undefined,
+    mergedPathRaw: typeof maybeInfo.mergedPathRaw === 'string' ? maybeInfo.mergedPathRaw : undefined,
+    mode: maybeInfo.mode,
+  };
+};
+
+const getInjectedCliInfo = (): CliThreeWayInfo | null =>
+  parseCliInfoLike(
+    (
+      globalThis as typeof globalThis & {
+        __EMERGE_CLI_INFO__?: unknown;
+      }
+    ).__EMERGE_CLI_INFO__,
+  );
+
+const waitForInjectedCliInfo = async (): Promise<CliThreeWayInfo | null> => {
+  const injected = getInjectedCliInfo();
+  if (injected) return injected;
+
+  return await new Promise<CliThreeWayInfo | null>((resolve) => {
+    const onReady = () => {
+      cleanup();
+      resolve(getInjectedCliInfo());
+    };
+    const cleanup = () => {
+      window.removeEventListener('emerge:cli-info-ready', onReady);
+      window.clearTimeout(timeoutId);
+    };
+    const timeoutId = window.setTimeout(() => {
+      cleanup();
+      resolve(getInjectedCliInfo());
+    }, 1000);
+
+    window.addEventListener('emerge:cli-info-ready', onReady, { once: true });
+  });
+};
+
+const getCliInfoWithTimeout = async (): Promise<CliThreeWayInfo | null> =>
+  await Promise.race<CliThreeWayInfo | null>([
+    window.excelAPI.getCliThreeWayInfo().catch(() => null),
+    new Promise<CliThreeWayInfo | null>((resolve) => {
+      window.setTimeout(() => resolve(null), 1500);
+    }),
+  ]);
+
 const isEditableEventTarget = (target: EventTarget | null): boolean => {
   if (!(target instanceof Element)) return false;
   if (target instanceof HTMLElement && target.isContentEditable) return true;
@@ -129,6 +190,10 @@ type CommitNumberInputProps = {
 const COMPARE_HEADER_ROW_COUNT = 3;
 const EMPTY_MERGE_ROW_OPS = new Map<number, SaveMergeRowOp>();
 const EMPTY_MERGE_COL_OPS = new Map<number, SaveMergeColOp>();
+const FORMULA_CONTROLLED_EDIT_MESSAGE = '该位置由模板公式控制，不能直接改值；保存时会保留 ours 模板中的公式。';
+const FORMULA_CONTROLLED_PREVIEW_HINT = '公式控制位：不能直接编辑，保存时会保留模板公式。';
+const SHARED_CONTROLLED_EDIT_MESSAGE = '该位置是跨 sheet 共享控制位，不能单独改值；保存时会保留 ours 模板中的共享结果。';
+const SHARED_CONTROLLED_PREVIEW_HINT = '共享控制位：同地址在多个工作表里同步变化，不能单独编辑。';
 
 const buildCompareRequestSignature = (request: {
   basePath: string;
@@ -150,6 +215,125 @@ const cloneMergeSheetsDeep = (sheets: MergeSheetData[]): MergeSheetData[] =>
     rowsMeta: sheet.rowsMeta ? sheet.rowsMeta.map((meta) => ({ ...meta })) : sheet.rowsMeta,
     columnsMeta: sheet.columnsMeta ? sheet.columnsMeta.map((meta) => ({ ...meta })) : sheet.columnsMeta,
   }));
+
+const getMergeCellKey = (rowNumber: number, colNumber: number): string => `${rowNumber}:${colNumber}`;
+
+const isFormulaControlledMergeCell = (
+  cell: Pick<MergeCell, 'formulaControlled'> | null | undefined,
+): boolean => cell?.formulaControlled === true;
+
+const isSharedControlledMergeCell = (
+  cell: Pick<MergeCell, 'sharedControlled'> | null | undefined,
+): boolean => cell?.sharedControlled === true;
+
+const isSharedControlMasterMergeCell = (
+  cell: Pick<MergeCell, 'sharedControlIsMaster'> | null | undefined,
+): boolean => cell?.sharedControlIsMaster === true;
+
+const getSharedControlMasterSheetName = (
+  cell: Pick<MergeCell, 'sharedControlMasterSheetName'> | null | undefined,
+): string | null => {
+  const value = cell?.sharedControlMasterSheetName;
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+};
+
+const getProtectedMergeCellMode = (
+  cell: Pick<MergeCell, 'formulaControlled' | 'sharedControlled'> | null | undefined,
+): 'formula' | 'shared' | null => {
+  if (isFormulaControlledMergeCell(cell)) return 'formula';
+  if (isSharedControlledMergeCell(cell)) return 'shared';
+  return null;
+};
+
+const isProtectedMergeCell = (
+  cell: Pick<MergeCell, 'formulaControlled' | 'sharedControlled'> | null | undefined,
+): boolean => getProtectedMergeCellMode(cell) !== null;
+
+const getProtectedMergeCellLabel = (
+  cell: Pick<MergeCell, 'formulaControlled' | 'sharedControlled'> | null | undefined,
+): string | null => {
+  const mode = getProtectedMergeCellMode(cell);
+  if (mode === 'formula') return '公式控制';
+  if (mode === 'shared') return '共享控制';
+  return null;
+};
+
+const getProtectedMergeCellHint = (
+  cell: Pick<MergeCell, 'formulaControlled' | 'sharedControlled' | 'sharedControlMasterSheetName'> | null | undefined,
+): string | null => {
+  const mode = getProtectedMergeCellMode(cell);
+  if (mode === 'formula') return FORMULA_CONTROLLED_PREVIEW_HINT;
+  if (mode === 'shared') {
+    const masterSheetName = getSharedControlMasterSheetName(cell);
+    return masterSheetName
+      ? `共享控制位：由 ${masterSheetName} sheet 统一控制，不能单独编辑。`
+      : SHARED_CONTROLLED_PREVIEW_HINT;
+  }
+  return null;
+};
+
+const getProtectedMergeCellEditMessage = (
+  cell: Pick<MergeCell, 'formulaControlled' | 'sharedControlled' | 'sharedControlMasterSheetName'> | null | undefined,
+): string | null => {
+  const mode = getProtectedMergeCellMode(cell);
+  if (mode === 'formula') return FORMULA_CONTROLLED_EDIT_MESSAGE;
+  if (mode === 'shared') {
+    const masterSheetName = getSharedControlMasterSheetName(cell);
+    return masterSheetName
+      ? `该位置由 ${masterSheetName} sheet 的共享主位控制，不能单独改值；请去主 sheet 修改。`
+      : SHARED_CONTROLLED_EDIT_MESSAGE;
+  }
+  return null;
+};
+
+const applySharedControlGroupUpdatesToCells = (
+  cells: MergeCell[],
+  updates: Map<string, string | number | null>,
+): MergeCell[] => {
+  if (updates.size === 0) return cells;
+  return cells.map((cell) => {
+    const groupKey = cell.sharedControlGroupKey;
+    if (!groupKey || !updates.has(groupKey)) return cell;
+    return {
+      ...cell,
+      mergedValue: updates.get(groupKey) ?? null,
+    };
+  });
+};
+
+const applySharedControlGroupUpdatesToSheets = (
+  sheets: MergeSheetData[],
+  updates: Map<string, string | number | null>,
+): MergeSheetData[] => {
+  if (updates.size === 0) return sheets;
+  return sheets.map((sheet) => ({
+    ...sheet,
+    cells: applySharedControlGroupUpdatesToCells(sheet.cells ?? [], updates),
+  }));
+};
+
+const addSharedControlGroupValueUpdate = (
+  updates: Map<string, string | number | null>,
+  cell: Pick<MergeCell, 'sharedControlGroupKey' | 'sharedControlIsMaster'>,
+  nextValue: string | number | null,
+) => {
+  if (!isSharedControlMasterMergeCell(cell) || !cell.sharedControlGroupKey) return;
+  updates.set(cell.sharedControlGroupKey, nextValue);
+};
+
+const shouldSkipMergeCellSaveWrite = (cell: MergeCell): boolean => {
+  if (isFormulaControlledMergeCell(cell)) return true;
+  if (isSharedControlledMergeCell(cell) && !getSharedControlMasterSheetName(cell)) return true;
+  return false;
+};
+
+const isAutoResolvedMergeCell = (cell: MergeCell): boolean =>
+  cell.status !== 'conflict' || isProtectedMergeCell(cell);
+
+const isUnresolvedUserConflict = (cell: MergeCell, resolvedSet: Set<string>): boolean =>
+  cell.status === 'conflict' &&
+  !isProtectedMergeCell(cell) &&
+  !resolvedSet.has(getMergeCellKey(cell.row, cell.col));
 
 const cloneResolvedBySheetMap = (source: Map<number, Set<string>>): Map<number, Set<string>> => {
   const next = new Map<number, Set<string>>();
@@ -522,8 +706,8 @@ export const App: React.FC = () => {
     sheets.forEach((sheet, sheetIndex) => {
       const set = new Set<string>();
       (sheet.cells ?? []).forEach((cell) => {
-        if (cell.status !== 'conflict') {
-          set.add(`${cell.row}:${cell.col}`);
+        if (isAutoResolvedMergeCell(cell)) {
+          set.add(getMergeCellKey(cell.row, cell.col));
         }
       });
       resolved.set(sheetIndex, set);
@@ -1199,10 +1383,15 @@ export const App: React.FC = () => {
     (async () => {
       let info: CliThreeWayInfo | null = null;
       try {
-        info = await window.excelAPI.getCliThreeWayInfo();
+        info = await waitForInjectedCliInfo();
+        if (!info) {
+          info = await getCliInfoWithTimeout();
+        }
         if (!info) return;
         setCliInfo(info);
         if (info.mode === 'merge') {
+          setMergeFileSelectorCollapsed(true);
+          setMergeAdvancedCollapsed(true);
           openWorkspaceTab('merge', 'Merge 模式 · CLI');
           await loadMergeComparison(
             {
@@ -2475,8 +2664,7 @@ export const App: React.FC = () => {
   const mergeRemainingCount = useMemo(() => {
     const resolvedSet = resolvedBySheet.get(selectedMergeSheetIndex) ?? new Set<string>();
     return mergeCells.reduce((count, cell) => {
-      if (cell.status !== 'conflict') return count;
-      return resolvedSet.has(`${cell.row}:${cell.col}`) ? count : count + 1;
+      return isUnresolvedUserConflict(cell, resolvedSet) ? count + 1 : count;
     }, 0);
   }, [mergeCells, resolvedBySheet, selectedMergeSheetIndex]);
   const activateMergeSheet = useCallback(
@@ -2506,8 +2694,8 @@ export const App: React.FC = () => {
         const next = new Map(prev);
         const resolved = new Set<string>();
         (sheet?.cells ?? []).forEach((cell) => {
-          if (cell.status !== 'conflict') {
-            resolved.add(`${cell.row}:${cell.col}`);
+          if (isAutoResolvedMergeCell(cell)) {
+            resolved.add(getMergeCellKey(cell.row, cell.col));
           }
         });
         next.set(safeSheetIndex, resolved);
@@ -2523,7 +2711,7 @@ export const App: React.FC = () => {
         .flatMap((sheet, sheetIndex) => {
           const resolvedSet = resolvedBySheet.get(sheetIndex) ?? new Set<string>();
           return (sheet.cells ?? [])
-            .filter((cell) => cell.status === 'conflict' && !resolvedSet.has(`${cell.row}:${cell.col}`))
+            .filter((cell) => isUnresolvedUserConflict(cell, resolvedSet))
             .map((cell) => ({
               sheetIndex,
               row: cell.row,
@@ -2532,10 +2720,6 @@ export const App: React.FC = () => {
         })
         .sort((a, b) => a.sheetIndex - b.sheetIndex || a.row - b.row || a.col - b.col),
     [mergeSheets, resolvedBySheet],
-  );
-  const mergeCellKeySet = useMemo(
-    () => new Set(mergeCells.map((c) => `${c.row}:${c.col}`)),
-    [mergeCells],
   );
   useEffect(() => {
     if (mode !== 'merge' || !mergeInfo || !showFullTables) {
@@ -2641,8 +2825,8 @@ export const App: React.FC = () => {
     mergeSheets.forEach((sheet, sheetIndex) => {
       const resolvedSet = resolvedBySheet.get(sheetIndex) ?? new Set<string>();
       (sheet.cells ?? []).forEach((cell) => {
-        if (cell.status !== 'conflict') return;
-        if (resolvedSet.has(`${cell.row}:${cell.col}`)) {
+        if (cell.status !== 'conflict' || isProtectedMergeCell(cell)) return;
+        if (resolvedSet.has(getMergeCellKey(cell.row, cell.col))) {
           resolved += 1;
           return;
         }
@@ -2893,7 +3077,10 @@ export const App: React.FC = () => {
     const col = colIndex + 1;
     const resolvedSet = resolvedBySheet.get(selectedMergeSheetIndex) ?? new Set<string>();
     const isUnresolvedMergeConflict = mergeCells.some(
-      (cell) => cell.row === row && cell.col === col && cell.status === 'conflict' && !resolvedSet.has(`${row}:${col}`),
+      (cell) =>
+        cell.row === row &&
+        cell.col === col &&
+        isUnresolvedUserConflict(cell, resolvedSet),
     );
     if (isUnresolvedMergeConflict) {
       lastMergeConflictNavRef.current = {
@@ -2928,6 +3115,39 @@ export const App: React.FC = () => {
     activateMergeSheet(nextConflict.sheetIndex, {
       rowIndex: nextConflict.row - 1,
       colIndex: nextConflict.col - 1,
+    });
+  }, [
+    activateMergeSheet,
+    mergeUnresolvedConflicts,
+    selectedMergeSheetIndex,
+  ]);
+  const handleJumpToPreviousMergeConflict = useCallback(() => {
+    if (mergeUnresolvedConflicts.length === 0) return;
+    const cursor = lastMergeConflictNavRef.current;
+    const previousConflict =
+      (cursor
+        ? [...mergeUnresolvedConflicts]
+            .reverse()
+            .find(
+              (cell) =>
+                cell.sheetIndex < cursor.sheetIndex ||
+                (cell.sheetIndex === cursor.sheetIndex &&
+                  (cell.row < cursor.row || (cell.row === cursor.row && cell.col < cursor.col))),
+            )
+        : undefined) ??
+      [...mergeUnresolvedConflicts].reverse().find((cell) => cell.sheetIndex === selectedMergeSheetIndex) ??
+      [...mergeUnresolvedConflicts].reverse().find((cell) => cell.sheetIndex < selectedMergeSheetIndex) ??
+      mergeUnresolvedConflicts[mergeUnresolvedConflicts.length - 1];
+
+    if (!previousConflict) return;
+    lastMergeConflictNavRef.current = {
+      sheetIndex: previousConflict.sheetIndex,
+      row: previousConflict.row,
+      col: previousConflict.col,
+    };
+    activateMergeSheet(previousConflict.sheetIndex, {
+      rowIndex: previousConflict.row - 1,
+      colIndex: previousConflict.col - 1,
     });
   }, [
     activateMergeSheet,
@@ -3056,12 +3276,13 @@ export const App: React.FC = () => {
   );
   const handleResolveMergeCell = useCallback(
     (rowNumber: number, colNumber: number) => {
-      const key = `${rowNumber}:${colNumber}`;
-      if (!mergeCellKeySet.has(key)) return;
+      const key = getMergeCellKey(rowNumber, colNumber);
+      const targetCell = mergeCells.find((cell) => cell.row === rowNumber && cell.col === colNumber) ?? null;
+      if (!targetCell || isProtectedMergeCell(targetCell)) return;
       pushMergeUndoSnapshot();
       markResolvedKeys(selectedMergeSheetIndex, [key]);
     },
-    [mergeCellKeySet, markResolvedKeys, pushMergeUndoSnapshot, selectedMergeSheetIndex],
+    [markResolvedKeys, mergeCells, pushMergeUndoSnapshot, selectedMergeSheetIndex],
   );
 
   const handleApplyMergeChoice = useCallback(
@@ -3069,46 +3290,65 @@ export const App: React.FC = () => {
       if (!selectedMergeCell) return;
 
       const { rowIndex, colIndex } = selectedMergeCell;
-      const key = `${rowIndex + 1}:${colIndex + 1}`;
-      if (!mergeCellKeySet.has(key)) return;
+      const rowNumber = rowIndex + 1;
+      const colNumber = colIndex + 1;
+      const key = getMergeCellKey(rowNumber, colNumber);
+      const targetCell = mergeCells.find((cell) => cell.row === rowNumber && cell.col === colNumber) ?? null;
+      if (!targetCell) return;
+      if (isProtectedMergeCell(targetCell)) {
+        alert(getProtectedMergeCellEditMessage(targetCell) ?? FORMULA_CONTROLLED_EDIT_MESSAGE);
+        return;
+      }
+      let value: string | number | null;
+      if (source === 'base') value = targetCell.baseValue;
+      else if (source === 'ours') value = targetCell.oursValue;
+      else value = targetCell.theirsValue;
+      const sharedUpdates = new Map<string, string | number | null>();
+      addSharedControlGroupValueUpdate(sharedUpdates, targetCell, value);
+
       pushMergeUndoSnapshot();
       // 只标记用户显式操作过的单元格
       markResolvedKeys(selectedMergeSheetIndex, [key]);
 
       setMergeSheets((prev) =>
-        prev.map((sheet: MergeSheetData, sIdx: number) => {
-          if (sIdx !== selectedMergeSheetIndex) return sheet;
-          const newCells = sheet.cells.map((cell) => {
-            if (cell.row - 1 !== rowIndex || cell.col - 1 !== colIndex) return cell;
-            let value: string | number | null;
-            if (source === 'base') value = cell.baseValue;
-            else if (source === 'ours') value = cell.oursValue;
-            else value = cell.theirsValue;
-            return { ...cell, mergedValue: value };
-          });
-          return { ...sheet, cells: newCells };
-        }),
+        applySharedControlGroupUpdatesToSheets(
+          prev.map((sheet: MergeSheetData, sIdx: number) => {
+            if (sIdx !== selectedMergeSheetIndex) return sheet;
+            const newCells = sheet.cells.map((cell) => {
+              if (cell.row - 1 !== rowIndex || cell.col - 1 !== colIndex) return cell;
+              return { ...cell, mergedValue: value };
+            });
+            return { ...sheet, cells: newCells };
+          }),
+          sharedUpdates,
+        ),
       );
 
       // 同步当前视图的 cells
       setMergeCells((prev) =>
-        prev.map((cell) => {
-          if (cell.row - 1 !== rowIndex || cell.col - 1 !== colIndex) return cell;
-          let value: string | number | null;
-          if (source === 'base') value = cell.baseValue;
-          else if (source === 'ours') value = cell.oursValue;
-          else value = cell.theirsValue;
-          return { ...cell, mergedValue: value };
-        }),
+        applySharedControlGroupUpdatesToCells(
+          prev.map((cell) => {
+            if (cell.row - 1 !== rowIndex || cell.col - 1 !== colIndex) return cell;
+            return { ...cell, mergedValue: value };
+          }),
+          sharedUpdates,
+        ),
       );
     },
-    [selectedMergeCell, selectedMergeSheetIndex, markResolvedKeys, mergeCellKeySet, pushMergeUndoSnapshot],
+    [selectedMergeCell, selectedMergeSheetIndex, markResolvedKeys, mergeCells, pushMergeUndoSnapshot],
   );
 
   const handleApplyMergeRowChoice = useCallback(
     async (rowNumber: number, source: 'ours' | 'theirs') => {
       pushMergeUndoSnapshot();
-      const valueFrom = (cell: MergeCell) => (source === 'ours' ? cell.oursValue : cell.theirsValue);
+      const valueFrom = (cell: MergeCell) =>
+        isProtectedMergeCell(cell) ? cell.mergedValue : source === 'ours' ? cell.oursValue : cell.theirsValue;
+      const sharedUpdates = new Map<string, string | number | null>();
+      mergeCells
+        .filter((cell) => cell.row === rowNumber)
+        .forEach((cell) => {
+          addSharedControlGroupValueUpdate(sharedUpdates, cell, valueFrom(cell));
+        });
 
       // 标记这一行所有差异单元格为 resolved
       const keys = mergeCells
@@ -3117,22 +3357,28 @@ export const App: React.FC = () => {
       markResolvedKeys(selectedMergeSheetIndex, keys);
 
       setMergeSheets((prev) =>
-        prev.map((sheet: MergeSheetData, sIdx: number) => {
-          if (sIdx !== selectedMergeSheetIndex) return sheet;
-          const newCells = sheet.cells.map((cell) => {
-            if (cell.row !== rowNumber) return cell;
-            return { ...cell, mergedValue: valueFrom(cell) };
-          });
-          return { ...sheet, cells: newCells };
-        }),
+        applySharedControlGroupUpdatesToSheets(
+          prev.map((sheet: MergeSheetData, sIdx: number) => {
+            if (sIdx !== selectedMergeSheetIndex) return sheet;
+            const newCells = sheet.cells.map((cell) => {
+              if (cell.row !== rowNumber) return cell;
+              return { ...cell, mergedValue: valueFrom(cell) };
+            });
+            return { ...sheet, cells: newCells };
+          }),
+          sharedUpdates,
+        ),
       );
 
       // 同步当前视图的 cells
       setMergeCells((prev) =>
-        prev.map((cell) => {
-          if (cell.row !== rowNumber) return cell;
-          return { ...cell, mergedValue: valueFrom(cell) };
-        }),
+        applySharedControlGroupUpdatesToCells(
+          prev.map((cell) => {
+            if (cell.row !== rowNumber) return cell;
+            return { ...cell, mergedValue: valueFrom(cell) };
+          }),
+          sharedUpdates,
+        ),
       );
       const rowMeta = mergeRowsMeta.find((m) => m.visualRowNumber === rowNumber);
       if (!rowMeta || !mergeInfo) return;
@@ -3179,6 +3425,7 @@ export const App: React.FC = () => {
       pushMergeUndoSnapshot,
     ],
   );
+
   const handleDeleteMergeRow = useCallback(
     (rowNumber: number) => {
       pushMergeUndoSnapshot();
@@ -3221,32 +3468,46 @@ export const App: React.FC = () => {
 
   const handleApplyMergeCellChoice = useCallback(
     (rowNumber: number, colNumber: number, source: 'ours' | 'theirs') => {
+      const targetCell = mergeCells.find((cell) => cell.row === rowNumber && cell.col === colNumber) ?? null;
+      if (!targetCell) return;
+      if (isProtectedMergeCell(targetCell)) {
+        alert(getProtectedMergeCellEditMessage(targetCell) ?? FORMULA_CONTROLLED_EDIT_MESSAGE);
+        return;
+      }
       const valueFrom = (cell: MergeCell) => (source === 'ours' ? cell.oursValue : cell.theirsValue);
-      const key = `${rowNumber}:${colNumber}`;
-      if (!mergeCellKeySet.has(key)) return;
+      const value = valueFrom(targetCell);
+      const sharedUpdates = new Map<string, string | number | null>();
+      addSharedControlGroupValueUpdate(sharedUpdates, targetCell, value);
+      const key = getMergeCellKey(rowNumber, colNumber);
 
       pushMergeUndoSnapshot();
-      markResolvedKeys(selectedMergeSheetIndex, [`${rowNumber}:${colNumber}`]);
+      markResolvedKeys(selectedMergeSheetIndex, [key]);
 
       setMergeSheets((prev) =>
-        prev.map((sheet: MergeSheetData, sIdx: number) => {
-          if (sIdx !== selectedMergeSheetIndex) return sheet;
-          const newCells = sheet.cells.map((cell) => {
-            if (cell.row !== rowNumber || cell.col !== colNumber) return cell;
-            return { ...cell, mergedValue: valueFrom(cell) };
-          });
-          return { ...sheet, cells: newCells };
-        }),
+        applySharedControlGroupUpdatesToSheets(
+          prev.map((sheet: MergeSheetData, sIdx: number) => {
+            if (sIdx !== selectedMergeSheetIndex) return sheet;
+            const newCells = sheet.cells.map((cell) => {
+              if (cell.row !== rowNumber || cell.col !== colNumber) return cell;
+              return { ...cell, mergedValue: valueFrom(cell) };
+            });
+            return { ...sheet, cells: newCells };
+          }),
+          sharedUpdates,
+        ),
       );
 
       setMergeCells((prev) =>
-        prev.map((cell) => {
-          if (cell.row !== rowNumber || cell.col !== colNumber) return cell;
-          return { ...cell, mergedValue: valueFrom(cell) };
-        }),
+        applySharedControlGroupUpdatesToCells(
+          prev.map((cell) => {
+            if (cell.row !== rowNumber || cell.col !== colNumber) return cell;
+            return { ...cell, mergedValue: valueFrom(cell) };
+          }),
+          sharedUpdates,
+        ),
       );
     },
-    [selectedMergeSheetIndex, markResolvedKeys, mergeCellKeySet, pushMergeUndoSnapshot],
+    [selectedMergeSheetIndex, markResolvedKeys, mergeCells, pushMergeUndoSnapshot],
   );
 
   const buildMergedColumnValues = useCallback(
@@ -3299,26 +3560,39 @@ export const App: React.FC = () => {
   const handleApplyMergeColumnChoice = useCallback(
     async (colNumber: number, source: 'ours' | 'theirs') => {
       pushMergeUndoSnapshot();
-      const valueFrom = (cell: MergeCell) => (source === 'theirs' ? cell.theirsValue : cell.oursValue);
+      const valueFrom = (cell: MergeCell) =>
+        isProtectedMergeCell(cell) ? cell.mergedValue : source === 'theirs' ? cell.theirsValue : cell.oursValue;
+      const sharedUpdates = new Map<string, string | number | null>();
+      mergeCells
+        .filter((cell) => cell.col === colNumber)
+        .forEach((cell) => {
+          addSharedControlGroupValueUpdate(sharedUpdates, cell, valueFrom(cell));
+        });
       const keys = mergeCells.filter((c) => c.col === colNumber).map((c) => `${c.row}:${c.col}`);
       markResolvedKeys(selectedMergeSheetIndex, keys);
 
       setMergeSheets((prev) =>
-        prev.map((sheet: MergeSheetData, sIdx: number) => {
-          if (sIdx !== selectedMergeSheetIndex) return sheet;
-          const newCells = sheet.cells.map((cell) => {
-            if (cell.col !== colNumber) return cell;
-            return { ...cell, mergedValue: valueFrom(cell) };
-          });
-          return { ...sheet, cells: newCells };
-        }),
+        applySharedControlGroupUpdatesToSheets(
+          prev.map((sheet: MergeSheetData, sIdx: number) => {
+            if (sIdx !== selectedMergeSheetIndex) return sheet;
+            const newCells = sheet.cells.map((cell) => {
+              if (cell.col !== colNumber) return cell;
+              return { ...cell, mergedValue: valueFrom(cell) };
+            });
+            return { ...sheet, cells: newCells };
+          }),
+          sharedUpdates,
+        ),
       );
 
       setMergeCells((prev) =>
-        prev.map((cell) => {
-          if (cell.col !== colNumber) return cell;
-          return { ...cell, mergedValue: valueFrom(cell) };
-        }),
+        applySharedControlGroupUpdatesToCells(
+          prev.map((cell) => {
+            if (cell.col !== colNumber) return cell;
+            return { ...cell, mergedValue: valueFrom(cell) };
+          }),
+          sharedUpdates,
+        ),
       );
 
       if (!mergeInfo) return;
@@ -3374,33 +3648,50 @@ export const App: React.FC = () => {
       if (!keys.length) return;
       const valueFrom = (cell: MergeCell) =>
         source === 'base' ? cell.baseValue : source === 'ours' ? cell.oursValue : cell.theirsValue;
-      const filtered = keys.filter((k) => mergeCellKeySet.has(`${k.rowNumber}:${k.colNumber}`));
+      const filtered = keys.filter((k) => {
+        const targetCell =
+          mergeCells.find((cell) => cell.row === k.rowNumber && cell.col === k.colNumber) ?? null;
+        return !!targetCell && !isProtectedMergeCell(targetCell);
+      });
       if (!filtered.length) return;
+      const sharedUpdates = new Map<string, string | number | null>();
+      filtered.forEach((k) => {
+        const targetCell =
+          mergeCells.find((cell) => cell.row === k.rowNumber && cell.col === k.colNumber) ?? null;
+        if (!targetCell) return;
+        addSharedControlGroupValueUpdate(sharedUpdates, targetCell, valueFrom(targetCell));
+      });
       pushMergeUndoSnapshot();
-      const keySet = new Set(filtered.map((k) => `${k.rowNumber}:${k.colNumber}`));
+      const keySet = new Set(filtered.map((k) => getMergeCellKey(k.rowNumber, k.colNumber)));
       markResolvedKeys(selectedMergeSheetIndex, Array.from(keySet));
 
       setMergeSheets((prev) =>
-        prev.map((sheet: MergeSheetData, sIdx: number) => {
-          if (sIdx !== selectedMergeSheetIndex) return sheet;
-          const newCells = sheet.cells.map((cell) => {
-            const k = `${cell.row}:${cell.col}`;
-            if (!keySet.has(k)) return cell;
-            return { ...cell, mergedValue: valueFrom(cell) };
-          });
-          return { ...sheet, cells: newCells };
-        }),
+        applySharedControlGroupUpdatesToSheets(
+          prev.map((sheet: MergeSheetData, sIdx: number) => {
+            if (sIdx !== selectedMergeSheetIndex) return sheet;
+            const newCells = sheet.cells.map((cell) => {
+              const k = `${cell.row}:${cell.col}`;
+              if (!keySet.has(k)) return cell;
+              return { ...cell, mergedValue: valueFrom(cell) };
+            });
+            return { ...sheet, cells: newCells };
+          }),
+          sharedUpdates,
+        ),
       );
 
       setMergeCells((prev) =>
-        prev.map((cell) => {
-          const k = `${cell.row}:${cell.col}`;
-          if (!keySet.has(k)) return cell;
-          return { ...cell, mergedValue: valueFrom(cell) };
-        }),
+        applySharedControlGroupUpdatesToCells(
+          prev.map((cell) => {
+            const k = `${cell.row}:${cell.col}`;
+            if (!keySet.has(k)) return cell;
+            return { ...cell, mergedValue: valueFrom(cell) };
+          }),
+          sharedUpdates,
+        ),
       );
     },
-    [selectedMergeSheetIndex, markResolvedKeys, mergeCellKeySet, pushMergeUndoSnapshot],
+    [selectedMergeSheetIndex, markResolvedKeys, mergeCells, pushMergeUndoSnapshot],
   );
 
   /**
@@ -3431,6 +3722,7 @@ export const App: React.FC = () => {
       const hasRowMeta = (sheet.rowsMeta ?? []).length > 0;
       return sheet.cells
         .map((cell: MergeCell) => {
+          if (shouldSkipMergeCellSaveWrite(cell)) return null;
           const meta = rowMetaMap.get(cell.row);
           const targetRowNumber = meta?.oursRowNumber ?? null;
           if (hasRowMeta && !targetRowNumber) return null;
@@ -3581,7 +3873,14 @@ export const App: React.FC = () => {
         }}
         title={
           mergeCell
-            ? `${value}\n状态: ${mergeCell.status}\n${resolved ? '已确认' : '待确认'}`
+            ? [
+                value,
+                `状态: ${getProtectedMergeCellLabel(mergeCell) ?? mergeCell.status}`,
+                resolved ? '已确认' : '待确认',
+                getProtectedMergeCellHint(mergeCell),
+              ]
+                .filter(Boolean)
+                .join('\n')
             : value
         }
         style={{
@@ -3594,6 +3893,7 @@ export const App: React.FC = () => {
           textOverflow: 'ellipsis',
           cursor: 'pointer',
           userSelect: 'none',
+          color: isProtectedMergeCell(mergeCell) ? '#4b5563' : '#111827',
         }}
       >
         {value}
@@ -3614,7 +3914,11 @@ export const App: React.FC = () => {
       style.backgroundColor = '#f5f5f5';
     }
     if (mergeCell) {
-      if (resolved) {
+      if (isProtectedMergeCell(mergeCell)) {
+        style.backgroundColor = '#e5e7eb';
+        style.borderLeft = '3px solid #9ca3af';
+        style.boxShadow = 'inset 0 0 0 1px #9ca3af';
+      } else if (resolved) {
         style.backgroundColor = '#f0f0f0';
       } else if (mergeCell.status === 'conflict') {
         style.backgroundColor = '#fff3e0';
@@ -3964,48 +4268,6 @@ export const App: React.FC = () => {
         overflow: 'hidden',
       }}
     >
-      <div style={{ marginBottom: 8, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-        {hasActiveWorkspace && mode === 'merge' && hasMergeData && mergeInfo && (
-          <>
-            <button onClick={handleSaveMergeToFile}>
-              {cliInfo?.mode === 'merge'
-                ? '将合并结果写回 Git 合并文件（MERGED，解决冲突）'
-                : cliInfo?.mode === 'diff'
-                  ? '将合并结果覆盖 ours（当前分支）文件'
-                  : '保存合并结果为新的 Excel 文件（以 ours 为格式模板）'}
-            </button>
-            <div
-              style={{
-                minWidth: 280,
-                maxWidth: '100%',
-                display: 'grid',
-                gap: 2,
-                flex: '1 1 420px',
-              }}
-            >
-              <span style={{ fontSize: 12, color: '#555' }}>
-                {mergedPath
-                  ? '目标文件'
-                  : cliInfo?.mode === 'merge' && cliInfo?.mergedPathRaw
-                    ? '目标文件（Git 相对路径）'
-                    : '目标文件（保存时选择）'}
-              </span>
-              <span
-                title={mergeSaveTargetLabel}
-                style={{
-                  fontSize: 12,
-                  color: '#111827',
-                  whiteSpace: 'nowrap',
-                  overflow: 'hidden',
-                  textOverflow: 'ellipsis',
-                }}
-              >
-                {mergeSaveTargetLabel}
-              </span>
-            </div>
-          </>
-        )}
-      </div>
       {workspaceTabs.length > 0 && (
         <div
           style={{
@@ -4065,6 +4327,59 @@ export const App: React.FC = () => {
               </div>
             );
           })}
+        </div>
+      )}
+
+      {hasActiveWorkspace && mode === 'merge' && hasMergeData && mergeInfo && (
+        <div
+          style={{
+            marginBottom: 12,
+            display: 'flex',
+            alignItems: 'center',
+            gap: 10,
+            flexWrap: 'wrap',
+            border: '1px solid #dbe3ef',
+            borderRadius: 10,
+            padding: '10px 12px',
+            backgroundColor: '#f8fafc',
+          }}
+        >
+          <button onClick={handleSaveMergeToFile}>
+            {cliInfo?.mode === 'merge'
+              ? '将合并结果写回 Git 合并文件（MERGED，解决冲突）'
+              : cliInfo?.mode === 'diff'
+                ? '将合并结果覆盖 ours（当前分支）文件'
+                : '保存合并结果为新的 Excel 文件（以 ours 为格式模板）'}
+          </button>
+          <div
+            style={{
+              minWidth: 280,
+              maxWidth: '100%',
+              display: 'grid',
+              gap: 2,
+              flex: '1 1 420px',
+            }}
+          >
+            <span style={{ fontSize: 12, color: '#555' }}>
+              {mergedPath
+                ? '目标文件'
+                : cliInfo?.mode === 'merge' && cliInfo?.mergedPathRaw
+                  ? '目标文件（Git 相对路径）'
+                  : '目标文件（保存时选择）'}
+            </span>
+            <span
+              title={mergeSaveTargetLabel}
+              style={{
+                fontSize: 12,
+                color: '#111827',
+                whiteSpace: 'nowrap',
+                overflow: 'hidden',
+                textOverflow: 'ellipsis',
+              }}
+            >
+              {mergeSaveTargetLabel}
+            </span>
+          </div>
         </div>
       )}
 
@@ -4655,6 +4970,8 @@ export const App: React.FC = () => {
                     remainingCount={mergeRemainingCount}
                     canUndo={mergeUndoStack.length > 0}
                     onUndo={handleUndoMergeAction}
+                    canJumpToPreviousConflict={mergeUnresolvedConflicts.length > 0}
+                    onJumpToPreviousConflict={handleJumpToPreviousMergeConflict}
                     canJumpToNextConflict={mergeUnresolvedConflicts.length > 0}
                     onJumpToNextConflict={handleJumpToNextMergeConflict}
                   />
@@ -4744,6 +5061,8 @@ export const App: React.FC = () => {
                   remainingCount={mergeRemainingCount}
                   canUndo={mergeUndoStack.length > 0}
                   onUndo={handleUndoMergeAction}
+                  canJumpToPreviousConflict={mergeUnresolvedConflicts.length > 0}
+                  onJumpToPreviousConflict={handleJumpToPreviousMergeConflict}
                   canJumpToNextConflict={mergeUnresolvedConflicts.length > 0}
                   onJumpToNextConflict={handleJumpToNextMergeConflict}
                 />

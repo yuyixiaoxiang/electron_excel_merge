@@ -1,0 +1,58 @@
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Allows the main eMerge window to access local Excel files, dialogs, CLI context and git execution.",
+  "windows": [
+    "main"
+  ],
+  "permissions": [
+    "core:default",
+    "dialog:default",
+    "opener:default",
+    "fs:default",
+    "fs:write-all",
+    {
+      "identifier": "fs:scope",
+      "allow": [
+        { "path": "$APPDATA/**" },
+        { "path": "$APPLOCALDATA/**" },
+        { "path": "$TEMP/**" },
+        { "path": "$RESOURCE/**" },
+        { "path": "C:/**" },
+        { "path": "D:/**" },
+        { "path": "E:/**" },
+        { "path": "F:/**" },
+        { "path": "G:/**" },
+        { "path": "H:/**" },
+        { "path": "I:/**" },
+        { "path": "J:/**" },
+        { "path": "K:/**" },
+        { "path": "L:/**" },
+        { "path": "M:/**" },
+        { "path": "N:/**" },
+        { "path": "O:/**" },
+        { "path": "P:/**" },
+        { "path": "Q:/**" },
+        { "path": "R:/**" },
+        { "path": "S:/**" },
+        { "path": "T:/**" },
+        { "path": "U:/**" },
+        { "path": "V:/**" },
+        { "path": "W:/**" },
+        { "path": "X:/**" },
+        { "path": "Y:/**" },
+        { "path": "Z:/**" }
+      ]
+    },
+    {
+      "identifier": "shell:allow-execute",
+      "allow": [
+        {
+          "name": "git",
+          "cmd": "git",
+          "args": true
+        }
+      ]
+    }
+  ]
+}
