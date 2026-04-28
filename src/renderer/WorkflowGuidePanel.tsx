@@ -10,7 +10,7 @@ type WorkflowStep = {
 
 export interface WorkflowGuidePanelProps {
   mode: WorkflowMode;
-  cliMode?: 'diff' | 'merge' | null;
+  cliMode?: 'diff' | 'merge' | 'simple-merge' | null;
   autoHasPrimaryKey?: boolean;
   primaryKeyHint?: string;
   showFullTables?: boolean;
@@ -250,9 +250,10 @@ const stepIndexStyle = (active: boolean): React.CSSProperties => ({
 
 const modeLabel = (mode: WorkflowMode) => (mode === 'diff' ? '双文件 diff 模式' : '三方 merge 模式');
 
-const modeSummaryLabel = (mode: WorkflowMode, cliMode?: 'diff' | 'merge' | null) => {
+const modeSummaryLabel = (mode: WorkflowMode, cliMode?: 'diff' | 'merge' | 'simple-merge' | null) => {
   if (mode === 'diff') return '默认主流程是左右两个 Excel 的并排对比，可直接编辑并分别保存。';
   if (cliMode === 'merge') return '当前由 Git/Fork merge 驱动，重点是决策后回写 MERGED/ours。';
+  if (cliMode === 'simple-merge') return '当前由 Git/Fork simple merge 驱动，ours / theirs 任意不一致都会进入冲突决策。';
   if (cliMode === 'diff') return '当前由 Git/Fork diff 驱动，重点是审查 ours 与 theirs 的差异。';
   return '当前为交互式三方 merge，重点是主键对齐、差异决策和预览回写。';
 };

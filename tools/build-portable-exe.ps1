@@ -13,6 +13,8 @@ $launcherSource = Join-Path $repoRoot 'tools\PortableLauncher.cs'
 $iconPath = Join-Path $repoRoot 'src-tauri\icons\icon.ico'
 $cscPath = 'C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 
+Add-Type -AssemblyName System.IO.Compression.FileSystem
+
 if (-not (Test-Path $releaseDir)) {
   throw "未找到 release 目录：$releaseDir"
 }
@@ -43,7 +45,12 @@ New-Item -ItemType Directory -Path $repoPortableDir -Force | Out-Null
 Copy-Item -LiteralPath (Join-Path $releaseDir 'eMerge.exe') -Destination (Join-Path $payloadDir 'eMerge.exe') -Force
 Copy-Item -LiteralPath (Join-Path $releaseDir 'resources') -Destination (Join-Path $payloadDir 'resources') -Recurse -Force
 
-Compress-Archive -Path (Join-Path $payloadDir '*') -DestinationPath $payloadZip -CompressionLevel Optimal
+[System.IO.Compression.ZipFile]::CreateFromDirectory(
+  $payloadDir,
+  $payloadZip,
+  [System.IO.Compression.CompressionLevel]::Optimal,
+  $false
+)
 
 $cscArgs = @(
   '/nologo'

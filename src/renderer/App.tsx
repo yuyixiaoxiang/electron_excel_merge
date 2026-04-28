@@ -115,7 +115,7 @@ const sameComparableValue = (a: string | number | null, b: string | number | nul
 const parseCliInfoLike = (value: unknown): CliThreeWayInfo | null => {
   if (!value || typeof value !== 'object') return null;
   const maybeInfo = value as Partial<CliThreeWayInfo>;
-  if (maybeInfo.mode !== 'diff' && maybeInfo.mode !== 'merge') return null;
+  if (maybeInfo.mode !== 'diff' && maybeInfo.mode !== 'merge' && maybeInfo.mode !== 'simple-merge') return null;
   if (
     typeof maybeInfo.basePath !== 'string' ||
     typeof maybeInfo.oursPath !== 'string' ||
@@ -208,6 +208,16 @@ const buildCompareRequestSignature = (request: {
     compareHeaderRowCount: COMPARE_HEADER_ROW_COUNT,
   });
 
+const normalizeRendererCompareMode = (
+  compareMode: ThreeWayDiffRequest['compareMode'] | CliThreeWayInfo['mode'] | null | undefined,
+): ThreeWayDiffRequest['compareMode'] => {
+  if (compareMode === 'diff') return 'diff';
+  if (compareMode === 'simple-merge') return 'simple-merge';
+  return 'merge';
+};
+
+type MergePathInputRole = 'basePath' | 'oursPath' | 'theirsPath';
+
 const cloneMergeSheetsDeep = (sheets: MergeSheetData[]): MergeSheetData[] =>
   sheets.map((sheet) => ({
     ...sheet,
@@ -217,6 +227,24 @@ const cloneMergeSheetsDeep = (sheets: MergeSheetData[]): MergeSheetData[] =>
   }));
 
 const getMergeCellKey = (rowNumber: number, colNumber: number): string => `${rowNumber}:${colNumber}`;
+
+const computeInsertTargetRowNumberFromRowsMeta = (
+  rowsMeta: MergeRowMeta[],
+  visualRowNumber: number,
+): number => {
+  const list = [...rowsMeta].sort((a, b) => a.visualRowNumber - b.visualRowNumber);
+  const idx = list.findIndex((meta) => meta.visualRowNumber === visualRowNumber);
+  if (idx < 0) return 1;
+  for (let i = idx - 1; i >= 0; i -= 1) {
+    const rowNumber = list[i].oursRowNumber;
+    if (rowNumber) return rowNumber + 1;
+  }
+  for (let i = idx + 1; i < list.length; i += 1) {
+    const rowNumber = list[i].oursRowNumber;
+    if (rowNumber) return rowNumber;
+  }
+  return 1;
+};
 
 const isFormulaControlledMergeCell = (
   cell: Pick<MergeCell, 'formulaControlled'> | null | undefined,
@@ -330,10 +358,25 @@ const shouldSkipMergeCellSaveWrite = (cell: MergeCell): boolean => {
 const isAutoResolvedMergeCell = (cell: MergeCell): boolean =>
   cell.status !== 'conflict' || isProtectedMergeCell(cell);
 
-const isUnresolvedUserConflict = (cell: MergeCell, resolvedSet: Set<string>): boolean =>
-  cell.status === 'conflict' &&
-  !isProtectedMergeCell(cell) &&
-  !resolvedSet.has(getMergeCellKey(cell.row, cell.col));
+const isMergeAttentionCell = (
+  cell: MergeCell,
+  resolvedSet: Set<string>,
+  includeTheirsChanged: boolean,
+): boolean => {
+  if (isProtectedMergeCell(cell)) return false;
+  if (resolvedSet.has(getMergeCellKey(cell.row, cell.col))) return false;
+  return cell.status === 'conflict';
+};
+
+const shouldAutoInsertMergeRow = (
+  rowMeta: Pick<MergeRowMeta, 'baseRowNumber' | 'oursRowNumber' | 'theirsRowNumber'> | null | undefined,
+  compareMode: ThreeWayDiffRequest['compareMode'],
+): boolean =>
+  compareMode !== 'simple-merge' &&
+  !!rowMeta &&
+  !rowMeta.oursRowNumber &&
+  !!rowMeta.theirsRowNumber &&
+  !rowMeta.baseRowNumber;
 
 const cloneResolvedBySheetMap = (source: Map<number, Set<string>>): Map<number, Set<string>> => {
   const next = new Map<number, Set<string>>();
@@ -481,7 +524,8 @@ export const App: React.FC = () => {
   const [mergedPreviewRowVisuals, setMergedPreviewRowVisuals] = useState<(number | null)[]>([]);
   const [mergedPreviewAlignedCols, setMergedPreviewAlignedCols] = useState<number[]>([]);
   const [mergeThreeWayRows, setMergeThreeWayRows] = useState<ThreeWayRowResult[]>([]);
-  const [showFullTables, setShowFullTables] = useState<boolean>(false);
+  const [showFullTables, setShowFullTables] = useState<boolean>(true);
+  const [fullBaseRows, setFullBaseRows] = useState<(string | number | null)[][]>([]);
   const [fullOursRows, setFullOursRows] = useState<(string | number | null)[][]>([]);
   const [fullTheirsRows, setFullTheirsRows] = useState<(string | number | null)[][]>([]);
   const [mergeInfo, setMergeInfo] = useState<{
@@ -489,6 +533,7 @@ export const App: React.FC = () => {
     oursPath: string;
     theirsPath: string;
     sheetName: string;
+    compareMode: ThreeWayDiffRequest['compareMode'];
   } | null>(null);
   const [selectedMergePaths, setSelectedMergePaths] = useState<{
     basePath: string | null;
@@ -525,6 +570,7 @@ export const App: React.FC = () => {
   const [diffAnalyzeProgress, setDiffAnalyzeProgress] = useState<number>(0);
   const [mergeAnalyzeInProgress, setMergeAnalyzeInProgress] = useState<boolean>(false);
   const [mergeAnalyzeProgress, setMergeAnalyzeProgress] = useState<number>(0);
+  const [mergeAnalyzeStatus, setMergeAnalyzeStatus] = useState<'idle' | 'loading' | 'loaded' | 'error'>('idle');
   const [diffSheets, setDiffSheets] = useState<MergeSheetData[]>([]);
   const [selectedDiffSheetIndex, setSelectedDiffSheetIndex] = useState<number>(0);
   const [diffSelectedCell, setDiffSelectedCell] = useState<{
@@ -608,7 +654,45 @@ export const App: React.FC = () => {
     return typeof alignedCol === 'number' && alignedCol >= 1 ? alignedCol : undefined;
   }, [mergeSheets, selectedMergeSheetIndex]);
   const hasActiveWorkspace = activeWorkspaceTab !== null;
-  const compareMode = useMemo(() => (mode === 'diff' ? 'diff' : 'merge'), [mode]);
+  const compareMode = useMemo(
+    () => (mode === 'diff' ? 'diff' : normalizeRendererCompareMode(mergeInfo?.compareMode ?? cliInfo?.mode)),
+    [cliInfo?.mode, mergeInfo?.compareMode, mode],
+  );
+  const isSimpleMergeMode = compareMode === 'simple-merge';
+  const mergeInputRows = useMemo<ReadonlyArray<readonly [MergePathInputRole, string, string]>>(
+    () =>
+      isSimpleMergeMode
+        ? [
+            ['oursPath', 'ours', '粘贴 ours Excel 路径'],
+            ['theirsPath', 'theirs', '粘贴 theirs Excel 路径'],
+          ]
+        : [
+            ['basePath', 'base', '粘贴 base Excel 路径'],
+            ['oursPath', 'ours', '粘贴 ours Excel 路径'],
+            ['theirsPath', 'theirs', '粘贴 theirs Excel 路径'],
+          ],
+    [isSimpleMergeMode],
+  );
+  const mergeAnalyzeDisplayProgress = useMemo(() => {
+    if (mergeAnalyzeInProgress) {
+      return Math.max(0, Math.min(100, mergeAnalyzeProgress));
+    }
+    if (mergeAnalyzeStatus === 'loaded') return 100;
+    if (mergeAnalyzeStatus === 'error') return Math.max(12, Math.min(100, mergeAnalyzeProgress));
+    return 0;
+  }, [mergeAnalyzeInProgress, mergeAnalyzeProgress, mergeAnalyzeStatus]);
+  const mergeAnalyzeBarColor = useMemo(() => {
+    if (mergeAnalyzeInProgress) return '#2563eb';
+    if (mergeAnalyzeStatus === 'loaded') return '#16a34a';
+    if (mergeAnalyzeStatus === 'error') return '#dc2626';
+    return '#94a3b8';
+  }, [mergeAnalyzeInProgress, mergeAnalyzeStatus]);
+  const mergeAnalyzeStatusLabel = useMemo(() => {
+    if (mergeAnalyzeInProgress) return `${Math.round(mergeAnalyzeDisplayProgress)}%`;
+    if (mergeAnalyzeStatus === 'loaded') return '已加载';
+    if (mergeAnalyzeStatus === 'error') return '加载失败';
+    return '待加载';
+  }, [mergeAnalyzeDisplayProgress, mergeAnalyzeInProgress, mergeAnalyzeStatus]);
   const parsedMergeFrozenRowDraft = useMemo(() => {
     const trimmed = mergeFrozenRowDraft.trim();
     if (trimmed === '') return null;
@@ -844,7 +928,14 @@ export const App: React.FC = () => {
 
   const applyMergeComparisonResult = useCallback(
     (
-      result: { basePath: string; oursPath: string; theirsPath: string; sheet?: MergeSheetData; sheets?: MergeSheetData[] },
+      result: {
+        basePath: string;
+        oursPath: string;
+        theirsPath: string;
+        compareMode?: ThreeWayDiffRequest['compareMode'];
+        sheet?: MergeSheetData;
+        sheets?: MergeSheetData[];
+      },
       preferredSheetName?: string,
     ) => {
       const allMergeSheets = normalizeCompareSheets(result);
@@ -873,6 +964,7 @@ export const App: React.FC = () => {
         oursPath: result.oursPath,
         theirsPath: result.theirsPath,
         sheetName: allMergeSheets[nextIndex]?.sheetName ?? allMergeSheets[0]?.sheetName ?? '',
+        compareMode: normalizeRendererCompareMode(result.compareMode),
       });
       setSelectedMergePaths({
         basePath: result.basePath,
@@ -898,13 +990,14 @@ export const App: React.FC = () => {
         theirsPath: string;
       },
       preferredSheetName?: string,
+      targetCompareMode: Exclude<ThreeWayDiffRequest['compareMode'], 'diff'> = 'merge',
     ) => {
       const requestId = nextDebugRequestId('load-merge');
       lastMergeCompareSignatureRef.current = buildCompareRequestSignature({
         basePath: paths.basePath,
         oursPath: paths.oursPath,
         theirsPath: paths.theirsPath,
-        compareMode: 'merge',
+        compareMode: targetCompareMode,
         primaryKeyCol: requestedPrimaryKeyCol,
         rowSimilarityThreshold,
       });
@@ -912,7 +1005,7 @@ export const App: React.FC = () => {
         basePath: paths.basePath,
         oursPath: paths.oursPath,
         theirsPath: paths.theirsPath,
-        compareMode: 'merge',
+        compareMode: targetCompareMode,
         primaryKeyCol: requestedPrimaryKeyCol,
         frozenRowCount: COMPARE_HEADER_ROW_COUNT,
         rowSimilarityThreshold,
@@ -921,6 +1014,7 @@ export const App: React.FC = () => {
       const startedAt = performance.now();
       logRendererDebug('loadMergeComparison:start', {
         requestId,
+        compareMode: targetCompareMode,
         preferredSheetName: preferredSheetName ?? null,
         compareHeaderRowCount: COMPARE_HEADER_ROW_COUNT,
         primaryKeyCol: requestedPrimaryKeyCol,
@@ -934,6 +1028,7 @@ export const App: React.FC = () => {
       }
       logRendererDebug('loadMergeComparison:end', {
         requestId,
+        compareMode: targetCompareMode,
         durationMs,
         sheetCount: normalizeCompareSheets(result).length,
       });
@@ -1084,9 +1179,13 @@ export const App: React.FC = () => {
   }, [diffAnalyzeInProgress, diffPathInputs, diffSheets, selectedDiffSheetIndex, loadDiffComparison]);
 
   const handlePickMergeWorkbook = useCallback(
-    async (role: 'basePath' | 'oursPath' | 'theirsPath') => {
+    async (role: MergePathInputRole) => {
       const result: OpenResult | null = await window.excelAPI.openFile();
       if (!result) return;
+      if (!mergeAnalyzeInProgress) {
+        setMergeAnalyzeStatus('idle');
+        setMergeAnalyzeProgress(0);
+      }
       setMergePathInputs((prev) => ({
         ...prev,
         [role]: result.filePath,
@@ -1098,70 +1197,131 @@ export const App: React.FC = () => {
       setMode('merge');
       setSelectedMergePaths(nextPaths);
     },
-    [selectedMergePaths],
+    [mergeAnalyzeInProgress, selectedMergePaths],
+  );
+
+  const runMergeAnalyzeFlow = useCallback(
+    async (
+      paths: {
+        basePath: string;
+        oursPath: string;
+        theirsPath: string;
+      },
+      targetCompareMode: Exclude<ThreeWayDiffRequest['compareMode'], 'diff'> = 'merge',
+      preferredSheetName?: string,
+    ) => {
+      if (mergeAnalyzeInProgress) return false;
+      const rawBase = paths.basePath.trim();
+      const rawOurs = paths.oursPath.trim();
+      const rawTheirs = paths.theirsPath.trim();
+      if (targetCompareMode === 'simple-merge') {
+        if (!rawOurs || !rawTheirs) {
+          alert('请先填写 ours / theirs 的文件路径。');
+          return false;
+        }
+      } else if (!rawBase || !rawOurs || !rawTheirs) {
+        alert('请先填写 base / ours / theirs 的文件路径。');
+        return false;
+      }
+
+      setMode('merge');
+      setMergeAnalyzeStatus('loading');
+      setMergeAnalyzeInProgress(true);
+      setMergeAnalyzeProgress(5);
+
+      let animatedProgress = 5;
+      const timer = window.setInterval(() => {
+        animatedProgress = Math.min(92, animatedProgress + Math.random() * 4 + 1);
+        setMergeAnalyzeProgress(animatedProgress);
+      }, 160);
+
+      let success = false;
+      try {
+        let normalizedPaths: {
+          basePath: string;
+          oursPath: string;
+          theirsPath: string;
+        };
+        if (targetCompareMode === 'simple-merge') {
+          const oursWorkbook = await window.excelAPI.loadWorkbook(rawOurs);
+          if (!oursWorkbook) {
+            setMergeAnalyzeStatus('error');
+            alert(`无法打开 ours Excel：${rawOurs}`);
+            return false;
+          }
+          setMergeAnalyzeProgress((prev) => Math.max(prev, 35));
+
+          const theirsWorkbook = await window.excelAPI.loadWorkbook(rawTheirs);
+          if (!theirsWorkbook) {
+            setMergeAnalyzeStatus('error');
+            alert(`无法打开 theirs Excel：${rawTheirs}`);
+            return false;
+          }
+          setMergeAnalyzeProgress((prev) => Math.max(prev, 60));
+
+          normalizedPaths = {
+            basePath: oursWorkbook.filePath,
+            oursPath: oursWorkbook.filePath,
+            theirsPath: theirsWorkbook.filePath,
+          };
+        } else {
+          const baseWorkbook = await window.excelAPI.loadWorkbook(rawBase);
+          if (!baseWorkbook) {
+            setMergeAnalyzeStatus('error');
+            alert(`无法打开 base Excel：${rawBase}`);
+            return false;
+          }
+          setMergeAnalyzeProgress((prev) => Math.max(prev, 20));
+
+          const oursWorkbook = await window.excelAPI.loadWorkbook(rawOurs);
+          if (!oursWorkbook) {
+            setMergeAnalyzeStatus('error');
+            alert(`无法打开 ours Excel：${rawOurs}`);
+            return false;
+          }
+          setMergeAnalyzeProgress((prev) => Math.max(prev, 35));
+
+          const theirsWorkbook = await window.excelAPI.loadWorkbook(rawTheirs);
+          if (!theirsWorkbook) {
+            setMergeAnalyzeStatus('error');
+            alert(`无法打开 theirs Excel：${rawTheirs}`);
+            return false;
+          }
+          setMergeAnalyzeProgress((prev) => Math.max(prev, 50));
+
+          normalizedPaths = {
+            basePath: baseWorkbook.filePath,
+            oursPath: oursWorkbook.filePath,
+            theirsPath: theirsWorkbook.filePath,
+          };
+        }
+
+        setSelectedMergePaths(normalizedPaths);
+        setMergePathInputs(normalizedPaths);
+        await loadMergeComparison(normalizedPaths, preferredSheetName, targetCompareMode);
+        setMergeAnalyzeProgress(100);
+        setMergeAnalyzeStatus('loaded');
+        success = true;
+        return true;
+      } catch (error) {
+        setMergeAnalyzeStatus('error');
+        throw error;
+      } finally {
+        window.clearInterval(timer);
+        setMergeAnalyzeInProgress(false);
+      }
+    },
+    [loadMergeComparison, mergeAnalyzeInProgress],
   );
 
   const handleLoadMergeFromInputs = useCallback(async () => {
     if (mergeAnalyzeInProgress) return;
-    const rawBase = mergePathInputs.basePath.trim();
-    const rawOurs = mergePathInputs.oursPath.trim();
-    const rawTheirs = mergePathInputs.theirsPath.trim();
-    if (!rawBase || !rawOurs || !rawTheirs) {
-      alert('请先填写 base / ours / theirs 的文件路径。');
-      return;
-    }
-
-    setMode('merge');
-    setMergeAnalyzeInProgress(true);
-    setMergeAnalyzeProgress(5);
-
-    let animatedProgress = 5;
-    const timer = window.setInterval(() => {
-      animatedProgress = Math.min(92, animatedProgress + Math.random() * 4 + 1);
-      setMergeAnalyzeProgress(animatedProgress);
-    }, 160);
-
-    let success = false;
-    try {
-      const baseWorkbook = await window.excelAPI.loadWorkbook(rawBase);
-      if (!baseWorkbook) {
-        alert(`无法打开 base Excel：${rawBase}`);
-        return;
-      }
-      setMergeAnalyzeProgress((prev) => Math.max(prev, 20));
-
-      const oursWorkbook = await window.excelAPI.loadWorkbook(rawOurs);
-      if (!oursWorkbook) {
-        alert(`无法打开 ours Excel：${rawOurs}`);
-        return;
-      }
-      setMergeAnalyzeProgress((prev) => Math.max(prev, 35));
-
-      const theirsWorkbook = await window.excelAPI.loadWorkbook(rawTheirs);
-      if (!theirsWorkbook) {
-        alert(`无法打开 theirs Excel：${rawTheirs}`);
-        return;
-      }
-      setMergeAnalyzeProgress((prev) => Math.max(prev, 50));
-
-      const normalizedPaths = {
-        basePath: baseWorkbook.filePath,
-        oursPath: oursWorkbook.filePath,
-        theirsPath: theirsWorkbook.filePath,
-      };
-      setSelectedMergePaths(normalizedPaths);
-      setMergePathInputs(normalizedPaths);
-      await loadMergeComparison(normalizedPaths, mergeInfo?.sheetName);
-      setMergeAnalyzeProgress(100);
-      success = true;
-    } finally {
-      window.clearInterval(timer);
-      setMergeAnalyzeInProgress(false);
-      if (!success) {
-        setMergeAnalyzeProgress(0);
-      }
-    }
-  }, [mergeAnalyzeInProgress, mergePathInputs, loadMergeComparison, mergeInfo?.sheetName]);
+    await runMergeAnalyzeFlow(
+      mergePathInputs,
+      isSimpleMergeMode ? 'simple-merge' : 'merge',
+      mergeInfo?.sheetName,
+    );
+  }, [isSimpleMergeMode, mergeAnalyzeInProgress, mergeInfo?.sheetName, mergePathInputs, runMergeAnalyzeFlow]);
   const openWorkspaceTab = useCallback((
     kind: WorkspaceTabKind,
     title?: string,
@@ -1389,16 +1549,18 @@ export const App: React.FC = () => {
         }
         if (!info) return;
         setCliInfo(info);
-        if (info.mode === 'merge') {
+        if (info.mode !== 'diff') {
           setMergeFileSelectorCollapsed(true);
           setMergeAdvancedCollapsed(true);
           openWorkspaceTab('merge', 'Merge 模式 · CLI');
-          await loadMergeComparison(
+          await runMergeAnalyzeFlow(
             {
               basePath: info.basePath,
               oursPath: info.oursPath,
               theirsPath: info.theirsPath,
             },
+            normalizeRendererCompareMode(info.mode) as Exclude<ThreeWayDiffRequest['compareMode'], 'diff'>,
+            undefined,
           );
           return;
         }
@@ -1432,7 +1594,7 @@ export const App: React.FC = () => {
         }
       }
     })();
-  }, [loadDiffComparison, loadMergeComparison, logRendererDebug, openWorkspaceTab]);
+  }, [loadDiffComparison, logRendererDebug, openWorkspaceTab, runMergeAnalyzeFlow]);
   useEffect(() => {
     if (mode !== 'diff') return;
     const handleWindowKeyDown = (e: KeyboardEvent) => {
@@ -2664,9 +2826,9 @@ export const App: React.FC = () => {
   const mergeRemainingCount = useMemo(() => {
     const resolvedSet = resolvedBySheet.get(selectedMergeSheetIndex) ?? new Set<string>();
     return mergeCells.reduce((count, cell) => {
-      return isUnresolvedUserConflict(cell, resolvedSet) ? count + 1 : count;
+      return isMergeAttentionCell(cell, resolvedSet, cliInfo?.mode === 'merge') ? count + 1 : count;
     }, 0);
-  }, [mergeCells, resolvedBySheet, selectedMergeSheetIndex]);
+  }, [cliInfo?.mode, mergeCells, resolvedBySheet, selectedMergeSheetIndex]);
   const activateMergeSheet = useCallback(
     (
       sheetIndex: number,
@@ -2705,13 +2867,13 @@ export const App: React.FC = () => {
     },
     [mergeSheets],
   );
-  const mergeUnresolvedConflicts = useMemo(
+  const mergeAttentionTargets = useMemo(
     () =>
       mergeSheets
         .flatMap((sheet, sheetIndex) => {
           const resolvedSet = resolvedBySheet.get(sheetIndex) ?? new Set<string>();
           return (sheet.cells ?? [])
-            .filter((cell) => isUnresolvedUserConflict(cell, resolvedSet))
+            .filter((cell) => isMergeAttentionCell(cell, resolvedSet, cliInfo?.mode === 'merge'))
             .map((cell) => ({
               sheetIndex,
               row: cell.row,
@@ -2719,17 +2881,23 @@ export const App: React.FC = () => {
             }));
         })
         .sort((a, b) => a.sheetIndex - b.sheetIndex || a.row - b.row || a.col - b.col),
-    [mergeSheets, resolvedBySheet],
+    [cliInfo?.mode, mergeSheets, resolvedBySheet],
   );
   useEffect(() => {
     if (mode !== 'merge' || !mergeInfo || !showFullTables) {
+      setFullBaseRows([]);
       setFullOursRows([]);
       setFullTheirsRows([]);
       return;
     }
     let cancelled = false;
     (async () => {
-      const [oursSheet, theirsSheet] = await Promise.all([
+      const [baseSheet, oursSheet, theirsSheet] = await Promise.all([
+        window.excelAPI.getSheetData({
+          path: mergeInfo.basePath,
+          sheetName: mergeInfo.sheetName,
+          sheetIndex: selectedMergeSheetIndex,
+        }),
         window.excelAPI.getSheetData({
           path: mergeInfo.oursPath,
           sheetName: mergeInfo.sheetName,
@@ -2742,12 +2910,16 @@ export const App: React.FC = () => {
         }),
       ]);
       if (cancelled) return;
+      const baseRows = (baseSheet?.rows ?? []).map((row: SheetCell[]) =>
+        row.map((c: SheetCell) => c.value ?? null),
+      );
       const oursRows = (oursSheet?.rows ?? []).map((row: SheetCell[]) =>
         row.map((c: SheetCell) => c.value ?? null),
       );
       const theirsRows = (theirsSheet?.rows ?? []).map((row: SheetCell[]) =>
         row.map((c: SheetCell) => c.value ?? null),
       );
+      setFullBaseRows(baseRows);
       setFullOursRows(oursRows);
       setFullTheirsRows(theirsRows);
     })();
@@ -2760,6 +2932,7 @@ export const App: React.FC = () => {
   }, [
     mode,
     showFullTables,
+    mergeInfo?.basePath,
     mergeInfo?.oursPath,
     mergeInfo?.theirsPath,
     mergeInfo?.sheetName,
@@ -2807,9 +2980,10 @@ export const App: React.FC = () => {
   }, [mode, selectedMergeCell, mergeCellsByRow, displayPrimaryKeyCol, mergeRowsMeta]);
 
 
+  const isCliMergeMode = cliInfo?.mode === 'merge' || cliInfo?.mode === 'simple-merge';
   const mergedPath = useMemo(() => {
     if (!mergeInfo) return null;
-    if (cliInfo?.mode === 'merge') {
+    if (isCliMergeMode) {
       if (cliInfo.mergedPath) return cliInfo.mergedPath;
       if (!cliInfo.mergedPathRaw) return mergeInfo.oursPath;
       return null;
@@ -2818,14 +2992,15 @@ export const App: React.FC = () => {
       return mergeInfo.oursPath;
     }
     return null;
-  }, [mergeInfo, cliInfo]);
+  }, [isCliMergeMode, mergeInfo, cliInfo]);
   const mergeConflictSummary = useMemo(() => {
     let resolved = 0;
     let unresolved = 0;
     mergeSheets.forEach((sheet, sheetIndex) => {
       const resolvedSet = resolvedBySheet.get(sheetIndex) ?? new Set<string>();
       (sheet.cells ?? []).forEach((cell) => {
-        if (cell.status !== 'conflict' || isProtectedMergeCell(cell)) return;
+        if (cell.status !== 'conflict') return;
+        if (isProtectedMergeCell(cell)) return;
         if (resolvedSet.has(getMergeCellKey(cell.row, cell.col))) {
           resolved += 1;
           return;
@@ -2838,13 +3013,44 @@ export const App: React.FC = () => {
       unresolved,
     };
   }, [mergeSheets, resolvedBySheet]);
+  const mergeSheetSummaries = useMemo(
+    () =>
+      mergeSheets.map((sheet, sheetIndex) => {
+        const resolvedSet = resolvedBySheet.get(sheetIndex) ?? new Set<string>();
+        let diffCount = 0;
+        let conflictCount = 0;
+
+        (sheet.cells ?? []).forEach((cell) => {
+          if (cell.status === 'unchanged') return;
+          diffCount += 1;
+          if (isMergeAttentionCell(cell, resolvedSet, cliInfo?.mode === 'merge')) {
+            conflictCount += 1;
+          }
+        });
+
+        return {
+          diffCount,
+          conflictCount,
+        };
+      }),
+    [cliInfo?.mode, mergeSheets, resolvedBySheet],
+  );
   const mergeSaveTargetLabel = useMemo(() => {
     if (mergedPath) return mergedPath;
-    if (cliInfo?.mode === 'merge' && cliInfo.mergedPathRaw) {
+    if (isCliMergeMode && cliInfo?.mergedPathRaw) {
       return `${cliInfo.mergedPathRaw}（Git 传入相对路径，保存时确认）`;
     }
     return '保存时会弹出选择目标文件';
-  }, [mergedPath, cliInfo]);
+  }, [isCliMergeMode, mergedPath, cliInfo]);
+  const mergeSaveButtonLabel = useMemo(() => {
+    if (isCliMergeMode) {
+      return '写回 Git MERGED 文件';
+    }
+    if (cliInfo?.mode === 'diff') {
+      return '覆盖 ours 文件';
+    }
+    return '保存合并结果';
+  }, [isCliMergeMode, cliInfo]);
   const currentRowOps = useMemo(
     () => mergeRowOpsBySheet.get(selectedMergeSheetIndex) ?? EMPTY_MERGE_ROW_OPS,
     [mergeRowOpsBySheet, selectedMergeSheetIndex],
@@ -2953,44 +3159,147 @@ export const App: React.FC = () => {
         effectiveColMap.splice(ins.idx, 0, { alignedCol: ins.col, oursCol: null });
       }
       const colCount = effectiveColMap.length;
-      const mergedRows: (string | number | null)[][] = [];
-      const mergedVisuals: (number | null)[] = [];
-      result.rows.forEach((rowRes: any, idx: number) => {
+      const columnsMetaMap = new Map<number, MergeColumnMeta>();
+      mergeColumnsMeta.forEach((meta) => columnsMetaMap.set(meta.col, meta));
+      const rowsMetaMap = new Map<number, MergeRowMeta>();
+      metas.forEach((meta) => rowsMetaMap.set(meta.visualRowNumber, meta));
+      const rowResultsMap = new Map<number, ThreeWayRowResult>();
+      result.rows.forEach((rowRes: ThreeWayRowResult, idx: number) => {
         const meta = metas[idx];
         const visualRowNumber = meta?.visualRowNumber ?? rowRes.rowNumber ?? idx + 1;
-        const op = currentRowOps.get(visualRowNumber);
-        const oursMissing = !meta?.oursRowNumber;
-        if (oursMissing && op?.action !== 'insert') return;
-        if (!oursMissing && op?.action === 'delete') return;
-        // Build merged row based on effective columns
+        rowResultsMap.set(visualRowNumber, rowRes);
+      });
+      const buildMergedRowFromVisual = (
+        visualRowNumber: number,
+        rowMeta: MergeRowMeta,
+        rowRes: ThreeWayRowResult | undefined,
+        op: SaveMergeRowOp | undefined,
+      ) => {
+        const shouldInsertRow = op?.action === 'insert' || (!op && shouldAutoInsertMergeRow(rowMeta, compareMode));
+        const shouldPreviewTheirsRowInSimpleMerge =
+          compareMode === 'simple-merge' && !rowMeta.oursRowNumber && !!rowMeta.theirsRowNumber;
         const mergedRow: (string | number | null)[] = [];
         for (let i = 0; i < effectiveColMap.length; i += 1) {
-          const colInfo = effectiveColMap[i];
-          const alignedCol = colInfo.alignedCol;
-          const colMeta = mergeColumnsMeta.find((m) => m.col === alignedCol);
-          // Check if there's a diff cell override
-          const diffCell = (mergeCellsByRow.get(visualRowNumber) ?? []).find((c) => c.col === alignedCol);
+          const alignedCol = effectiveColMap[i].alignedCol;
+          const colMeta = columnsMetaMap.get(alignedCol);
+          const diffCell = (mergeCellsByRow.get(visualRowNumber) ?? []).find((cell) => cell.col === alignedCol);
           if (diffCell) {
-            mergedRow.push(diffCell.mergedValue ?? null);
+            if (diffCell.mergedValue !== null && diffCell.mergedValue !== undefined) {
+              mergedRow.push(diffCell.mergedValue);
+              continue;
+            }
+            if (shouldPreviewTheirsRowInSimpleMerge && rowRes?.theirs) {
+              mergedRow.push(rowRes.theirs[alignedCol - 1] ?? null);
+              continue;
+            }
+            mergedRow.push(null);
             continue;
           }
-          // Otherwise get from ours/theirs raw data
+          if (shouldInsertRow) {
+            if (op?.action === 'insert' && op.values) {
+              mergedRow.push(op.values[alignedCol - 1] ?? null);
+              continue;
+            }
+            if (rowRes?.theirs) {
+              mergedRow.push(rowRes.theirs[alignedCol - 1] ?? rowRes.base?.[alignedCol - 1] ?? null);
+              continue;
+            }
+          }
+          if (shouldPreviewTheirsRowInSimpleMerge && rowRes?.theirs) {
+            mergedRow.push(rowRes.theirs[alignedCol - 1] ?? null);
+            continue;
+          }
           if (op?.action === 'insert' && op.values) {
-            // IMPORTANT: 用 alignedCol 索引而非循环索引 i——effectiveColMap 会跳过已删除的列和未插入的 theirs-only 列，
-            // 但 op.values 始终按原始 aligned 列顺序排列，所以必须用 alignedCol - 1 取值。
             mergedRow.push(op.values[alignedCol - 1] ?? null);
-          } else if (colMeta?.oursCol && rowRes.ours) {
+          } else if (colMeta?.oursCol && rowRes?.ours) {
             mergedRow.push(rowRes.ours[alignedCol - 1] ?? null);
-          } else if (colMeta?.theirsCol && rowRes.theirs) {
-            // For theirs-only columns that are being inserted
+          } else if (colMeta?.theirsCol && rowRes?.theirs) {
             mergedRow.push(rowRes.theirs[alignedCol - 1] ?? null);
           } else {
             mergedRow.push(null);
           }
         }
-        mergedRows.push(mergedRow);
-        mergedVisuals.push(visualRowNumber);
+        return mergedRow;
+      };
+      const buildAlignedRowFromOursPhysical = (physicalRowNumber: number) => {
+        const rawRow = fullOursRows[physicalRowNumber - 1] ?? [];
+        const mergedRow: (string | number | null)[] = [];
+        for (let i = 0; i < effectiveColMap.length; i += 1) {
+          const alignedCol = effectiveColMap[i].alignedCol;
+          const colMeta = columnsMetaMap.get(alignedCol);
+          const oursCol = colMeta?.oursCol ?? null;
+          mergedRow.push(oursCol ? rawRow[oursCol - 1] ?? null : null);
+        }
+        return mergedRow;
+      };
+      const mergedRows: (string | number | null)[][] = [];
+      const mergedVisuals: (number | null)[] = [];
+      const oursPhysicalToVisual = new Map<number, number>();
+      metas.forEach((meta) => {
+        if (meta.oursRowNumber) {
+          oursPhysicalToVisual.set(meta.oursRowNumber, meta.visualRowNumber);
+        }
       });
+      const pendingInsertVisualsByTargetRow = new Map<number, number[]>();
+      const deletedVisualRows = new Set<number>();
+      metas.forEach((meta) => {
+        const visualRowNumber = meta.visualRowNumber;
+        const op = currentRowOps.get(visualRowNumber);
+        const oursMissing = !meta.oursRowNumber;
+        const shouldInsertRow = op?.action === 'insert' || (!op && shouldAutoInsertMergeRow(meta, compareMode));
+        const shouldPreviewSimpleMergeMissingRow =
+          compareMode === 'simple-merge' && oursMissing && !!meta.theirsRowNumber;
+        if (oursMissing) {
+          if (!shouldInsertRow && !shouldPreviewSimpleMergeMissingRow) return;
+          const targetRowNumber = op?.targetRowNumber ?? computeInsertTargetRowNumberFromRowsMeta(metas, visualRowNumber);
+          const list = pendingInsertVisualsByTargetRow.get(targetRowNumber) ?? [];
+          list.push(visualRowNumber);
+          pendingInsertVisualsByTargetRow.set(targetRowNumber, list);
+          return;
+        }
+        if (op?.action === 'delete') {
+          deletedVisualRows.add(visualRowNumber);
+        }
+      });
+      pendingInsertVisualsByTargetRow.forEach((list) => list.sort((a, b) => a - b));
+      const pushInsertedRowsAtTarget = (targetRowNumber: number) => {
+        const visualRows = pendingInsertVisualsByTargetRow.get(targetRowNumber) ?? [];
+        visualRows.forEach((visualRowNumber) => {
+          const rowMeta = rowsMetaMap.get(visualRowNumber);
+          if (!rowMeta) return;
+          const rowRes = rowResultsMap.get(visualRowNumber);
+          const op = currentRowOps.get(visualRowNumber);
+          mergedRows.push(buildMergedRowFromVisual(visualRowNumber, rowMeta, rowRes, op));
+          mergedVisuals.push(visualRowNumber);
+        });
+      };
+      const physicalOursRowCount = fullOursRows.length;
+      if (physicalOursRowCount === 0) {
+        pushInsertedRowsAtTarget(1);
+      }
+      for (let physicalRowNumber = 1; physicalRowNumber <= physicalOursRowCount; physicalRowNumber += 1) {
+        pushInsertedRowsAtTarget(physicalRowNumber);
+        const visualRowNumber = oursPhysicalToVisual.get(physicalRowNumber) ?? null;
+        if (visualRowNumber == null) {
+          mergedRows.push(buildAlignedRowFromOursPhysical(physicalRowNumber));
+          mergedVisuals.push(null);
+          continue;
+        }
+        if (deletedVisualRows.has(visualRowNumber)) {
+          continue;
+        }
+        const rowMeta = rowsMetaMap.get(visualRowNumber);
+        if (!rowMeta) {
+          mergedRows.push(buildAlignedRowFromOursPhysical(physicalRowNumber));
+          mergedVisuals.push(null);
+          continue;
+        }
+        const rowRes = rowResultsMap.get(visualRowNumber);
+        const op = currentRowOps.get(visualRowNumber);
+        mergedRows.push(buildMergedRowFromVisual(visualRowNumber, rowMeta, rowRes, op));
+        mergedVisuals.push(visualRowNumber);
+      }
+      pushInsertedRowsAtTarget(physicalOursRowCount + 1);
       while (mergedRows.length < minRows) {
         mergedRows.push(Array(colCount).fill(null));
         mergedVisuals.push(null);
@@ -3024,6 +3333,7 @@ export const App: React.FC = () => {
     currentColOps,
     mergeColumnsMeta,
     compareMode,
+    fullOursRows,
     nextDebugRequestId,
   ]);
 
@@ -3076,35 +3386,35 @@ export const App: React.FC = () => {
     const row = rowIndex + 1;
     const col = colIndex + 1;
     const resolvedSet = resolvedBySheet.get(selectedMergeSheetIndex) ?? new Set<string>();
-    const isUnresolvedMergeConflict = mergeCells.some(
+    const isAttentionTarget = mergeCells.some(
       (cell) =>
         cell.row === row &&
         cell.col === col &&
-        isUnresolvedUserConflict(cell, resolvedSet),
+        isMergeAttentionCell(cell, resolvedSet, cliInfo?.mode === 'merge'),
     );
-    if (isUnresolvedMergeConflict) {
+    if (isAttentionTarget) {
       lastMergeConflictNavRef.current = {
         sheetIndex: selectedMergeSheetIndex,
         row,
         col,
       };
     }
-  }, [mergeCells, resolvedBySheet, selectedMergeSheetIndex]);
+  }, [cliInfo?.mode, mergeCells, resolvedBySheet, selectedMergeSheetIndex]);
   const handleJumpToNextMergeConflict = useCallback(() => {
-    if (mergeUnresolvedConflicts.length === 0) return;
+    if (mergeAttentionTargets.length === 0) return;
     const cursor = lastMergeConflictNavRef.current;
     const nextConflict =
       (cursor
-        ? mergeUnresolvedConflicts.find(
+        ? mergeAttentionTargets.find(
             (cell) =>
               cell.sheetIndex > cursor.sheetIndex ||
               (cell.sheetIndex === cursor.sheetIndex &&
                 (cell.row > cursor.row || (cell.row === cursor.row && cell.col > cursor.col))),
           )
         : undefined) ??
-      mergeUnresolvedConflicts.find((cell) => cell.sheetIndex === selectedMergeSheetIndex) ??
-      mergeUnresolvedConflicts.find((cell) => cell.sheetIndex > selectedMergeSheetIndex) ??
-      mergeUnresolvedConflicts[0];
+      mergeAttentionTargets.find((cell) => cell.sheetIndex === selectedMergeSheetIndex) ??
+      mergeAttentionTargets.find((cell) => cell.sheetIndex > selectedMergeSheetIndex) ??
+      mergeAttentionTargets[0];
 
     if (!nextConflict) return;
     lastMergeConflictNavRef.current = {
@@ -3118,15 +3428,15 @@ export const App: React.FC = () => {
     });
   }, [
     activateMergeSheet,
-    mergeUnresolvedConflicts,
+    mergeAttentionTargets,
     selectedMergeSheetIndex,
   ]);
   const handleJumpToPreviousMergeConflict = useCallback(() => {
-    if (mergeUnresolvedConflicts.length === 0) return;
+    if (mergeAttentionTargets.length === 0) return;
     const cursor = lastMergeConflictNavRef.current;
     const previousConflict =
       (cursor
-        ? [...mergeUnresolvedConflicts]
+        ? [...mergeAttentionTargets]
             .reverse()
             .find(
               (cell) =>
@@ -3135,9 +3445,9 @@ export const App: React.FC = () => {
                   (cell.row < cursor.row || (cell.row === cursor.row && cell.col < cursor.col))),
             )
         : undefined) ??
-      [...mergeUnresolvedConflicts].reverse().find((cell) => cell.sheetIndex === selectedMergeSheetIndex) ??
-      [...mergeUnresolvedConflicts].reverse().find((cell) => cell.sheetIndex < selectedMergeSheetIndex) ??
-      mergeUnresolvedConflicts[mergeUnresolvedConflicts.length - 1];
+      [...mergeAttentionTargets].reverse().find((cell) => cell.sheetIndex === selectedMergeSheetIndex) ??
+      [...mergeAttentionTargets].reverse().find((cell) => cell.sheetIndex < selectedMergeSheetIndex) ??
+      mergeAttentionTargets[mergeAttentionTargets.length - 1];
 
     if (!previousConflict) return;
     lastMergeConflictNavRef.current = {
@@ -3151,7 +3461,7 @@ export const App: React.FC = () => {
     });
   }, [
     activateMergeSheet,
-    mergeUnresolvedConflicts,
+    mergeAttentionTargets,
     selectedMergeSheetIndex,
   ]);
   const updateRowOpForSheet = useCallback(
@@ -3200,32 +3510,25 @@ export const App: React.FC = () => {
     [mergeColumnsMeta],
   );
   const computeInsertTargetRowNumber = useCallback(
-    (visualRowNumber: number) => {
-      const list = [...mergeRowsMeta].sort((a, b) => a.visualRowNumber - b.visualRowNumber);
-      const idx = list.findIndex((m) => m.visualRowNumber === visualRowNumber);
-      if (idx < 0) return 1;
-      for (let i = idx - 1; i >= 0; i -= 1) {
-        const r = list[i].oursRowNumber;
-        if (r) return r + 1;
-      }
-      for (let i = idx + 1; i < list.length; i += 1) {
-        const r = list[i].oursRowNumber;
-        if (r) return r;
-      }
-      return 1;
-    },
+    (visualRowNumber: number) => computeInsertTargetRowNumberFromRowsMeta(mergeRowsMeta, visualRowNumber),
     [mergeRowsMeta],
   );
-  const buildMergedRowValues = useCallback(
-    async (visualRowNumber: number, rowMeta: MergeRowMeta) => {
+  const buildMergedRowValuesForSheet = useCallback(
+    async (
+      sheetIndex: number,
+      sheetName: string,
+      visualRowNumber: number,
+      rowMeta: MergeRowMeta,
+      cellsByRow: Map<number, MergeCell[]>,
+    ) => {
       if (!mergeInfo) return null;
       const result = await window.excelAPI.getThreeWayRow({
         basePath: mergeInfo.basePath,
         oursPath: mergeInfo.oursPath,
         theirsPath: mergeInfo.theirsPath,
         compareMode,
-        sheetName: mergeInfo.sheetName,
-        sheetIndex: selectedMergeSheetIndex,
+        sheetName,
+        sheetIndex,
         frozenRowCount: COMPARE_HEADER_ROW_COUNT,
         rowNumber: visualRowNumber,
         baseRowNumber: rowMeta.baseRowNumber ?? null,
@@ -3243,7 +3546,7 @@ export const App: React.FC = () => {
       if (mergedRow.length < colCount) {
         mergedRow.push(...Array(colCount - mergedRow.length).fill(null));
       }
-      const diffCells = mergeCellsByRow.get(visualRowNumber) ?? [];
+      const diffCells = cellsByRow.get(visualRowNumber) ?? [];
       diffCells.forEach((cell) => {
         if (cell.col >= 1 && cell.col <= colCount) {
           mergedRow[cell.col - 1] = cell.mergedValue ?? null;
@@ -3251,7 +3554,18 @@ export const App: React.FC = () => {
       });
       return mergedRow;
     },
-    [mergeInfo, selectedMergeSheetIndex, mergeCellsByRow, compareMode],
+    [mergeInfo, compareMode],
+  );
+  const buildMergedRowValues = useCallback(
+    async (visualRowNumber: number, rowMeta: MergeRowMeta) =>
+      await buildMergedRowValuesForSheet(
+        selectedMergeSheetIndex,
+        mergeInfo?.sheetName ?? '',
+        visualRowNumber,
+        rowMeta,
+        mergeCellsByRow,
+      ),
+    [buildMergedRowValuesForSheet, mergeCellsByRow, mergeInfo?.sheetName, selectedMergeSheetIndex],
   );
 
   /**
@@ -3288,6 +3602,7 @@ export const App: React.FC = () => {
   const handleApplyMergeChoice = useCallback(
     (source: 'base' | 'ours' | 'theirs') => {
       if (!selectedMergeCell) return;
+      if (compareMode === 'simple-merge' && source === 'base') return;
 
       const { rowIndex, colIndex } = selectedMergeCell;
       const rowNumber = rowIndex + 1;
@@ -3335,7 +3650,7 @@ export const App: React.FC = () => {
         ),
       );
     },
-    [selectedMergeCell, selectedMergeSheetIndex, markResolvedKeys, mergeCells, pushMergeUndoSnapshot],
+    [compareMode, selectedMergeCell, selectedMergeSheetIndex, markResolvedKeys, mergeCells, pushMergeUndoSnapshot],
   );
 
   const handleApplyMergeRowChoice = useCallback(
@@ -3646,6 +3961,7 @@ export const App: React.FC = () => {
   const handleApplyMergeCellsChoice = useCallback(
     (keys: { rowNumber: number; colNumber: number }[], source: 'base' | 'ours' | 'theirs') => {
       if (!keys.length) return;
+      if (compareMode === 'simple-merge' && source === 'base') return;
       const valueFrom = (cell: MergeCell) =>
         source === 'base' ? cell.baseValue : source === 'ours' ? cell.oursValue : cell.theirsValue;
       const filtered = keys.filter((k) => {
@@ -3691,7 +4007,7 @@ export const App: React.FC = () => {
         ),
       );
     },
-    [selectedMergeSheetIndex, markResolvedKeys, mergeCells, pushMergeUndoSnapshot],
+    [compareMode, selectedMergeSheetIndex, markResolvedKeys, mergeCells, pushMergeUndoSnapshot],
   );
 
   /**
@@ -3773,7 +4089,49 @@ export const App: React.FC = () => {
       return map;
     };
 
-    const rowOps = Array.from(mergeRowOpsBySheet.entries()).flatMap(([sheetIndex, opsMap]) => {
+    const effectiveRowOpsEntries = await Promise.all(
+      mergeSheets.map(async (sheet, sheetIndex) => {
+        if (!sheet) return [sheetIndex, []] as const;
+        const explicitOpsMap = mergeRowOpsBySheet.get(sheetIndex) ?? new Map<number, SaveMergeRowOp>();
+        const explicitOps = Array.from(explicitOpsMap.values());
+        const autoInsertMetas = (sheet.rowsMeta ?? []).filter(
+          (rowMeta) => shouldAutoInsertMergeRow(rowMeta, compareMode) && !explicitOpsMap.has(rowMeta.visualRowNumber),
+        );
+        if (autoInsertMetas.length === 0) {
+          return [sheetIndex, explicitOps] as const;
+        }
+        const cellsByRow = new Map<number, MergeCell[]>();
+        (sheet.cells ?? []).forEach((cell) => {
+          const list = cellsByRow.get(cell.row) ?? [];
+          list.push(cell);
+          cellsByRow.set(cell.row, list);
+        });
+        const autoInsertOps: SaveMergeRowOp[] = [];
+        for (const rowMeta of autoInsertMetas) {
+          const values = await buildMergedRowValuesForSheet(
+            sheetIndex,
+            sheet.sheetName,
+            rowMeta.visualRowNumber,
+            rowMeta,
+            cellsByRow,
+          );
+          if (!values) continue;
+          autoInsertOps.push({
+            sheetName: sheet.sheetName,
+            action: 'insert',
+            targetRowNumber: computeInsertTargetRowNumberFromRowsMeta(
+              sheet.rowsMeta ?? [],
+              rowMeta.visualRowNumber,
+            ),
+            values,
+            visualRowNumber: rowMeta.visualRowNumber,
+          });
+        }
+        return [sheetIndex, [...explicitOps, ...autoInsertOps]] as const;
+      }),
+    );
+    const rowOps = effectiveRowOpsEntries.flatMap(([sheetIndex, ops]) => {
+      if (ops.length === 0) return [];
       const sheet = mergeSheets[sheetIndex];
       const sheetName = sheet?.sheetName ?? mergeInfo.sheetName;
       const colsMeta = sheet?.columnsMeta ?? [];
@@ -3781,7 +4139,7 @@ export const App: React.FC = () => {
       // 将 row op 的 values 从 aligned 列空间重映射到物理列空间，
       // 跳过 theirs-only 列（除非用户选择了插入）和已删除的列。
       const colMap = colsMeta.length > 0 ? buildPhysicalColMap(colsMeta, colOpsForSheet) : null;
-      return Array.from(opsMap.values()).map((op) => ({
+      return ops.map((op) => ({
         ...op,
         sheetName: op.sheetName || sheetName,
         values: op.values && colMap
@@ -3836,6 +4194,8 @@ export const App: React.FC = () => {
       alert(`保存合并结果失败：${String(e)}`);
     }
   }, [
+    buildMergedRowValuesForSheet,
+    compareMode,
     mergeInfo,
     mergeSheets,
     mergeRowOpsBySheet,
@@ -3923,12 +4283,10 @@ export const App: React.FC = () => {
       } else if (mergeCell.status === 'conflict') {
         style.backgroundColor = '#fff3e0';
         style.boxShadow = 'inset 0 0 0 2px #ff8a00';
-      } else if (mergeCell.status === 'both-changed-same') {
-        style.backgroundColor = '#f5f5f5';
-      } else if (mergeCell.status === 'ours-changed') {
-        style.backgroundColor = '#e9f8e9';
-      } else if (mergeCell.status === 'theirs-changed') {
-        style.backgroundColor = '#ffe9e9';
+      } else if (mergeCell.status !== 'unchanged') {
+        style.backgroundColor = '#b9d7ff';
+        style.borderLeft = '3px solid #1d4ed8';
+        style.boxShadow = 'inset 0 0 0 2px #1d4ed8';
       }
     }
     if (selectedMergeCell) {
@@ -4330,59 +4688,6 @@ export const App: React.FC = () => {
         </div>
       )}
 
-      {hasActiveWorkspace && mode === 'merge' && hasMergeData && mergeInfo && (
-        <div
-          style={{
-            marginBottom: 12,
-            display: 'flex',
-            alignItems: 'center',
-            gap: 10,
-            flexWrap: 'wrap',
-            border: '1px solid #dbe3ef',
-            borderRadius: 10,
-            padding: '10px 12px',
-            backgroundColor: '#f8fafc',
-          }}
-        >
-          <button onClick={handleSaveMergeToFile}>
-            {cliInfo?.mode === 'merge'
-              ? '将合并结果写回 Git 合并文件（MERGED，解决冲突）'
-              : cliInfo?.mode === 'diff'
-                ? '将合并结果覆盖 ours（当前分支）文件'
-                : '保存合并结果为新的 Excel 文件（以 ours 为格式模板）'}
-          </button>
-          <div
-            style={{
-              minWidth: 280,
-              maxWidth: '100%',
-              display: 'grid',
-              gap: 2,
-              flex: '1 1 420px',
-            }}
-          >
-            <span style={{ fontSize: 12, color: '#555' }}>
-              {mergedPath
-                ? '目标文件'
-                : cliInfo?.mode === 'merge' && cliInfo?.mergedPathRaw
-                  ? '目标文件（Git 相对路径）'
-                  : '目标文件（保存时选择）'}
-            </span>
-            <span
-              title={mergeSaveTargetLabel}
-              style={{
-                fontSize: 12,
-                color: '#111827',
-                whiteSpace: 'nowrap',
-                overflow: 'hidden',
-                textOverflow: 'ellipsis',
-              }}
-            >
-              {mergeSaveTargetLabel}
-            </span>
-          </div>
-        </div>
-      )}
-
       {!hasActiveWorkspace ? (
         <div
           style={{
@@ -4594,73 +4899,134 @@ export const App: React.FC = () => {
         <div
           style={{
             marginBottom: 12,
-            padding: 12,
-            border: '1px solid #dcdcdc',
-            borderRadius: 10,
-            display: 'grid',
-            gap: 8,
+            display: 'flex',
+            gap: 12,
+            flexWrap: 'wrap',
             flexShrink: 0,
           }}
         >
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-            <div style={{ fontSize: 12, color: '#555' }}>文件选择（支持直接粘贴路径）</div>
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                <div
-                  style={{
-                    width: 160,
-                    height: 8,
-                    borderRadius: 999,
-                    border: '1px solid #cbd5e1',
-                    backgroundColor: '#eef2f7',
-                    overflow: 'hidden',
-                  }}
-                >
+          <div
+            style={{
+              flex: '1 1 760px',
+              minWidth: 520,
+              padding: 12,
+              border: '1px solid #dcdcdc',
+              borderRadius: 10,
+              display: 'grid',
+              gap: 8,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+              <div style={{ fontSize: 12, color: '#555' }}>文件选择（支持直接粘贴路径）</div>
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
                   <div
                     style={{
-                      width: `${Math.max(0, Math.min(100, mergeAnalyzeProgress))}%`,
-                      height: '100%',
-                      backgroundColor: mergeAnalyzeInProgress ? '#2563eb' : '#94a3b8',
-                      transition: 'width 140ms linear',
+                      width: 160,
+                      height: 8,
+                      borderRadius: 999,
+                      border: '1px solid #cbd5e1',
+                      backgroundColor: '#eef2f7',
+                      overflow: 'hidden',
                     }}
-                  />
+                  >
+                    <div
+                    style={{
+                        width: `${mergeAnalyzeDisplayProgress}%`,
+                        height: '100%',
+                        backgroundColor: mergeAnalyzeBarColor,
+                        transition: 'width 140ms linear',
+                      }}
+                    />
+                  </div>
+                  <span style={{ fontSize: 11, color: '#64748b', width: 56, textAlign: 'right' }}>
+                    {mergeAnalyzeStatusLabel}
+                  </span>
                 </div>
-                <span style={{ fontSize: 11, color: '#64748b', width: 52, textAlign: 'right' }}>
-                  {mergeAnalyzeInProgress ? `${Math.round(mergeAnalyzeProgress)}%` : '待加载'}
-                </span>
-              </div>
-              <button type="button" onClick={() => void handleLoadMergeFromInputs()} disabled={mergeAnalyzeInProgress}>
-                {mergeAnalyzeInProgress ? '分析中...' : '加载'}
-              </button>
-              <button type="button" onClick={() => setMergeFileSelectorCollapsed((prev) => !prev)}>
-                {mergeFileSelectorCollapsed ? '展开' : '收起'}
-              </button>
-            </div>
-          </div>
-          {!mergeFileSelectorCollapsed &&
-            ([
-              ['basePath', 'base', '粘贴 base Excel 路径'],
-              ['oursPath', 'ours', '粘贴 ours Excel 路径'],
-              ['theirsPath', 'theirs', '粘贴 theirs Excel 路径'],
-            ] as const).map(([role, label, placeholder]) => (
-              <div key={role} style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
-                <span style={{ width: 72, fontSize: 12, color: '#555' }}>{label}</span>
-                <input
-                  value={mergePathInputs[role]}
-                  placeholder={placeholder}
-                  onChange={(e) =>
-                    setMergePathInputs((prev) => ({
-                      ...prev,
-                      [role]: e.target.value,
-                    }))
-                  }
-                  style={{ flex: 1, minWidth: 260, padding: '4px 6px', boxSizing: 'border-box' }}
-                />
-                <button type="button" onClick={() => handlePickMergeWorkbook(role)}>
-                  {`选择 ${label}`}
+                <button type="button" onClick={() => void handleLoadMergeFromInputs()} disabled={mergeAnalyzeInProgress}>
+                  {mergeAnalyzeInProgress ? '分析中...' : '加载'}
+                </button>
+                <button type="button" onClick={() => setMergeFileSelectorCollapsed((prev) => !prev)}>
+                  {mergeFileSelectorCollapsed ? '展开' : '收起'}
                 </button>
               </div>
-            ))}
+            </div>
+            {!mergeFileSelectorCollapsed &&
+              mergeInputRows.map(([role, label, placeholder]) => (
+                <div key={role} style={{ display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap' }}>
+                  <span style={{ width: 72, fontSize: 12, color: '#555' }}>{label}</span>
+                  <input
+                    value={mergePathInputs[role]}
+                    placeholder={placeholder}
+                    onChange={(e) => {
+                      if (!mergeAnalyzeInProgress) {
+                        setMergeAnalyzeStatus('idle');
+                        setMergeAnalyzeProgress(0);
+                      }
+                      setMergePathInputs((prev) => ({
+                        ...prev,
+                        [role]: e.target.value,
+                      }));
+                    }}
+                    style={{ flex: 1, minWidth: 260, padding: '4px 6px', boxSizing: 'border-box' }}
+                  />
+                  <button type="button" onClick={() => handlePickMergeWorkbook(role)}>
+                    {`选择 ${label}`}
+                  </button>
+                </div>
+              ))}
+          </div>
+          <div
+            style={{
+              flex: '1 1 440px',
+              minWidth: 360,
+              padding: 12,
+              border: '1px solid #dcdcdc',
+              borderRadius: 10,
+              display: 'grid',
+              gap: 8,
+            }}
+          >
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
+              <div style={{ fontSize: 12, color: '#555' }}>高级参数</div>
+              <button type="button" onClick={() => setMergeAdvancedCollapsed((prev) => !prev)}>
+                {mergeAdvancedCollapsed ? '展开' : '收起'}
+              </button>
+            </div>
+            {!mergeAdvancedCollapsed && (
+              <>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <span>merge 视图冻结行数:</span>
+                    <input
+                      type="number"
+                      min={0}
+                      value={mergeFrozenRowDraft}
+                      onChange={(e) => handleMergeFrozenRowDraftChange(e.target.value, 'merge')}
+                      style={{ width: 60, padding: '2px 6px', boxSizing: 'border-box' }}
+                    />
+                    <button type="button" onClick={applyMergeFrozenRowDraft} disabled={!canRefreshFrozenRows}>
+                      刷新
+                    </button>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                    <span>行相似度阈值:</span>
+                    <CommitNumberInput
+                      value={rowSimilarityThreshold}
+                      min={0}
+                      max={1}
+                      step={0.01}
+                      onCommit={(value) => setRowSimilarityThreshold(value)}
+                    />
+                    <span style={{ fontSize: 12, color: '#666' }}>（0~1，越大越严格）</span>
+                  </div>
+                  <span style={{ fontSize: 12, color: '#666' }}>当前冲突: {mergeRemainingCount}</span>
+                  <span style={{ fontSize: 12, color: '#666' }}>本表差异单元格: {mergeCells.length}</span>
+                </div>
+                {primaryKeyControl}
+              </>
+            )}
+          </div>
         </div>
       )}
 
@@ -4707,61 +5073,6 @@ export const App: React.FC = () => {
           )}
         </div>
       )}
-
-      {mode === 'merge' && (
-        <div
-          style={{
-            marginBottom: 12,
-            padding: 12,
-            border: '1px solid #dcdcdc',
-            borderRadius: 10,
-            display: 'grid',
-            gap: 8,
-            flexShrink: 0,
-          }}
-        >
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 8 }}>
-            <div style={{ fontSize: 12, color: '#555' }}>高级参数</div>
-            <button type="button" onClick={() => setMergeAdvancedCollapsed((prev) => !prev)}>
-              {mergeAdvancedCollapsed ? '展开' : '收起'}
-            </button>
-          </div>
-          {!mergeAdvancedCollapsed && (
-            <>
-              <div style={{ display: 'flex', alignItems: 'center', gap: 12, flexWrap: 'wrap' }}>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <span>merge 视图冻结行数:</span>
-                  <input
-                    type="number"
-                    min={0}
-                    value={mergeFrozenRowDraft}
-                    onChange={(e) => handleMergeFrozenRowDraftChange(e.target.value, 'merge')}
-                    style={{ width: 60, padding: '2px 6px', boxSizing: 'border-box' }}
-                  />
-                  <button type="button" onClick={applyMergeFrozenRowDraft} disabled={!canRefreshFrozenRows}>
-                    刷新
-                  </button>
-                </div>
-                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
-                  <span>行相似度阈值:</span>
-                  <CommitNumberInput
-                    value={rowSimilarityThreshold}
-                    min={0}
-                    max={1}
-                    step={0.01}
-                    onCommit={(value) => setRowSimilarityThreshold(value)}
-                  />
-                  <span style={{ fontSize: 12, color: '#666' }}>（0~1，越大越严格）</span>
-                </div>
-                <span style={{ fontSize: 12, color: '#666' }}>当前未解决冲突: {mergeRemainingCount}</span>
-                <span style={{ fontSize: 12, color: '#666' }}>本表差异单元格: {mergeCells.length}</span>
-              </div>
-              {primaryKeyControl}
-            </>
-          )}
-        </div>
-      )}
-
 
       {/* 主内容：表格 / 三方 Merge，占用剩余空间，由内部自己滚动 */}
       <div
@@ -4951,6 +5262,7 @@ export const App: React.FC = () => {
                     rowsMeta={mergeRowsMeta}
                     columnsMeta={mergeColumnsMeta}
                     sourceRows={mergeThreeWayRows}
+                    compareMode={compareMode}
                     layoutMode="grids-only"
                     selected={selectedMergeCell}
                     onSelectCell={handleSelectMergeCell}
@@ -4958,6 +5270,7 @@ export const App: React.FC = () => {
                     onApplyCellsChoice={handleApplyMergeCellsChoice}
                     onResolveCell={handleResolveMergeCell}
                     onApplyRowChoice={handleApplyMergeRowChoice}
+                    onApplyColumnChoice={handleApplyMergeColumnChoice}
                     onDeleteRow={handleDeleteMergeRow}
                     resolvedCellKeys={resolvedBySheet.get(selectedMergeSheetIndex)}
                     frozenRowCount={mergeFrozenRowCount}
@@ -4967,13 +5280,22 @@ export const App: React.FC = () => {
                     oursPath={mergeInfo?.oursPath ?? null}
                     theirsPath={mergeInfo?.theirsPath ?? null}
                     mergedPath={mergedPath}
+                    fullBaseRows={fullBaseRows}
+                    fullOursRows={fullOursRows}
+                    fullTheirsRows={fullTheirsRows}
+                    mergedPreviewRows={mergedPreviewRows}
+                    mergedPreviewRowVisuals={mergedPreviewRowVisuals}
+                    mergedPreviewAlignedCols={mergedPreviewAlignedCols}
+                    onSaveMergeResult={handleSaveMergeToFile}
+                    saveMergeResultLabel={mergeSaveButtonLabel}
                     remainingCount={mergeRemainingCount}
                     canUndo={mergeUndoStack.length > 0}
                     onUndo={handleUndoMergeAction}
-                    canJumpToPreviousConflict={mergeUnresolvedConflicts.length > 0}
+                    canJumpToPreviousConflict={mergeAttentionTargets.length > 0}
                     onJumpToPreviousConflict={handleJumpToPreviousMergeConflict}
-                    canJumpToNextConflict={mergeUnresolvedConflicts.length > 0}
+                    canJumpToNextConflict={mergeAttentionTargets.length > 0}
                     onJumpToNextConflict={handleJumpToNextMergeConflict}
+                    showTheirsChangedReviewFallback={cliInfo?.mode === 'merge'}
                   />
                 </div>
                 <div style={{ marginTop: 8, fontSize: 12, color: '#666', flexShrink: 0 }}>
@@ -4996,8 +5318,8 @@ export const App: React.FC = () => {
                     <div style={{ display: 'inline-flex', borderBottom: '1px solid #ccc', gap: 4, flexWrap: 'wrap' }}>
                       {mergeSheets.map((s, idx) => {
                         const isActive = idx === selectedMergeSheetIndex;
-                        const hasDiff =
-                          typeof s.hasExactDiff === 'boolean' ? s.hasExactDiff : (s.cells?.length ?? 0) > 0;
+                        const summary =
+                          mergeSheetSummaries[idx] ?? { diffCount: 0, conflictCount: 0 };
                         return (
                           <button
                             key={s.sheetName || idx}
@@ -5016,19 +5338,49 @@ export const App: React.FC = () => {
                               gap: 6,
                             }}
                           >
-                            {hasDiff && (
-                              <span
-                                title="该工作表有内容变动"
-                                style={{
-                                  width: 8,
-                                  height: 8,
-                                  backgroundColor: '#d32f2f',
-                                  borderRadius: 2,
-                                  display: 'inline-block',
-                                }}
-                              />
-                            )}
                             {s.sheetName || `Sheet${idx + 1}`}
+                            {summary.diffCount > 0 && (
+                              <span
+                                title={`该工作表有 ${summary.diffCount} 个差异单元格`}
+                                style={{
+                                  minWidth: 18,
+                                  height: 18,
+                                  padding: '0 6px',
+                                  borderRadius: 999,
+                                  backgroundColor: '#dbeafe',
+                                  color: '#1d4ed8',
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  fontSize: 11,
+                                  fontWeight: 700,
+                                  lineHeight: 1,
+                                }}
+                              >
+                                {summary.diffCount}
+                              </span>
+                            )}
+                            {isCliMergeMode && summary.conflictCount > 0 && (
+                              <span
+                                title={`该工作表有 ${summary.conflictCount} 个冲突`}
+                                style={{
+                                  minWidth: 18,
+                                  height: 18,
+                                  padding: '0 6px',
+                                  borderRadius: 999,
+                                  backgroundColor: '#ffedd5',
+                                  color: '#c2410c',
+                                  display: 'inline-flex',
+                                  alignItems: 'center',
+                                  justifyContent: 'center',
+                                  fontSize: 11,
+                                  fontWeight: 700,
+                                  lineHeight: 1,
+                                }}
+                              >
+                                !{summary.conflictCount}
+                              </span>
+                            )}
                           </button>
                         );
                       })}
@@ -5042,6 +5394,7 @@ export const App: React.FC = () => {
                   rowsMeta={mergeRowsMeta}
                   columnsMeta={mergeColumnsMeta}
                   sourceRows={mergeThreeWayRows}
+                  compareMode={compareMode}
                   layoutMode="panel-only"
                   selected={selectedMergeCell}
                   onSelectCell={handleSelectMergeCell}
@@ -5049,6 +5402,7 @@ export const App: React.FC = () => {
                   onApplyCellsChoice={handleApplyMergeCellsChoice}
                   onResolveCell={handleResolveMergeCell}
                   onApplyRowChoice={handleApplyMergeRowChoice}
+                  onApplyColumnChoice={handleApplyMergeColumnChoice}
                   onDeleteRow={handleDeleteMergeRow}
                   resolvedCellKeys={resolvedBySheet.get(selectedMergeSheetIndex)}
                   frozenRowCount={mergeFrozenRowCount}
@@ -5058,18 +5412,31 @@ export const App: React.FC = () => {
                   oursPath={mergeInfo?.oursPath ?? null}
                   theirsPath={mergeInfo?.theirsPath ?? null}
                   mergedPath={mergedPath}
+                  fullBaseRows={fullBaseRows}
+                  fullOursRows={fullOursRows}
+                  fullTheirsRows={fullTheirsRows}
+                  mergedPreviewRows={mergedPreviewRows}
+                  mergedPreviewRowVisuals={mergedPreviewRowVisuals}
+                  mergedPreviewAlignedCols={mergedPreviewAlignedCols}
+                  onSaveMergeResult={handleSaveMergeToFile}
+                  saveMergeResultLabel={mergeSaveButtonLabel}
                   remainingCount={mergeRemainingCount}
                   canUndo={mergeUndoStack.length > 0}
                   onUndo={handleUndoMergeAction}
-                  canJumpToPreviousConflict={mergeUnresolvedConflicts.length > 0}
+                  canJumpToPreviousConflict={mergeAttentionTargets.length > 0}
                   onJumpToPreviousConflict={handleJumpToPreviousMergeConflict}
-                  canJumpToNextConflict={mergeUnresolvedConflicts.length > 0}
+                  canJumpToNextConflict={mergeAttentionTargets.length > 0}
                   onJumpToNextConflict={handleJumpToNextMergeConflict}
+                  showTheirsChangedReviewFallback={cliInfo?.mode === 'merge'}
                 />
               </div>
             </div>
           ) : (
-            <div style={{ marginBottom: 12 }}>请先在上方选择 base / ours / theirs 三个 Excel 文件。</div>
+            <div style={{ marginBottom: 12 }}>
+              {isSimpleMergeMode
+                ? '请先在上方选择 ours / theirs 两个 Excel 文件。'
+                : '请先在上方选择 base / ours / theirs 三个 Excel 文件。'}
+            </div>
           )}
         </div>
       )}

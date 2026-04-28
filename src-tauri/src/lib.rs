@@ -50,13 +50,15 @@ fn serialize_for_script<T: Serialize>(value: &T) -> String {
 
 fn strip_outer_quotes(value: &str) -> String {
   let trimmed = value.trim();
-  let quoted_double = trimmed.starts_with('"') && trimmed.ends_with('"') && trimmed.len() >= 2;
-  let quoted_single = trimmed.starts_with('\'') && trimmed.ends_with('\'') && trimmed.len() >= 2;
-  if quoted_double || quoted_single {
-    trimmed[1..trimmed.len() - 1].to_string()
-  } else {
-    trimmed.to_string()
+  let quote_pairs = [('"', '"'), ('\'', '\''), ('“', '”'), ('‘', '’')];
+  for (start, end) in quote_pairs {
+    if trimmed.starts_with(start) && trimmed.ends_with(end) && trimmed.len() >= start.len_utf8() + end.len_utf8() {
+      let start_index = start.len_utf8();
+      let end_index = trimmed.len() - end.len_utf8();
+      return trimmed[start_index..end_index].trim().to_string();
+    }
   }
+  trimmed.to_string()
 }
 
 fn normalize_cli_path_text(value: &str) -> String {
@@ -75,7 +77,30 @@ fn is_excel_like_path_text(value: &str) -> bool {
   normalized.ends_with(".xlsx") || normalized.ends_with(".xlsm") || normalized.ends_with(".xls")
 }
 
+fn resolve_msys_tmp_path(value: &str) -> Option<String> {
+  let normalized = normalize_cli_path_text(value);
+  let lowercase = normalized.to_ascii_lowercase();
+  if lowercase != "/tmp" && !lowercase.starts_with("/tmp/") {
+    return None;
+  }
+
+  let mut temp_path = std::env::temp_dir();
+  let relative = normalized
+    .strip_prefix("/tmp")
+    .unwrap_or("")
+    .trim_start_matches('/');
+  for part in relative.split('/') {
+    if !part.is_empty() {
+      temp_path.push(part);
+    }
+  }
+  Some(temp_path.to_string_lossy().into_owned())
+}
+
 fn resolve_cli_path(current_dir: Option<&str>, value: &str) -> String {
+  if let Some(msys_temp_path) = resolve_msys_tmp_path(value) {
+    return msys_temp_path;
+  }
   let normalized = normalize_cli_path_text(value);
   let path = PathBuf::from(&normalized);
   if path.is_absolute() {
@@ -116,6 +141,24 @@ fn parse_cli_three_way_info(context: &ProcessContext) -> Option<CliThreeWayInfo>
 
   if candidate_args.len() < 3 {
     return None;
+  }
+
+  if candidate_args.len() == 3 {
+    let ours_path = resolve_cli_path(context.current_dir.as_deref(), &candidate_args[0]);
+    let theirs_path = resolve_cli_path(context.current_dir.as_deref(), &candidate_args[1]);
+    let merged_path_raw = Some(normalize_cli_path_text(&candidate_args[2]));
+    let merged_path = merged_path_raw
+      .as_deref()
+      .map(|value| resolve_cli_path(context.current_dir.as_deref(), value));
+
+    return Some(CliThreeWayInfo {
+      base_path: ours_path.clone(),
+      ours_path,
+      theirs_path,
+      merged_path,
+      merged_path_raw,
+      mode: "simple-merge".to_string(),
+    });
   }
 
   let base_path = resolve_cli_path(context.current_dir.as_deref(), &candidate_args[0]);

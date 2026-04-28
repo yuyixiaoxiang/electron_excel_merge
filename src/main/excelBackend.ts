@@ -8,7 +8,14 @@ import { exists, mkdir, readDir, readFile, readTextFile, stat, writeFile, writeT
 import { Command } from '@tauri-apps/plugin-shell';
 import { Workbook, Worksheet, Row, Cell, CellValue } from 'exceljs';
 import JSZip from 'jszip';
-import { ThreeWayCompareMode, classifyThreeWayCell, diffArraysToOps, getThreeWayRuntimeConfig } from './threeWayDiffCore';
+import {
+  ThreeWayCompareMode,
+  classifyThreeWayCell,
+  diffArraysToOps,
+  getThreeWayRuntimeConfig,
+  normalizeThreeWayCompareMode,
+  sameComparableCellValue,
+} from './threeWayDiffCore';
 import type {
   CliThreeWayInfo,
   DebugLogEntry,
@@ -842,8 +849,9 @@ const patchExcelJsLegacyCommentCompat = async () => {
  * CLI three-way merge arguments for git/Fork integration.
  *
  * 约定（以 Fork / git mergetool 为例）：
- *   - diff 模式:   app.exe OURS THEIRS
- *   - merge 模式:  app.exe BASE OURS THEIRS [MERGED]
+ *   - diff 模式:         app.exe OURS THEIRS
+ *   - simple merge 模式: app.exe OURS THEIRS MERGED
+ *   - 标准 merge 模式:   app.exe BASE OURS THEIRS [MERGED]
  *
  * 当带有mergedPath 时，保存结果会直接写回MERGED 文件：
  * 否则会回退到覆盖ours（当前分支工作区文件）。
@@ -854,15 +862,34 @@ interface CliThreeWayArgs {
   theirsPath: string;
   mergedPath?: string;
   mergedPathRaw?: string;
-  mode: 'diff' | 'merge';
+  mode: 'diff' | 'merge' | 'simple-merge';
 }
 
-const stripOuterQuotes = (s: string) => s.replace(/^"(.*)"$/, '$1').replace(/^'(.*)'$/, '$1');
+const isCliMergeMode = (mode: CliThreeWayArgs['mode'] | null | undefined): boolean =>
+  mode === 'merge' || mode === 'simple-merge';
+
+const stripOuterQuotes = (value: string): string => {
+  const trimmed = value.trim();
+  if (trimmed.length < 2) return trimmed;
+  const quotePairs: Array<readonly [string, string]> = [
+    ['"', '"'],
+    ["'", "'"],
+    ['“', '”'],
+    ['‘', '’'],
+  ];
+  for (const [start, end] of quotePairs) {
+    if (trimmed.startsWith(start) && trimmed.endsWith(end)) {
+      return trimmed.slice(start.length, trimmed.length - end.length).trim();
+    }
+  }
+  return trimmed;
+};
 const isExcelLikePathText = (value: string): boolean => {
   const normalized = normalizeCliPathText(value);
   const ext = path.extname(normalized).toLowerCase();
   return ext === '.xlsx' || ext === '.xlsm' || ext === '.xls';
 };
+const isMsysTempPathText = (value: string): boolean => /^\/tmp(?:\/|$)/i.test(stripOuterQuotes(value).trim());
 const normalizeCliPathText = (value: string): string => {
   const raw = stripOuterQuotes(value).trim();
   if (!raw) return raw;
@@ -871,6 +898,14 @@ const normalizeCliPathText = (value: string): string => {
     return `${msysDrivePathMatch[1].toUpperCase()}:\\${msysDrivePathMatch[2].replace(/\//g, '\\')}`;
   }
   return raw;
+};
+const resolveMsysTempPath = async (value: string): Promise<string | null> => {
+  const raw = stripOuterQuotes(value).trim();
+  if (!isMsysTempPathText(raw)) return null;
+  const tempRoot = normalizeWinPath(await tempDir());
+  const relative = raw.replace(/^\/tmp\/?/i, '');
+  if (!relative) return tempRoot;
+  return normalizeWinPath(`${tempRoot}${WIN_PATH_SEP}${toWinSlashes(relative)}`);
 };
 const getCliRelativePathRoots = (): string[] => {
   return [];
@@ -899,6 +934,8 @@ const getCliRelativePathRootsAsync = async (): Promise<string[]> => {
 const resolveCliInputPath = async (value: string): Promise<string> => {
   const normalized = normalizeCliPathText(value);
   if (!normalized) return normalized;
+  const msysTempPath = await resolveMsysTempPath(normalized);
+  if (msysTempPath) return msysTempPath;
   if (path.isAbsolute(normalized)) return path.normalize(normalized);
   const context = await getProcessContext();
   for (const root of await getCliRelativePathRootsAsync()) {
@@ -913,6 +950,8 @@ const resolveCliOutputPath = async (value: string | null | undefined): Promise<s
   if (!value) return undefined;
   const normalized = normalizeCliPathText(value);
   if (!normalized) return undefined;
+  const msysTempPath = await resolveMsysTempPath(normalized);
+  if (msysTempPath) return msysTempPath;
   if (path.isAbsolute(normalized)) return path.normalize(normalized);
   const context = await getProcessContext();
   for (const root of await getCliRelativePathRootsAsync()) {
@@ -951,6 +990,23 @@ const parseCliThreeWayArgs = async (): Promise<CliThreeWayArgs | null> => {
 
   if (candidateArgs.length < 3) {
     return null;
+  }
+
+  // 3 个参数，认为是 simple merge：OURS / THEIRS / MERGED
+  if (candidateArgs.length === 3) {
+    const [oursArg, theirsArg, mergedArg] = candidateArgs.map(normalizeCliPathText);
+    const oursPath = await resolveCliInputPath(oursArg);
+    const theirsPath = await resolveCliInputPath(theirsArg);
+    const mergedPathRaw = mergedArg || undefined;
+    const mergedPath = await resolveCliOutputPath(mergedPathRaw);
+    return {
+      basePath: oursPath,
+      oursPath,
+      theirsPath,
+      mergedPath,
+      mergedPathRaw,
+      mode: 'simple-merge',
+    };
   }
 
   const [baseArg, oursArg, theirsArg, mergedArg] = candidateArgs.map(normalizeCliPathText);
@@ -1618,6 +1674,8 @@ const buildHeaderRowRecord = (ws: any, rowNumber: number, colCount: number, prim
   };
 };
 
+const getWorksheetRowUpperBound = (ws: any): number => Math.max(ws?.rowCount ?? 0, ws?.actualRowCount ?? 0);
+
 /**
  * 从工作表中提取行记录（列对齐版本）。
  * 
@@ -1639,10 +1697,13 @@ const buildRowRecordsAligned = (
   alignedColumns: AlignedColumn[],
   primaryKeyColAligned: number,
   side: 'base' | 'ours' | 'theirs',
+  includeEmptyRows = false,
 ): RowRecord[] => {
   const rows: RowRecord[] = [];
   let index = 0;
-  ws.eachRow({ includeEmpty: false }, (row: any, rowNumber: number) => {
+  const maxRow = getWorksheetRowUpperBound(ws);
+  for (let rowNumber = 1; rowNumber <= maxRow; rowNumber += 1) {
+    const row = ws.getRow(rowNumber);
     const values: SimpleCellValue[] = [];
     const nonEmptyCols: number[] = [];
     // 按照对齐后的列顺序读取值
@@ -1660,14 +1721,14 @@ const buildRowRecordsAligned = (
       values.push(value);
       if (value !== null && value !== '') nonEmptyCols.push(i + 1);
     }
-    if (nonEmptyCols.length === 0) return;
+    if (nonEmptyCols.length === 0 && !includeEmptyRows) continue;
     const key =
       primaryKeyColAligned >= 1 && primaryKeyColAligned <= alignedColumns.length
         ? normalizeKeyValue(values[primaryKeyColAligned - 1])
         : null;
     rows.push({ rowNumber, index, values, nonEmptyCols, key });
     index += 1;
-  });
+  }
   return rows;
 };
 
@@ -1954,17 +2015,58 @@ const alignRowsByKey = (
 
   const matchedInOurs: Array<{ baseIndex: number; sideIndex: number }> = [];
   const matchedInTheirs: Array<{ baseIndex: number; sideIndex: number }> = [];
+  const pickNoKeyRowMatch = (
+    baseRow: RowRecord,
+    sideRows: RowRecord[],
+    matchedRows: Set<number>,
+  ): { row: RowRecord | null; ambiguous: boolean } => {
+    const candidates = sideRows.filter((row) => !matchedRows.has(row.index) && !row.key);
+    if (candidates.length === 0) {
+      return { row: null, ambiguous: false };
+    }
+
+    const baseToken = rowTokenOf(baseRow);
+    const exactMatches = candidates.filter((row) => rowTokenOf(row) === baseToken);
+    if (exactMatches.length > 0) {
+      exactMatches.sort((a, b) => Math.abs(a.index - baseRow.index) - Math.abs(b.index - baseRow.index));
+      return { row: exactMatches[0] ?? null, ambiguous: false };
+    }
+
+    const scored = candidates
+      .map((row) => ({ row, score: rowSimilarity(baseRow, row) }))
+      .filter((entry) => entry.score >= rowSimilarityThreshold)
+      .sort((a, b) => b.score - a.score);
+    const best = scored[0];
+    const second = scored[1];
+    if (!best) {
+      return { row: null, ambiguous: false };
+    }
+    if (second && best.score - second.score < 0.1) {
+      return { row: null, ambiguous: true };
+    }
+    return { row: best.row, ambiguous: false };
+  };
 
   const alignedBase: AlignedRow[] = baseRows.map((baseRow) => {
     const key = baseRow.key ?? null;
     if (!key) {
+      const oursFallback = pickNoKeyRowMatch(baseRow, oursRows, matchedOursRows);
+      const theirsFallback = pickNoKeyRowMatch(baseRow, theirsRows, matchedTheirsRows);
+      if (oursFallback.row) {
+        matchedOursRows.add(oursFallback.row.index);
+        matchedInOurs.push({ baseIndex: baseRow.index, sideIndex: oursFallback.row.index });
+      }
+      if (theirsFallback.row) {
+        matchedTheirsRows.add(theirsFallback.row.index);
+        matchedInTheirs.push({ baseIndex: baseRow.index, sideIndex: theirsFallback.row.index });
+      }
       return {
         base: baseRow,
-        ours: null,
-        theirs: null,
+        ours: oursFallback.row,
+        theirs: theirsFallback.row,
         key,
-        ambiguousOurs: true,
-        ambiguousTheirs: true,
+        ambiguousOurs: oursFallback.ambiguous,
+        ambiguousTheirs: theirsFallback.ambiguous,
       };
     }
 
@@ -2096,13 +2198,36 @@ const alignRowsByKey = (
   const addGapRows = (gapIndex: number) => {
     const oursGap = gapsOurs.get(gapIndex) ?? [];
     const theirsGap = gapsTheirs.get(gapIndex) ?? [];
+    const unmatchedTheirsByKey = new Map<string, RowRecord[]>();
+    const unmatchedTheirsWithoutKey: RowRecord[] = [];
+    for (const r of theirsGap) {
+      if (!r.key) {
+        unmatchedTheirsWithoutKey.push(r);
+        continue;
+      }
+      if (!unmatchedTheirsByKey.has(r.key)) unmatchedTheirsByKey.set(r.key, []);
+      unmatchedTheirsByKey.get(r.key)!.push(r);
+    }
     for (const r of oursGap) {
+      const sameKeyTheirs = r.key ? unmatchedTheirsByKey.get(r.key) ?? [] : [];
+      const matchedTheirs = sameKeyTheirs.shift() ?? null;
+      if (r.key && sameKeyTheirs.length === 0) unmatchedTheirsByKey.delete(r.key);
+      if (matchedTheirs) {
+        aligned.push({ ours: r, theirs: matchedTheirs, key: r.key, ambiguousOurs: false, ambiguousTheirs: false });
+        continue;
+      }
       const ambiguous = !r.key;
       aligned.push({ ours: r, key: r.key ?? null, ambiguousOurs: ambiguous });
     }
-    for (const r of theirsGap) {
+    for (const r of unmatchedTheirsWithoutKey) {
       const ambiguous = !r.key;
       aligned.push({ theirs: r, key: r.key ?? null, ambiguousTheirs: ambiguous });
+    }
+    for (const rows of unmatchedTheirsByKey.values()) {
+      for (const r of rows) {
+        const ambiguous = !r.key;
+        aligned.push({ theirs: r, key: r.key ?? null, ambiguousTheirs: ambiguous });
+      }
     }
   };
 
@@ -2392,6 +2517,385 @@ const alignRowsByContent = (
   return { aligned, ambiguousOurs: new Set(), ambiguousTheirs: new Set() };
 };
 
+const classifySimpleMergeCell = (
+  oursValue: string | number | null,
+  theirsValue: string | number | null,
+): { status: MergeCell['status']; mergedValue: string | number | null } => {
+  if (sameComparableCellValue(oursValue, theirsValue)) {
+    return { status: 'unchanged', mergedValue: oursValue ?? theirsValue };
+  }
+  return { status: 'conflict', mergedValue: oursValue };
+};
+
+const computeSimpleMergeRowStatuses = (
+  oursRow: RowRecord | null,
+  theirsRow: RowRecord | null,
+  ambiguousOurs: boolean | undefined,
+  ambiguousTheirs: boolean | undefined,
+): { oursStatus: RowStatus; theirsStatus: RowStatus } => {
+  if (ambiguousOurs || ambiguousTheirs) {
+    return {
+      oursStatus: ambiguousOurs ? 'ambiguous' : oursRow ? 'unchanged' : 'deleted',
+      theirsStatus: ambiguousTheirs ? 'ambiguous' : theirsRow ? 'unchanged' : 'deleted',
+    };
+  }
+  if (oursRow && theirsRow) {
+    const same = rowsEqual(oursRow, theirsRow);
+    return {
+      oursStatus: same ? 'unchanged' : 'modified',
+      theirsStatus: same ? 'unchanged' : 'modified',
+    };
+  }
+  if (oursRow && !theirsRow) {
+    return { oursStatus: 'added', theirsStatus: 'deleted' };
+  }
+  if (!oursRow && theirsRow) {
+    return { oursStatus: 'deleted', theirsStatus: 'added' };
+  }
+  return { oursStatus: 'unchanged', theirsStatus: 'unchanged' };
+};
+
+const buildSimpleMergeSheetWithRowAlign = (
+  oursWs: any,
+  theirsWs: any,
+  primaryKeyCol: number,
+  frozenRowCount: number,
+  rowSimilarityThreshold: number,
+): MergeSheetData => {
+  const sheetsEqualByCoordinate = (a: any, b: any) => {
+    const maxRow = Math.max(getWorksheetRowUpperBound(a), getWorksheetRowUpperBound(b));
+    const maxCol = Math.max(
+      (a?.actualColumnCount ?? 0) > 0 ? a.actualColumnCount : a?.columnCount ?? 0,
+      (b?.actualColumnCount ?? 0) > 0 ? b.actualColumnCount : b?.columnCount ?? 0,
+    );
+    for (let r = 1; r <= maxRow; r += 1) {
+      const rowA = a.getRow(r);
+      const rowB = b.getRow(r);
+      for (let c = 1; c <= maxCol; c += 1) {
+        const av = normalizeCellValue(getSimpleValueForMerge(rowA.getCell(c)?.value));
+        const bv = normalizeCellValue(getSimpleValueForMerge(rowB.getCell(c)?.value));
+        if (av !== bv) return false;
+      }
+    }
+    return true;
+  };
+  const detectKeyColByThreshold = (
+    rows: RowRecord[],
+    totalCols: number,
+    minCoverage: number,
+    minUniq: number,
+  ) => {
+    const total = rows.length;
+    if (total === 0) return null;
+    const minNonEmpty = Math.max(3, Math.floor(total * minCoverage));
+    let bestCol: number | null = null;
+    let bestScore = 0;
+    for (let col = 1; col <= totalCols; col += 1) {
+      let nonEmpty = 0;
+      const uniq = new Set<string>();
+      for (const row of rows) {
+        const v = normalizeKeyValue(row.values[col - 1] ?? null);
+        if (v == null) continue;
+        nonEmpty += 1;
+        uniq.add(v);
+      }
+      if (nonEmpty < minNonEmpty) continue;
+      const coverage = nonEmpty / total;
+      const uniqueness = uniq.size / Math.max(1, nonEmpty);
+      if (coverage < minCoverage || uniqueness < minUniq) continue;
+      const score = coverage * uniqueness;
+      if (score > bestScore) {
+        bestScore = score;
+        bestCol = col;
+      }
+    }
+    return bestCol;
+  };
+  const detectImplicitKeyCol = (rows: RowRecord[], totalCols: number) =>
+    detectKeyColByThreshold(rows, totalCols, 0.8, 0.9);
+  const detectWeakKeyCol = (rows: RowRecord[], totalCols: number) =>
+    detectKeyColByThreshold(rows, totalCols, 0.6, 0.9);
+  const detectHeaderKeyCol = (ws: any, totalCols: number, headerRows: number) => {
+    const maxHeader = Math.max(1, Math.min(Math.floor(headerRows), 3));
+    for (let r = 1; r <= maxHeader; r += 1) {
+      const row = ws.getRow(r);
+      for (let c = 1; c <= totalCols; c += 1) {
+        const raw = getSimpleValueForMerge(row.getCell(c)?.value);
+        if (raw == null) continue;
+        const text = String(raw).trim();
+        if (!text) continue;
+        if (/id/i.test(text) || /编号|主键/.test(text)) {
+          return c;
+        }
+      }
+    }
+    return null;
+  };
+  const applyKeyFromColumn = (rows: RowRecord[], col: number): RowRecord[] =>
+    rows.map((r) => ({
+      ...r,
+      key: col >= 1 ? normalizeKeyValue(r.values[col - 1] ?? null) : null,
+    }));
+
+  const rawColCount = Math.max(
+    oursWs?.actualColumnCount ?? oursWs?.columnCount ?? 0,
+    theirsWs?.actualColumnCount ?? theirsWs?.columnCount ?? 0,
+  );
+  const headerCount = resolveStructuredHeaderRowCount([oursWs, theirsWs], frozenRowCount);
+  const alignedColumns = buildAlignedColumns(oursWs, oursWs, theirsWs, headerCount);
+  const columnsMeta: MergeColumnMeta[] = alignedColumns.map((c, idx) => ({
+    col: idx + 1,
+    baseCol: null,
+    oursCol: c.oursCol ?? null,
+    theirsCol: c.theirsCol ?? null,
+  }));
+  const colCount = Math.max(alignedColumns.length, 0);
+  const useKey = primaryKeyCol >= 1 && primaryKeyCol <= rawColCount;
+  const shouldAutoDetectKey = primaryKeyCol < 0;
+  const mapRawToAligned = (rawCol: number, side: 'ours' | 'theirs'): number | null => {
+    if (rawCol < 1) return null;
+    const idx = alignedColumns.findIndex((c) => (side === 'ours' ? c.oursCol === rawCol : c.theirsCol === rawCol));
+    return idx >= 0 ? idx + 1 : null;
+  };
+  const keyColAligned = useKey ? mapRawToAligned(primaryKeyCol, 'ours') ?? -1 : -1;
+
+  const oursRowsForKeyDetection = buildRowRecordsAligned(oursWs, alignedColumns, keyColAligned, 'ours').filter(
+    (r) => r.rowNumber > headerCount,
+  );
+  const implicitKeyCol = shouldAutoDetectKey ? detectImplicitKeyCol(oursRowsForKeyDetection, colCount) : null;
+  const headerKeyColRaw =
+    shouldAutoDetectKey && implicitKeyCol == null ? detectHeaderKeyCol(oursWs, rawColCount, headerCount) : null;
+  const headerKeyCol = headerKeyColRaw ? mapRawToAligned(headerKeyColRaw, 'ours') : null;
+  const weakKeyCol =
+    shouldAutoDetectKey && implicitKeyCol == null && headerKeyCol == null
+      ? detectWeakKeyCol(oursRowsForKeyDetection, colCount)
+      : null;
+  const alignKeyCol = useKey ? keyColAligned ?? -1 : shouldAutoDetectKey ? implicitKeyCol ?? headerKeyCol ?? weakKeyCol ?? -1 : -1;
+  const includeEmptyAlignedRows = alignKeyCol < 1;
+  const oursRows = buildRowRecordsAligned(oursWs, alignedColumns, keyColAligned, 'ours', includeEmptyAlignedRows).filter(
+    (r) => r.rowNumber > headerCount,
+  );
+  const theirsRows = buildRowRecordsAligned(
+    theirsWs,
+    alignedColumns,
+    keyColAligned,
+    'theirs',
+    includeEmptyAlignedRows,
+  ).filter((r) => r.rowNumber > headerCount);
+  const primaryKeySource: PrimaryKeySource = useKey
+    ? alignKeyCol >= 1
+      ? 'manual'
+      : 'none'
+    : implicitKeyCol != null
+      ? 'auto-implicit'
+      : headerKeyCol != null
+        ? 'auto-header'
+        : weakKeyCol != null
+          ? 'auto-weak'
+          : 'none';
+  const primaryKeyAlignedCol = alignKeyCol >= 1 ? alignKeyCol : null;
+  const primaryKeyOursCol = primaryKeyAlignedCol ? alignedColumns[primaryKeyAlignedCol - 1]?.oursCol ?? null : null;
+
+  if (sheetsEqualByCoordinate(oursWs, theirsWs)) {
+    return {
+      sheetName: oursWs.name,
+      cells: [],
+      rowsMeta: [],
+      hasExactDiff: false,
+      columnsMeta,
+      primaryKeyAlignedCol,
+      primaryKeyOursCol,
+      primaryKeySource,
+    };
+  }
+
+  const alignedResult =
+    alignKeyCol >= 1
+      ? alignRowsByKey(
+          applyKeyFromColumn(oursRows, alignKeyCol),
+          applyKeyFromColumn(oursRows, alignKeyCol),
+          applyKeyFromColumn(theirsRows, alignKeyCol),
+          alignKeyCol,
+          rowSimilarityThreshold,
+        )
+      : alignRowsByContent(oursRows, theirsRows);
+  const aligned = alignedResult.aligned;
+
+  const rowsMeta: MergeRowMeta[] = [];
+  const metaKeyCol = alignKeyCol >= 1 ? alignKeyCol : keyColAligned;
+  for (let r = 1; r <= headerCount; r += 1) {
+    const oursRow = buildHeaderRowRecordAligned(oursWs, r, alignedColumns, metaKeyCol, 'ours');
+    const theirsRow = buildHeaderRowRecordAligned(theirsWs, r, alignedColumns, metaKeyCol, 'theirs');
+    const statuses = computeSimpleMergeRowStatuses(oursRow, theirsRow, false, false);
+    const similarity = rowSimilarity(oursRow, theirsRow);
+    rowsMeta.push({
+      visualRowNumber: r,
+      key: oursRow.key ?? theirsRow.key ?? null,
+      baseRowNumber: null,
+      oursRowNumber: r,
+      theirsRowNumber: r,
+      oursSimilarity: similarity,
+      theirsSimilarity: similarity,
+      oursStatus: statuses.oursStatus,
+      theirsStatus: statuses.theirsStatus,
+    });
+  }
+  aligned.forEach((row, idx) => {
+    const visualRowNumber = headerCount + idx + 1;
+    const oursRow = row.ours ?? row.base ?? null;
+    const theirsRow = row.theirs ?? null;
+    const statuses = computeSimpleMergeRowStatuses(oursRow, theirsRow, row.ambiguousOurs, row.ambiguousTheirs);
+    const similarity = oursRow && theirsRow ? rowSimilarity(oursRow, theirsRow) : null;
+    rowsMeta.push({
+      visualRowNumber,
+      key: alignKeyCol >= 1 ? row.key ?? oursRow?.key ?? theirsRow?.key ?? null : null,
+      baseRowNumber: null,
+      oursRowNumber: oursRow?.rowNumber ?? null,
+      theirsRowNumber: theirsRow?.rowNumber ?? null,
+      oursSimilarity: similarity,
+      theirsSimilarity: similarity,
+      oursStatus: statuses.oursStatus,
+      theirsStatus: statuses.theirsStatus,
+    });
+  });
+
+  const cells: MergeCell[] = [];
+  let hasExactDiff = false;
+
+  for (let r = 1; r <= headerCount; r += 1) {
+    const oursRow = buildHeaderRowRecordAligned(oursWs, r, alignedColumns, metaKeyCol, 'ours');
+    const theirsRow = buildHeaderRowRecordAligned(theirsWs, r, alignedColumns, metaKeyCol, 'theirs');
+    const cols = new Set<number>();
+    oursRow.nonEmptyCols.forEach((c) => cols.add(c));
+    theirsRow.nonEmptyCols.forEach((c) => cols.add(c));
+    for (const col of cols) {
+      const oursValue = oursRow.values[col - 1] ?? null;
+      const theirsValue = theirsRow.values[col - 1] ?? null;
+      const { status, mergedValue } = classifySimpleMergeCell(oursValue, theirsValue);
+      const colMeta = alignedColumns[col - 1];
+      const formulaControlled = isFormulaControlledMergeCell({
+        oursWs,
+        oursRowNumber: r,
+        oursColNumber: colMeta?.oursCol ?? null,
+        theirsWs,
+        theirsRowNumber: r,
+        theirsColNumber: colMeta?.theirsCol ?? null,
+      });
+      if (status !== 'unchanged') {
+        cells.push({
+          address: makeAddress(col, r),
+          row: r,
+          col,
+          baseCol: null,
+          oursCol: colMeta?.oursCol ?? null,
+          theirsCol: colMeta?.theirsCol ?? null,
+          formulaControlled,
+          baseValue: null,
+          oursValue,
+          theirsValue,
+          status,
+          mergedValue,
+        });
+        hasExactDiff = true;
+      }
+    }
+  }
+
+  aligned.forEach((row, visualIndex) => {
+    const visualRowNumber = headerCount + visualIndex + 1;
+    const oursRow = row.ours ?? row.base ?? null;
+    const theirsRow = row.theirs ?? null;
+    const cols = new Set<number>();
+    oursRow?.nonEmptyCols.forEach((c) => cols.add(c));
+    theirsRow?.nonEmptyCols.forEach((c) => cols.add(c));
+    if (cols.size === 0) return;
+    for (const col of cols) {
+      const oursValue = oursRow?.values[col - 1] ?? null;
+      const theirsValue = theirsRow?.values[col - 1] ?? null;
+      const { status, mergedValue } = classifySimpleMergeCell(oursValue, theirsValue);
+      const colMeta = alignedColumns[col - 1];
+      const formulaControlled = isFormulaControlledMergeCell({
+        oursWs,
+        oursRowNumber: oursRow?.rowNumber ?? null,
+        oursColNumber: colMeta?.oursCol ?? null,
+        theirsWs,
+        theirsRowNumber: theirsRow?.rowNumber ?? null,
+        theirsColNumber: colMeta?.theirsCol ?? null,
+      });
+      if (status !== 'unchanged') {
+        const addressRow = oursRow?.rowNumber ?? theirsRow?.rowNumber ?? visualRowNumber;
+        cells.push({
+          address: makeAddress(col, addressRow),
+          row: visualRowNumber,
+          col,
+          baseCol: null,
+          oursCol: colMeta?.oursCol ?? null,
+          theirsCol: colMeta?.theirsCol ?? null,
+          formulaControlled,
+          baseValue: null,
+          oursValue,
+          theirsValue,
+          status,
+          mergedValue,
+        });
+        hasExactDiff = true;
+      }
+    }
+  });
+
+  if (headerCount > 0 && cells.length > 0) {
+    const diffColumns = new Set<number>(cells.map((c) => c.col));
+    if (diffColumns.size > 0) {
+      const existing = new Set<string>(cells.map((c) => `${c.row}:${c.col}`));
+      for (let r = 1; r <= headerCount; r += 1) {
+        const oursRow = buildHeaderRowRecordAligned(oursWs, r, alignedColumns, metaKeyCol, 'ours');
+        const theirsRow = buildHeaderRowRecordAligned(theirsWs, r, alignedColumns, metaKeyCol, 'theirs');
+        for (const col of diffColumns) {
+          const key = `${r}:${col}`;
+          if (existing.has(key)) continue;
+          const colMeta = alignedColumns[col - 1];
+          const formulaControlled = isFormulaControlledMergeCell({
+            oursWs,
+            oursRowNumber: r,
+            oursColNumber: colMeta?.oursCol ?? null,
+            theirsWs,
+            theirsRowNumber: r,
+            theirsColNumber: colMeta?.theirsCol ?? null,
+          });
+          cells.push({
+            address: makeAddress(col, r),
+            row: r,
+            col,
+            baseCol: null,
+            oursCol: colMeta?.oursCol ?? null,
+            theirsCol: colMeta?.theirsCol ?? null,
+            formulaControlled,
+            baseValue: null,
+            oursValue: oursRow.values[col - 1] ?? null,
+            theirsValue: theirsRow.values[col - 1] ?? null,
+            status: 'unchanged',
+            mergedValue: oursRow.values[col - 1] ?? theirsRow.values[col - 1] ?? null,
+          });
+          existing.add(key);
+        }
+      }
+    }
+  }
+
+  cells.sort((a, b) => a.row - b.row || a.col - b.col);
+
+  return {
+    sheetName: oursWs.name,
+    cells,
+    rowsMeta,
+    hasExactDiff,
+    columnsMeta,
+    primaryKeyAlignedCol,
+    primaryKeyOursCol,
+    primaryKeySource,
+  };
+};
+
 const buildMergeSheetWithRowAlign = (
   baseWs: any,
   oursWs: any,
@@ -2417,7 +2921,7 @@ const buildMergeSheetWithRowAlign = (
     return true;
   };
   const getRowCount = (ws: any) =>
-    (ws?.actualRowCount ?? 0) > 0 ? ws.actualRowCount : ws?.rowCount ?? 0;
+    getWorksheetRowUpperBound(ws);
   const getColCount = (ws: any) =>
     (ws?.actualColumnCount ?? 0) > 0 ? ws.actualColumnCount : ws?.columnCount ?? 0;
   // note: hasExactDiff will be derived from visible diff cells (ours/theirs/conflict)
@@ -2505,22 +3009,46 @@ const buildMergeSheetWithRowAlign = (
   };
   const keyColAligned = useKey ? mapRawToAligned(primaryKeyCol, 'ours') ?? -1 : -1;
 
-  const baseRows = buildRowRecordsAligned(baseWsForAlign, alignedColumns, keyColAligned, 'base').filter(
+  const baseRowsForKeyDetection = buildRowRecordsAligned(baseWsForAlign, alignedColumns, keyColAligned, 'base').filter(
     (r) => r.rowNumber > headerCount,
   );
-  const oursRows = buildRowRecordsAligned(oursWs, alignedColumns, keyColAligned, 'ours').filter(
+  const oursRowsForKeyDetection = buildRowRecordsAligned(oursWs, alignedColumns, keyColAligned, 'ours').filter(
     (r) => r.rowNumber > headerCount,
   );
-  const theirsRows = buildRowRecordsAligned(theirsWs, alignedColumns, keyColAligned, 'theirs').filter(
+  const theirsRowsForKeyDetection = buildRowRecordsAligned(theirsWs, alignedColumns, keyColAligned, 'theirs').filter(
     (r) => r.rowNumber > headerCount,
   );
-  const implicitKeyCol = shouldAutoDetectKey ? detectImplicitKeyCol(baseRows, colCount) : null;
+  const implicitKeyCol = shouldAutoDetectKey ? detectImplicitKeyCol(baseRowsForKeyDetection, colCount) : null;
   const headerKeyColRaw =
     shouldAutoDetectKey && implicitKeyCol == null ? detectHeaderKeyCol(baseWsForAlign, rawColCount, headerCount) : null;
   const headerKeyCol = headerKeyColRaw ? mapRawToAligned(headerKeyColRaw, 'base') : null;
   const weakKeyCol =
-    shouldAutoDetectKey && implicitKeyCol == null && headerKeyCol == null ? detectWeakKeyCol(baseRows, colCount) : null;
+    shouldAutoDetectKey && implicitKeyCol == null && headerKeyCol == null
+      ? detectWeakKeyCol(baseRowsForKeyDetection, colCount)
+      : null;
   const alignKeyCol = useKey ? keyColAligned ?? -1 : shouldAutoDetectKey ? implicitKeyCol ?? headerKeyCol ?? weakKeyCol ?? -1 : -1;
+  const includeEmptyAlignedRows = compareMode === 'merge' && alignKeyCol < 1;
+  const baseRows = buildRowRecordsAligned(
+    baseWsForAlign,
+    alignedColumns,
+    keyColAligned,
+    'base',
+    includeEmptyAlignedRows,
+  ).filter((r) => r.rowNumber > headerCount);
+  const oursRows = buildRowRecordsAligned(
+    oursWs,
+    alignedColumns,
+    keyColAligned,
+    'ours',
+    includeEmptyAlignedRows,
+  ).filter((r) => r.rowNumber > headerCount);
+  const theirsRows = buildRowRecordsAligned(
+    theirsWs,
+    alignedColumns,
+    keyColAligned,
+    'theirs',
+    includeEmptyAlignedRows,
+  ).filter((r) => r.rowNumber > headerCount);
   const primaryKeySource: PrimaryKeySource = useKey
     ? alignKeyCol >= 1
       ? 'manual'
@@ -2937,8 +3465,9 @@ const buildMergeSheetsForWorkbooks = async (
     theirsPath: debugFileLabel(theirsPath),
   });
   // 复用缓存，避免每次调取重新 diff 时重复从磁盘读取
+  const effectiveBasePath = compareMode === 'simple-merge' ? oursPath : basePath;
   const [baseWb, oursWb, theirsWb] = await Promise.all([
-    loadWorkbookCached(basePath),
+    loadWorkbookCached(effectiveBasePath),
     loadWorkbookCached(oursPath),
     loadWorkbookCached(theirsPath),
   ]);
@@ -2979,15 +3508,23 @@ const buildMergeSheetsForWorkbooks = async (
     usedTheirsIdx.add(theirsHit.idx);
 
     mergeSheets.push(
-      buildMergeSheetWithRowAlign(
-        baseWs,
-        oursHit.ws,
-        theirsHit.ws,
-        primaryKeyCol,
-        frozenRowCount,
-        rowSimilarityThreshold,
-        compareMode,
-      ),
+      compareMode === 'simple-merge'
+        ? buildSimpleMergeSheetWithRowAlign(
+            oursHit.ws,
+            theirsHit.ws,
+            primaryKeyCol,
+            frozenRowCount,
+            rowSimilarityThreshold,
+          )
+        : buildMergeSheetWithRowAlign(
+            baseWs,
+            oursHit.ws,
+            theirsHit.ws,
+            primaryKeyCol,
+            frozenRowCount,
+            rowSimilarityThreshold,
+            compareMode,
+          ),
     );
   }
 
@@ -2999,15 +3536,23 @@ const buildMergeSheetsForWorkbooks = async (
     usedOursIdx.add(idx);
     usedTheirsIdx.add(idx);
     mergeSheets.push(
-      buildMergeSheetWithRowAlign(
-        baseList[idx],
-        oursList[idx],
-        theirsList[idx],
-        primaryKeyCol,
-        frozenRowCount,
-        rowSimilarityThreshold,
-        compareMode,
-      ),
+      compareMode === 'simple-merge'
+        ? buildSimpleMergeSheetWithRowAlign(
+            oursList[idx],
+            theirsList[idx],
+            primaryKeyCol,
+            frozenRowCount,
+            rowSimilarityThreshold,
+          )
+        : buildMergeSheetWithRowAlign(
+            baseList[idx],
+            oursList[idx],
+            theirsList[idx],
+            primaryKeyCol,
+            frozenRowCount,
+            rowSimilarityThreshold,
+            compareMode,
+          ),
     );
   }
 
@@ -3030,6 +3575,7 @@ const normalizeThreeWayResult = (
   basePath: string,
   oursPath: string,
   theirsPath: string,
+  compareMode: ThreeWayCompareMode,
   mergeSheets: MergeSheetData[],
 ) => {
   const emptySheet: MergeSheetData = { sheetName: '', cells: [], rowsMeta: [] };
@@ -3037,6 +3583,7 @@ const normalizeThreeWayResult = (
     basePath,
     oursPath,
     theirsPath,
+    compareMode,
     sheet: mergeSheets[0] ?? emptySheet,
     sheets: mergeSheets,
   };
@@ -3201,10 +3748,7 @@ const readWorkbookOpenResult = async (filePath: string) => {
       return String(raw);
     };
 
-    const maxRow =
-      (worksheet as any).actualRowCount && (worksheet as any).actualRowCount > 0
-        ? (worksheet as any).actualRowCount
-        : worksheet.rowCount;
+    const maxRow = getWorksheetRowUpperBound(worksheet);
     const maxCol =
       (worksheet as any).actualColumnCount && (worksheet as any).actualColumnCount > 0
         ? (worksheet as any).actualColumnCount
@@ -3409,10 +3953,7 @@ export const getSheetData = async (req: GetSheetDataRequest): Promise<SheetData 
   const ws = getWorksheetSafe(wb, req.sheetName, req.sheetIndex);
   if (!ws) return null;
 
-  const maxRow =
-    (ws as any).actualRowCount && (ws as any).actualRowCount > 0
-      ? (ws as any).actualRowCount
-      : ws.rowCount;
+  const maxRow = getWorksheetRowUpperBound(ws);
   const maxCol =
     (ws as any).actualColumnCount && (ws as any).actualColumnCount > 0
       ? (ws as any).actualColumnCount
@@ -3461,11 +4002,11 @@ const saveMergeResultInternal = async (
     };
     let targetPath: string | undefined = options?.targetPathOverride;
     const unresolvedCliMergedPath =
-      cliThreeWayArgs?.mode === 'merge' && cliThreeWayArgs.mergedPathRaw && !cliThreeWayArgs.mergedPath
+      isCliMergeMode(cliThreeWayArgs?.mode) && cliThreeWayArgs?.mergedPathRaw && !cliThreeWayArgs.mergedPath
         ? cliThreeWayArgs.mergedPathRaw
         : null;
 
-    if (!targetPath && cliThreeWayArgs && cliThreeWayArgs.mode === 'merge') {
+    if (!targetPath && cliThreeWayArgs && isCliMergeMode(cliThreeWayArgs.mode)) {
       // git / Fork merge 模式：
       //   - 如果 MERGED 能解析成绝对路径，则优先写回 MERGED；
       //   - 如果根本没传 MERGED，则回退覆盖 ours；
@@ -3527,7 +4068,7 @@ const saveMergeResultInternal = async (
             (ws as any).spliceColumns(colNumber, 1);
           } else {
             // fallback: manual delete by shifting cells left
-            const maxRow = ws?.actualRowCount ?? ws?.rowCount ?? 0;
+            const maxRow = getWorksheetRowUpperBound(ws);
             const maxCol = ws?.actualColumnCount ?? ws?.columnCount ?? 0;
             for (let r = 1; r <= maxRow; r += 1) {
               for (let c = colNumber; c < maxCol; c += 1) {
@@ -3551,10 +4092,7 @@ const saveMergeResultInternal = async (
             if (baseCol > delCol) baseCol -= 1;
           }
           const colNumber = baseCol + offset;
-          const maxRow = Math.max(
-            ws?.actualRowCount ?? ws?.rowCount ?? 0,
-            op.values?.length ?? 0,
-          );
+          const maxRow = Math.max(getWorksheetRowUpperBound(ws), op.values?.length ?? 0);
           const values: (string | number | null)[] = [];
           for (let i = 0; i < maxRow; i += 1) {
             values.push(op.values && i < op.values.length ? op.values[i] ?? null : null);
@@ -3734,7 +4272,7 @@ const saveMergeResultInternal = async (
     }
 
     // 如果是通过 git/Fork 的merge 模式启动，并且有明确的目标文件，尝试自动执行一次git add
-    if (cliThreeWayArgs && cliThreeWayArgs.mode === 'merge' && targetPath) {
+    if (cliThreeWayArgs && isCliMergeMode(cliThreeWayArgs.mode) && targetPath) {
       try {
         await gitAddFile(targetPath);
       } catch (e) {
@@ -3770,6 +4308,7 @@ export const openThreeWay = async (): Promise<ThreeWayOpenResult | null> => {
 
   if (cliThreeWayArgs) {
     const { basePath, oursPath, theirsPath, mode } = cliThreeWayArgs;
+    const compareMode = normalizeThreeWayCompareMode(mode);
     const { mergeSheets } = await buildMergeSheetsForWorkbooks(
       basePath,
       oursPath,
@@ -3777,9 +4316,9 @@ export const openThreeWay = async (): Promise<ThreeWayOpenResult | null> => {
       primaryKeyCol,
       frozenRowCount,
       rowSimilarityThreshold,
-      mode,
+      compareMode,
     );
-    return normalizeThreeWayResult(basePath, oursPath, theirsPath, mergeSheets);
+    return normalizeThreeWayResult(basePath, oursPath, theirsPath, compareMode, mergeSheets);
   }
 
   // 没有 CLI 参数时，回退到交互式选择文件的模式
@@ -3809,7 +4348,7 @@ export const openThreeWay = async (): Promise<ThreeWayOpenResult | null> => {
     'merge',
   );
 
-  return normalizeThreeWayResult(basePath, oursPath, theirsPath, mergeSheets);
+  return normalizeThreeWayResult(basePath, oursPath, theirsPath, 'merge', mergeSheets);
 };
 interface ThreeWayDiffRequest {
   basePath: string;
@@ -3827,7 +4366,7 @@ export const computeThreeWayDiff = async (req: ThreeWayDiffRequest): Promise<Thr
   const requestId = req.debugRequestId ?? `compute-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const startedAt = Date.now();
   const primaryKeyCol =
-    typeof req.primaryKeyCol === 'number' && !Number.isNaN(req.primaryKeyCol) ? Math.floor(req.primaryKeyCol) : 1;
+    typeof req.primaryKeyCol === 'number' && !Number.isNaN(req.primaryKeyCol) ? Math.floor(req.primaryKeyCol) : -1;
   const frozenRowCount =
     typeof req.frozenRowCount === 'number' && !Number.isNaN(req.frozenRowCount)
       ? Math.max(0, Math.floor(req.frozenRowCount))
@@ -3836,7 +4375,7 @@ export const computeThreeWayDiff = async (req: ThreeWayDiffRequest): Promise<Thr
     typeof req.rowSimilarityThreshold === 'number' && !Number.isNaN(req.rowSimilarityThreshold)
       ? Math.min(1, Math.max(0, req.rowSimilarityThreshold))
       : DEFAULT_ROW_SIMILARITY_THRESHOLD;
-  const compareMode: ThreeWayCompareMode = req.compareMode === 'diff' ? 'diff' : 'merge';
+  const compareMode = normalizeThreeWayCompareMode(req.compareMode);
   appendDebugLog('main', 'computeThreeWayDiff:start', {
     requestId,
     compareMode,
@@ -3863,7 +4402,7 @@ export const computeThreeWayDiff = async (req: ThreeWayDiffRequest): Promise<Thr
       sheetCount: mergeSheets.length,
       diffCellCount: mergeSheets.reduce((sum, sheet) => sum + (sheet.cells?.length ?? 0), 0),
     });
-    return normalizeThreeWayResult(req.basePath, req.oursPath, req.theirsPath, mergeSheets);
+    return normalizeThreeWayResult(req.basePath, req.oursPath, req.theirsPath, compareMode, mergeSheets);
   } catch (error: any) {
     appendDebugLog('main', 'computeThreeWayDiff:error', {
       requestId,
@@ -3956,6 +4495,19 @@ const normalizeSharedFormulas = (workbook: Workbook) => {
   });
 };
 
+const resolveRequestedRowNumber = (
+  value: number | null | undefined,
+  fallbackRow: number | null,
+): number | null => {
+  if (typeof value === 'number' && !Number.isNaN(value)) {
+    return Math.max(1, Math.floor(value));
+  }
+  if (value === null) {
+    return null;
+  }
+  return fallbackRow;
+};
+
 
 export const getThreeWayRow = async (req: ThreeWayRowRequest): Promise<ThreeWayRowResult | null> => {
   if (!req || !req.basePath || !req.oursPath || !req.theirsPath) return null;
@@ -3965,18 +4517,9 @@ export const getThreeWayRow = async (req: ThreeWayRowRequest): Promise<ThreeWayR
     typeof req.rowNumber === 'number' && !Number.isNaN(req.rowNumber)
       ? Math.max(1, Math.floor(req.rowNumber))
       : null;
-  const baseRowNumber =
-    typeof req.baseRowNumber === 'number' && !Number.isNaN(req.baseRowNumber)
-      ? Math.max(1, Math.floor(req.baseRowNumber))
-      : fallbackRow;
-  const oursRowNumber =
-    typeof req.oursRowNumber === 'number' && !Number.isNaN(req.oursRowNumber)
-      ? Math.max(1, Math.floor(req.oursRowNumber))
-      : fallbackRow;
-  const theirsRowNumber =
-    typeof req.theirsRowNumber === 'number' && !Number.isNaN(req.theirsRowNumber)
-      ? Math.max(1, Math.floor(req.theirsRowNumber))
-      : fallbackRow;
+  const baseRowNumber = resolveRequestedRowNumber(req.baseRowNumber, fallbackRow);
+  const oursRowNumber = resolveRequestedRowNumber(req.oursRowNumber, fallbackRow);
+  const theirsRowNumber = resolveRequestedRowNumber(req.theirsRowNumber, fallbackRow);
 
   const [baseWb, oursWb, theirsWb] = await Promise.all([
     loadWorkbookCached(req.basePath),
@@ -3994,7 +4537,7 @@ export const getThreeWayRow = async (req: ThreeWayRowRequest): Promise<ThreeWayR
       ? Math.max(0, Math.floor(req.frozenRowCount))
       : DEFAULT_FROZEN_HEADER_ROWS;
   const resolvedHeaderCount = resolveStructuredHeaderRowCount([baseWs, oursWs, theirsWs], headerCount);
-  const compareMode: ThreeWayCompareMode = req.compareMode === 'diff' ? 'diff' : 'merge';
+  const compareMode = normalizeThreeWayCompareMode(req.compareMode);
   const runtimeConfig = getThreeWayRuntimeConfig(compareMode);
   const baseWsForAlign = runtimeConfig.alignBaseSide === 'ours' ? oursWs : baseWs;
   const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, resolvedHeaderCount);
@@ -4075,7 +4618,7 @@ export const getThreeWayRows = async (req: ThreeWayRowsRequest): Promise<ThreeWa
       ? Math.max(0, Math.floor(req.frozenRowCount))
       : DEFAULT_FROZEN_HEADER_ROWS;
   const resolvedHeaderCount = resolveStructuredHeaderRowCount([baseWs, oursWs, theirsWs], headerCount);
-  const compareMode: ThreeWayCompareMode = req.compareMode === 'diff' ? 'diff' : 'merge';
+  const compareMode = normalizeThreeWayCompareMode(req.compareMode);
   const runtimeConfig = getThreeWayRuntimeConfig(compareMode);
   const baseWsForAlign = runtimeConfig.alignBaseSide === 'ours' ? oursWs : baseWs;
   const alignedColumns = buildAlignedColumns(baseWsForAlign, oursWs, theirsWs, resolvedHeaderCount);
@@ -4116,12 +4659,9 @@ export const getThreeWayRows = async (req: ThreeWayRowsRequest): Promise<ThreeWa
   const rows: ThreeWayRowResult[] = req.rows.map((r) => {
     const fallbackRow =
       typeof r.rowNumber === 'number' && !Number.isNaN(r.rowNumber) ? Math.max(1, Math.floor(r.rowNumber)) : null;
-    const baseRowNumber =
-      typeof r.baseRowNumber === 'number' && !Number.isNaN(r.baseRowNumber) ? Math.max(1, Math.floor(r.baseRowNumber)) : fallbackRow;
-    const oursRowNumber =
-      typeof r.oursRowNumber === 'number' && !Number.isNaN(r.oursRowNumber) ? Math.max(1, Math.floor(r.oursRowNumber)) : fallbackRow;
-    const theirsRowNumber =
-      typeof r.theirsRowNumber === 'number' && !Number.isNaN(r.theirsRowNumber) ? Math.max(1, Math.floor(r.theirsRowNumber)) : fallbackRow;
+    const baseRowNumber = resolveRequestedRowNumber(r.baseRowNumber, fallbackRow);
+    const oursRowNumber = resolveRequestedRowNumber(r.oursRowNumber, fallbackRow);
+    const theirsRowNumber = resolveRequestedRowNumber(r.theirsRowNumber, fallbackRow);
 
     return {
       sheetName: resolvedSheetName,

@@ -106,11 +106,12 @@ interface ThreeWayOpenResult {
   basePath: string;
   oursPath: string;
   theirsPath: string;
+  compareMode?: ThreeWayCompareMode;
   sheet: MergeSheetData; // 第一个 sheet
   sheets: MergeSheetData[];
 }
 
-type ThreeWayCompareMode = 'diff' | 'merge';
+type ThreeWayCompareMode = 'diff' | 'merge' | 'simple-merge';
 
 interface ThreeWayDiffRequest {
   basePath: string;
@@ -167,7 +168,7 @@ interface CliThreeWayInfo {
   theirsPath: string;
   mergedPath?: string;
   mergedPathRaw?: string;
-  mode: 'diff' | 'merge';
+  mode: 'diff' | 'merge' | 'simple-merge';
 }
 interface DebugLogEntry {
   source: string;

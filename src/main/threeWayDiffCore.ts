@@ -1,6 +1,6 @@
 import { diffArrays } from 'diff';
 
-export type ThreeWayCompareMode = 'diff' | 'merge';
+export type ThreeWayCompareMode = 'diff' | 'merge' | 'simple-merge';
 export type ComparableCellValue = string | number | null;
 export type MergeCellStatus = 'unchanged' | 'ours-changed' | 'theirs-changed' | 'both-changed-same' | 'conflict';
 export type DiffOp =
@@ -14,6 +14,12 @@ export interface ThreeWayRuntimeConfig {
   shortCircuitWhenOursEqualsTheirs: boolean;
 }
 
+export const normalizeThreeWayCompareMode = (compareMode: unknown): ThreeWayCompareMode => {
+  if (compareMode === 'diff') return 'diff';
+  if (compareMode === 'simple-merge') return 'simple-merge';
+  return 'merge';
+};
+
 export const normalizeComparableCellValue = (value: ComparableCellValue): string => {
   if (value === null || value === undefined) return '';
   if (typeof value === 'string') return value.trim();
@@ -26,6 +32,13 @@ export const sameComparableCellValue = (a: ComparableCellValue, b: ComparableCel
 
 export const getThreeWayRuntimeConfig = (compareMode: ThreeWayCompareMode): ThreeWayRuntimeConfig => {
   if (compareMode === 'diff') {
+    return {
+      alignBaseSide: 'ours',
+      useTwoWayContentAlignment: true,
+      shortCircuitWhenOursEqualsTheirs: true,
+    };
+  }
+  if (compareMode === 'simple-merge') {
     return {
       alignBaseSide: 'ours',
       useTwoWayContentAlignment: true,

@@ -275,6 +275,8 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
 
     const { rowIndex, colIndex } = target;
     const align = props.scrollToCellAlign ?? 'nearest';
+    const initialScrollLeft = el.scrollLeft;
+    const initialScrollTop = el.scrollTop;
 
     // 竖向：冻结行无需滚动
     if (rowIndex >= safeFrozenRowCount) {
@@ -317,8 +319,8 @@ export function VirtualGrid<Cell>(props: VirtualGridProps<Cell>) {
       }
     }
     // 有些环境下 programmatic scroll 不一定触发 scroll 事件，这里显式通知外部同步
-    if (props.onScrollXChange) props.onScrollXChange(el.scrollLeft);
-    if (props.onScrollYChange) props.onScrollYChange(el.scrollTop);
+    if (props.onScrollXChange && el.scrollLeft !== initialScrollLeft) props.onScrollXChange(el.scrollLeft);
+    if (props.onScrollYChange && el.scrollTop !== initialScrollTop) props.onScrollYChange(el.scrollTop);
   }, [
     props.scrollToCell,
     props.scrollToCellAlign,
