@@ -131,7 +131,7 @@ interface SaveMergeCellInput {
 }
 interface SaveMergeRowOp {
   sheetName: string;
-  action: 'insert' | 'delete';
+  action: 'insert' | 'delete' | 'skip-insert';
   targetRowNumber: number; // 1-based in template (ours)
   values?: (string | number | null)[];
   visualRowNumber?: number; // for stable ordering

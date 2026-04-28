@@ -3765,11 +3765,28 @@ export const App: React.FC = () => {
         });
         return;
       }
+      const canSkipInsertedRow =
+        existingOp?.action === 'insert' ||
+        (compareMode !== 'simple-merge' &&
+          !rowMeta.baseRowNumber &&
+          !rowMeta.oursRowNumber &&
+          !!rowMeta.theirsRowNumber);
+      if (canSkipInsertedRow) {
+        updateRowOpForSheet(selectedMergeSheetIndex, rowNumber, {
+          sheetName: mergeInfo.sheetName,
+          action: 'skip-insert',
+          targetRowNumber: computeInsertTargetRowNumber(rowNumber),
+          visualRowNumber: rowNumber,
+        });
+        return;
+      }
       if (existingOp) {
         updateRowOpForSheet(selectedMergeSheetIndex, rowNumber, null);
       }
     },
     [
+      compareMode,
+      computeInsertTargetRowNumber,
       currentRowOps,
       markResolvedKeys,
       mergeCells,
@@ -3957,6 +3974,44 @@ export const App: React.FC = () => {
       pushMergeUndoSnapshot,
     ],
   );
+  const handleDeleteMergeColumn = useCallback(
+    (colNumber: number) => {
+      const meta = mergeColumnsMeta.find((column) => column.col === colNumber) ?? null;
+      const existingOp = currentColOps.get(colNumber) ?? null;
+      if (!meta && !existingOp) return;
+
+      pushMergeUndoSnapshot();
+      const keys = mergeCells
+        .filter((cell) => cell.col === colNumber)
+        .map((cell) => `${cell.row}:${cell.col}`);
+      markResolvedKeys(selectedMergeSheetIndex, keys);
+
+      if (existingOp?.action === 'insert' && !meta?.oursCol) {
+        updateColOpForSheet(selectedMergeSheetIndex, colNumber, null);
+        return;
+      }
+
+      if (!meta?.oursCol) return;
+
+      updateColOpForSheet(selectedMergeSheetIndex, colNumber, {
+        sheetName: mergeSheets[selectedMergeSheetIndex]?.sheetName ?? mergeInfo?.sheetName ?? '',
+        action: 'delete',
+        targetColNumber: meta.oursCol,
+        alignedColNumber: colNumber,
+      });
+    },
+    [
+      currentColOps,
+      markResolvedKeys,
+      mergeCells,
+      mergeColumnsMeta,
+      mergeInfo?.sheetName,
+      mergeSheets,
+      pushMergeUndoSnapshot,
+      selectedMergeSheetIndex,
+      updateColOpForSheet,
+    ],
+  );
 
   const handleApplyMergeCellsChoice = useCallback(
     (keys: { rowNumber: number; colNumber: number }[], source: 'base' | 'ours' | 'theirs') => {
@@ -4131,7 +4186,8 @@ export const App: React.FC = () => {
       }),
     );
     const rowOps = effectiveRowOpsEntries.flatMap(([sheetIndex, ops]) => {
-      if (ops.length === 0) return [];
+      const executableOps = ops.filter((op) => op.action !== 'skip-insert');
+      if (executableOps.length === 0) return [];
       const sheet = mergeSheets[sheetIndex];
       const sheetName = sheet?.sheetName ?? mergeInfo.sheetName;
       const colsMeta = sheet?.columnsMeta ?? [];
@@ -4139,7 +4195,7 @@ export const App: React.FC = () => {
       // 将 row op 的 values 从 aligned 列空间重映射到物理列空间，
       // 跳过 theirs-only 列（除非用户选择了插入）和已删除的列。
       const colMap = colsMeta.length > 0 ? buildPhysicalColMap(colsMeta, colOpsForSheet) : null;
-      return ops.map((op) => ({
+      return executableOps.map((op) => ({
         ...op,
         sheetName: op.sheetName || sheetName,
         values: op.values && colMap
@@ -5272,6 +5328,9 @@ export const App: React.FC = () => {
                     onApplyRowChoice={handleApplyMergeRowChoice}
                     onApplyColumnChoice={handleApplyMergeColumnChoice}
                     onDeleteRow={handleDeleteMergeRow}
+                    onDeleteColumn={handleDeleteMergeColumn}
+                    currentRowOps={currentRowOps}
+                    currentColOps={currentColOps}
                     resolvedCellKeys={resolvedBySheet.get(selectedMergeSheetIndex)}
                     frozenRowCount={mergeFrozenRowCount}
                     primaryKeyCol={displayPrimaryKeyCol}
@@ -5404,6 +5463,9 @@ export const App: React.FC = () => {
                   onApplyRowChoice={handleApplyMergeRowChoice}
                   onApplyColumnChoice={handleApplyMergeColumnChoice}
                   onDeleteRow={handleDeleteMergeRow}
+                  onDeleteColumn={handleDeleteMergeColumn}
+                  currentRowOps={currentRowOps}
+                  currentColOps={currentColOps}
                   resolvedCellKeys={resolvedBySheet.get(selectedMergeSheetIndex)}
                   frozenRowCount={mergeFrozenRowCount}
                   primaryKeyCol={displayPrimaryKeyCol}

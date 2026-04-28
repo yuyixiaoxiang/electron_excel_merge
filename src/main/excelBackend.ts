@@ -3665,7 +3665,7 @@ interface SaveMergeCellInput {
 }
 interface SaveMergeRowOp {
   sheetName: string;
-  action: 'insert' | 'delete';
+  action: 'insert' | 'delete' | 'skip-insert';
   targetRowNumber: number; // 1-based in template (ours)
   values?: (string | number | null)[];
   visualRowNumber?: number;
@@ -3922,6 +3922,8 @@ export const saveChanges = async (
           ws.spliceRows(rowNumber, 0, values);
         } else if (op.action === 'delete') {
           ws.spliceRows(rowNumber, 1);
+        } else if (op.action === 'skip-insert') {
+          continue;
         }
       }
     });
@@ -4148,6 +4150,8 @@ const saveMergeResultInternal = async (
           } else if (op.action === 'delete') {
             ws.spliceRows(rowNumber, 1);
             offset -= 1;
+          } else if (op.action === 'skip-insert') {
+            continue;
           }
         }
       });
@@ -4187,7 +4191,7 @@ const saveMergeResultInternal = async (
           if (op.action === 'insert') {
             if (r >= rowNumber) r += 1;
             offset += 1;
-          } else {
+          } else if (op.action === 'delete') {
             if (r === rowNumber) return null;
             if (r > rowNumber) r -= 1;
             offset -= 1;

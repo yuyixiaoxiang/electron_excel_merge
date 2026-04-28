@@ -4,6 +4,8 @@ import type {
   MergeColumnMeta,
   MergeRowMeta,
   RowStatus,
+  SaveMergeColOp,
+  SaveMergeRowOp,
   ThreeWayCompareMode,
   ThreeWayRowResult,
 } from '../main/preload';
@@ -49,6 +51,9 @@ export interface MergeWorkbenchProps {
   onApplyRowChoice?: (rowNumber: number, source: 'ours' | 'theirs') => void;
   onApplyColumnChoice?: (colNumber: number, source: 'ours' | 'theirs') => void;
   onDeleteRow?: (rowNumber: number) => void;
+  onDeleteColumn?: (colNumber: number) => void;
+  currentRowOps?: Map<number, SaveMergeRowOp>;
+  currentColOps?: Map<number, SaveMergeColOp>;
   resolvedCellKeys?: Set<string>;
   frozenRowCount?: number;
   primaryKeyCol?: number;
@@ -422,6 +427,9 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
   onApplyRowChoice,
   onApplyColumnChoice,
   onDeleteRow,
+  onDeleteColumn,
+  currentRowOps,
+  currentColOps,
   resolvedCellKeys,
   frozenRowCount = DEFAULT_FROZEN_HEADER_ROWS,
   primaryKeyCol,
@@ -1035,6 +1043,9 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
     };
   }, [buildPhysicalSourceGridRows, mergedGridRows, selected]);
   const selectedRowMeta = selectedCell ? rowsMetaMap.get(selectedCell.rowNumber) : undefined;
+  const selectedRowOp = selectedCell ? currentRowOps?.get(selectedCell.rowNumber) : undefined;
+  const selectedColumnMeta = selectedCell ? columnsMetaMap.get(selectedCell.colNumber) : undefined;
+  const selectedColumnOp = selectedCell ? currentColOps?.get(selectedCell.colNumber) : undefined;
   const selectedIsDiffCell = selectedCell?.isDiffCell === true;
   const selectedCanApplyCellChoice =
     !!selectedCell && selectedIsDiffCell && !isProtectedCell(selectedCell);
@@ -1044,6 +1055,33 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
   const selectedColumnHasDiff = selectedCell
     ? cells.some((cell) => cell.col === selectedCell.colNumber && cell.status !== 'unchanged')
     : false;
+  const selectedCanApplyOursRowChoice =
+    !!selectedCell && !!selectedRowMeta && selectedRowHasDiff && !!selectedRowMeta.oursRowNumber;
+  const selectedCanApplyTheirsRowChoice =
+    !!selectedCell && !!selectedRowMeta && selectedRowHasDiff && !!selectedRowMeta.theirsRowNumber;
+  const selectedCanDeleteInsertedRow =
+    !!selectedCell &&
+    !!selectedRowMeta &&
+    selectedRowHasDiff &&
+    compareMode !== 'simple-merge' &&
+    selectedRowOp?.action !== 'skip-insert' &&
+    ((!selectedRowMeta.baseRowNumber && !selectedRowMeta.oursRowNumber && !!selectedRowMeta.theirsRowNumber) ||
+      selectedRowOp?.action === 'insert');
+  const selectedCanDeleteRow =
+    (!!selectedCell && !!selectedRowMeta && selectedRowHasDiff && !!selectedRowMeta.oursRowNumber) ||
+    selectedCanDeleteInsertedRow;
+  const selectedCanApplyOursColumnChoice =
+    !!selectedCell &&
+    selectedColumnHasDiff &&
+    (selectedColumnMeta ? !!selectedColumnMeta.oursCol : true);
+  const selectedCanApplyTheirsColumnChoice =
+    !!selectedCell &&
+    selectedColumnHasDiff &&
+    (selectedColumnMeta ? !!selectedColumnMeta.theirsCol : true);
+  const selectedCanDeleteColumn =
+    !!selectedCell &&
+    selectedColumnHasDiff &&
+    (!!selectedColumnMeta?.oursCol || selectedColumnOp?.action === 'insert');
   const selectedRowAttentionCount = selectedCell ? conflictCountByRow.get(selectedCell.rowNumber) ?? 0 : 0;
 
   const jumpToNextConflict = () => {
@@ -1225,8 +1263,8 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
       ]
     : [
         { side: 'base', title: 'base（只读）', path: basePath, ref: baseScrollRef as React.RefObject<HTMLDivElement>, showRowHeader: true },
-        { side: 'ours', title: 'ours（只读）', path: oursPath, ref: oursScrollRef as React.RefObject<HTMLDivElement>, showRowHeader: false },
-        { side: 'theirs', title: 'theirs（只读）', path: theirsPath, ref: theirsScrollRef as React.RefObject<HTMLDivElement>, showRowHeader: false },
+        { side: 'ours', title: 'ours（只读）', path: oursPath, ref: oursScrollRef as React.RefObject<HTMLDivElement>, showRowHeader: true },
+        { side: 'theirs', title: 'theirs（只读）', path: theirsPath, ref: theirsScrollRef as React.RefObject<HTMLDivElement>, showRowHeader: true },
       ];
 
   const statusTone =
@@ -1728,25 +1766,39 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
                     <button
                       type="button"
-                      disabled={!selectedCell || !selectedColumnHasDiff}
+                      disabled={!selectedCanApplyOursColumnChoice}
                       onClick={() => {
                         if (!selectedCell) return;
                         onApplyColumnChoice?.(selectedCell.colNumber, 'ours');
                       }}
-                      style={getQuickActionButtonStyle('ours', !selectedCell || !selectedColumnHasDiff)}
+                      style={getQuickActionButtonStyle('ours', !selectedCanApplyOursColumnChoice)}
                     >
                       采用 ours 整列
                     </button>
                     <button
                       type="button"
-                      disabled={!selectedCell || !selectedColumnHasDiff}
+                      disabled={!selectedCanApplyTheirsColumnChoice}
                       onClick={() => {
                         if (!selectedCell) return;
                         onApplyColumnChoice?.(selectedCell.colNumber, 'theirs');
                       }}
-                      style={getQuickActionButtonStyle('theirs', !selectedCell || !selectedColumnHasDiff)}
+                      style={getQuickActionButtonStyle('theirs', !selectedCanApplyTheirsColumnChoice)}
                     >
                       采用 theirs 整列
+                    </button>
+                    <button
+                      type="button"
+                      disabled={!selectedCanDeleteColumn}
+                      onClick={() => {
+                        if (!selectedCell) return;
+                        onDeleteColumn?.(selectedCell.colNumber);
+                      }}
+                      style={{
+                        ...getQuickActionButtonStyle('danger', !selectedCanDeleteColumn),
+                        gridColumn: '1 / -1',
+                      }}
+                    >
+                      删除结果中的这列
                     </button>
                   </div>
                 </div>
@@ -1755,38 +1807,35 @@ const MergeWorkbenchComponent: React.FC<MergeWorkbenchProps> = ({
                   <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 6 }}>
                     <button
                       type="button"
-                      disabled={!selectedCell || !selectedRowMeta || !selectedRowHasDiff}
+                      disabled={!selectedCanApplyOursRowChoice}
                       onClick={() => {
                         if (!selectedCell) return;
                         onApplyRowChoice?.(selectedCell.rowNumber, 'ours');
                       }}
-                      style={getQuickActionButtonStyle('ours', !selectedCell || !selectedRowMeta || !selectedRowHasDiff)}
+                      style={getQuickActionButtonStyle('ours', !selectedCanApplyOursRowChoice)}
                     >
                       采用 ours 整行
                     </button>
                     <button
                       type="button"
-                      disabled={!selectedCell || !selectedRowMeta || !selectedRowHasDiff}
+                      disabled={!selectedCanApplyTheirsRowChoice}
                       onClick={() => {
                         if (!selectedCell) return;
                         onApplyRowChoice?.(selectedCell.rowNumber, 'theirs');
                       }}
-                      style={getQuickActionButtonStyle('theirs', !selectedCell || !selectedRowMeta || !selectedRowHasDiff)}
+                      style={getQuickActionButtonStyle('theirs', !selectedCanApplyTheirsRowChoice)}
                     >
                       采用 theirs 整行
                     </button>
                     <button
                       type="button"
-                      disabled={!selectedCell || !selectedRowMeta || !selectedRowHasDiff || !selectedRowMeta.oursRowNumber}
+                      disabled={!selectedCanDeleteRow}
                       onClick={() => {
                         if (!selectedCell) return;
                         onDeleteRow?.(selectedCell.rowNumber);
                       }}
                       style={{
-                        ...getQuickActionButtonStyle(
-                          'danger',
-                          !selectedCell || !selectedRowMeta || !selectedRowHasDiff || !selectedRowMeta.oursRowNumber,
-                        ),
+                        ...getQuickActionButtonStyle('danger', !selectedCanDeleteRow),
                         gridColumn: '1 / -1',
                       }}
                     >
